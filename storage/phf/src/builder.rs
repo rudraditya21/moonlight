@@ -7,7 +7,7 @@ pub struct PhfBuilder {
 
 impl PhfBuilder {
     pub fn new() -> Self {
-        PhfBuilder { max_seed: 100_000 }
+        PhfBuilder { max_seed: 1_000_000 }
     }
 
     pub fn with_max_seed(mut self, max_seed: u64) -> Self {

@@ -1,5 +1,5 @@
 use crate::config::Config;
-use modules::{ModuleRegistry, RegistryError};
+use modules::{ModuleRegistry, ModuleRegistryBuilder, RegistryError};
 use repl::{Repl, ReplError};
 
 pub fn run(config: Config) -> Result<(), ReplError> {
@@ -10,5 +10,5 @@ pub fn run(config: Config) -> Result<(), ReplError> {
 
 fn build_registry() -> Result<ModuleRegistry, RegistryError> {
     // Empty registry for now; modules will be added as they are implemented.
-    ModuleRegistry::new()
+    ModuleRegistryBuilder::new().build()
 }

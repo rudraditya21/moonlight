@@ -1,4 +1,5 @@
 use std::fmt;
+use phf::PhfMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModuleOptionKind {
@@ -106,11 +107,21 @@ impl ModuleOption {
 #[derive(Debug, Clone)]
 pub struct ModuleOptions {
     options: Vec<ModuleOption>,
+    index: Option<PhfMap<usize>>,
 }
 
 impl ModuleOptions {
     pub fn new(options: Vec<ModuleOption>) -> Self {
-        ModuleOptions { options }
+        let mut entries = Vec::with_capacity(options.len());
+        for (idx, opt) in options.iter().enumerate() {
+            entries.push((opt.name.to_lowercase(), idx));
+        }
+        let index = if entries.is_empty() {
+            None
+        } else {
+            PhfMap::build(entries).ok()
+        };
+        ModuleOptions { options, index }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &ModuleOption> {
@@ -122,10 +133,28 @@ impl ModuleOptions {
     }
 
     pub fn get(&self, name: &str) -> Option<&ModuleOption> {
+        if let Some(index) = &self.index {
+            if let Some(idx) = index.get(&name.to_lowercase()) {
+                return self.options.get(*idx);
+            }
+        }
         self.options.iter().find(|opt| opt.name.eq_ignore_ascii_case(name))
     }
 
     pub fn set(&mut self, name: &str, value: &str) -> Result<(), String> {
+        let mut idx = None;
+        if let Some(index) = &self.index {
+            if let Some(found) = index.get(&name.to_lowercase()) {
+                idx = Some(*found);
+            }
+        }
+        if let Some(idx) = idx {
+            return self
+                .options
+                .get_mut(idx)
+                .ok_or_else(|| format!("unknown option: {name}"))?
+                .set_from_str(value);
+        }
         let opt = self
             .options
             .iter_mut()

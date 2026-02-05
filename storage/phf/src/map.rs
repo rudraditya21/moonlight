@@ -15,7 +15,7 @@ pub struct PhfMap<V> {
 
 impl<V> PhfMap<V> {
     pub fn build(entries: Vec<(String, V)>) -> Result<Self, String> {
-        build_internal(entries, 100_000)
+        build_internal(entries, 1_000_000)
     }
 
     pub(crate) fn build_with(entries: Vec<(String, V)>, max_seed: u64) -> Result<Self, String> {

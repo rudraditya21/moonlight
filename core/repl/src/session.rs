@@ -45,10 +45,6 @@ impl Repl {
     }
 
     pub fn run(&mut self) -> Result<(), ReplError> {
-        self.registry
-            .finalize()
-            .map_err(|e| ReplError::Registry(e.to_string()))?;
-
         let stdin = io::stdin();
         loop {
             print!("{}", self.prompt);
@@ -123,11 +119,11 @@ impl Repl {
             return;
         }
         let name = &tokens[1];
-        let Some(factory) = self.registry.get_factory(name) else {
+        let Some(module) = self.registry.create(name) else {
             println!("Module not found: {name}");
             return;
         };
-        self.active = Some(factory.create());
+        self.active = Some(module);
         println!("Using module: {name}");
     }
 
@@ -138,11 +134,10 @@ impl Repl {
         }
         match tokens[1].as_str() {
             "modules" => {
-                let list = self.registry.list();
-                if list.is_empty() {
+                if self.registry.is_empty() {
                     println!("No modules registered.");
                 } else {
-                    for meta in list {
+                    for meta in self.registry.iter_metadata() {
                         println!("{} - {}", meta.name, meta.description);
                     }
                 }
