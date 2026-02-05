@@ -1,0 +1,23 @@
+[package]
+name = "moonlight"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = [
+  "core/core",
+  "core/repl",
+  "modules/modules",
+  "storage/phf",
+  "network/net",
+  "network/proto",
+]
+resolver = "2"
+
+[dependencies]
+corelib = { path = "core/core" }
+repl = { path = "core/repl" }
+modules = { path = "modules/modules" }
+net = { path = "network/net" }
+proto = { path = "network/proto" }
+phf = { path = "storage/phf" }

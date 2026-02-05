@@ -1,0 +1,8 @@
+[package]
+name = "repl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+corelib = { path = "../core" }
+modules = { path = "../../modules/modules" }
