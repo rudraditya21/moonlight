@@ -1,0 +1,8 @@
+[package]
+name = "dynlib_test"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "moonlight_dynlib_test"
+crate-type = ["cdylib"]

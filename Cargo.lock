@@ -7,6 +7,10 @@ name = "corelib"
 version = "0.1.0"
 
 [[package]]
+name = "dynlib_test"
+version = "0.1.0"
+
+[[package]]
 name = "libc"
 version = "0.2.180"
 source = "registry+https://github.com/rust-lang/crates.io-index"

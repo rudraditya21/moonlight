@@ -8,6 +8,7 @@ members = [
   "core/core",
   "core/repl",
   "modules/modules",
+  "modules/dynlib_test",
   "storage/phf",
   "crypt/md5",
   "crypt/sha1",
