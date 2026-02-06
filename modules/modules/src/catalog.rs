@@ -97,6 +97,7 @@ impl StringIndex {
 
 #[derive(Debug, Clone)]
 struct LoadedIndex {
+    version: u32,
     entries: Vec<CachedEntry>,
     name_index: Option<PhfMap<usize>>,
     tag_index: Option<StringIndex>,
@@ -147,10 +148,14 @@ impl ModuleCatalog {
             .collect::<Vec<_>>();
         let mut results = process_manifest_tasks(tasks, &cache_map)?;
 
+        let needs_rewrite = loaded_index
+            .as_ref()
+            .map(|idx| idx.version != INDEX_VERSION)
+            .unwrap_or(false);
         let unchanged = loaded_index.is_some()
             && results.len() == cache_map.len()
             && results.iter().all(|item| item.fast_match);
-        if unchanged {
+        if unchanged && !needs_rewrite {
             return Ok(catalog_from_index(loaded_index.unwrap(), root));
         }
 
@@ -525,7 +530,9 @@ fn build_record(metadata: ModuleMetadata, manifest_path: &Path) -> ModuleRecord 
 const CATEGORY_COUNT: usize = 7;
 const RANK_COUNT: usize = 8;
 const INDEX_MAGIC: &[u8; 4] = b"MLMI";
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION_V1: u32 = 1;
+const INDEX_VERSION_V2: u32 = 2;
+const INDEX_VERSION: u32 = INDEX_VERSION_V2;
 
 fn category_to_index(category: ModuleCategory) -> usize {
     match category {
@@ -587,6 +594,107 @@ fn tokenize_text(input: &str) -> Vec<String> {
     tokens
 }
 
+#[derive(Debug, Clone)]
+struct StringTable {
+    values: Vec<String>,
+    map: HashMap<String, u32>,
+}
+
+impl StringTable {
+    fn id_of(&self, value: &str) -> CoreResult<u32> {
+        self.map
+            .get(value)
+            .copied()
+            .ok_or_else(|| CoreError::Parse(format!("string not in table: {value}")))
+    }
+
+    fn get(&self, id: u32) -> CoreResult<&str> {
+        let idx = id as usize;
+        self.values
+            .get(idx)
+            .map(|s| s.as_str())
+            .ok_or_else(|| CoreError::Parse(format!("string id out of range: {id}")))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StringTableBuilder {
+    map: HashMap<String, u32>,
+    values: Vec<String>,
+}
+
+impl StringTableBuilder {
+    fn new() -> Self {
+        StringTableBuilder {
+            map: HashMap::new(),
+            values: Vec::new(),
+        }
+    }
+
+    fn intern(&mut self, value: &str) -> u32 {
+        if let Some(id) = self.map.get(value) {
+            return *id;
+        }
+        let id = self.values.len() as u32;
+        self.values.push(value.to_string());
+        self.map.insert(value.to_string(), id);
+        id
+    }
+
+    fn finish(self) -> StringTable {
+        StringTable {
+            values: self.values,
+            map: self.map,
+        }
+    }
+}
+
+fn collect_strings(table: &mut StringTableBuilder, entries: &[CachedEntry], catalog: &ModuleCatalog) {
+    for entry in entries {
+        table.intern(&entry.manifest_path);
+        collect_metadata_strings(table, &entry.metadata);
+    }
+    if let Some(name_index) = &catalog.name_index {
+        collect_phf_map_strings(table, name_index);
+    }
+    if let Some(tag_index) = &catalog.tag_index {
+        collect_phf_map_strings(table, &tag_index.map);
+    }
+    if let Some(platform_index) = &catalog.platform_index {
+        collect_phf_map_strings(table, &platform_index.map);
+    }
+    if let Some(token_index) = &catalog.token_index {
+        collect_phf_map_strings(table, &token_index.map);
+    }
+}
+
+fn collect_phf_map_strings(table: &mut StringTableBuilder, map: &PhfMap<usize>) {
+    for slot in map.slots() {
+        if let Some(entry) = slot {
+            table.intern(entry.key());
+        }
+    }
+}
+
+fn collect_metadata_strings(table: &mut StringTableBuilder, metadata: &ModuleMetadata) {
+    table.intern(&metadata.name);
+    table.intern(&metadata.description);
+    table.intern(&metadata.author);
+    for platform in &metadata.platforms {
+        table.intern(platform);
+    }
+    for tag in &metadata.tags {
+        table.intern(tag);
+    }
+    if let Some(entrypoint) = &metadata.entrypoint {
+        table.intern(entrypoint);
+    }
+    for reference in &metadata.references {
+        table.intern(&reference.kind);
+        table.intern(&reference.value);
+    }
+}
+
 fn load_index(path: &Path) -> CoreResult<Option<LoadedIndex>> {
     if !path.exists() {
         return Ok(None);
@@ -597,31 +705,73 @@ fn load_index(path: &Path) -> CoreResult<Option<LoadedIndex>> {
         return Ok(None);
     }
     let version = read_u32(&data, &mut cursor)?;
-    if version != INDEX_VERSION {
-        return Ok(None);
+    match version {
+        INDEX_VERSION_V1 => load_index_v1(&data, &mut cursor),
+        INDEX_VERSION_V2 => load_index_v2(&data, &mut cursor),
+        _ => Ok(None),
     }
-    let entry_count = read_u32(&data, &mut cursor)? as usize;
+}
+
+fn load_index_v1(data: &[u8], cursor: &mut usize) -> CoreResult<Option<LoadedIndex>> {
+    let entry_count = read_u32(data, cursor)? as usize;
     let mut entries = Vec::with_capacity(entry_count);
     for _ in 0..entry_count {
-        let manifest_path = read_string(&data, &mut cursor)?;
-        let size = read_u64(&data, &mut cursor)?;
-        let mtime = read_u64(&data, &mut cursor)?;
-        let hash = read_u64(&data, &mut cursor)?;
-        let metadata = read_metadata(&data, &mut cursor)?;
+        let manifest_path = read_string(data, cursor)?;
+        let size = read_u64(data, cursor)?;
+        let mtime = read_u64(data, cursor)?;
+        let hash = read_u64(data, cursor)?;
+        let metadata = read_metadata_v1(data, cursor)?;
         entries.push(CachedEntry {
             manifest_path,
             fingerprint: crate::hash::FileFingerprint { size, mtime, hash },
             metadata,
         });
     }
-    let name_index = read_phf_map_option(&data, &mut cursor)?;
-    let tag_index = read_string_index(&data, &mut cursor)?;
-    let platform_index = read_string_index(&data, &mut cursor)?;
-    let token_index = read_string_index(&data, &mut cursor)?;
-    let category_index = read_index_lists(&data, &mut cursor)?;
-    let rank_index = read_index_lists(&data, &mut cursor)?;
+    let name_index = read_phf_map_option_v1(data, cursor)?;
+    let tag_index = read_string_index_v1(data, cursor)?;
+    let platform_index = read_string_index_v1(data, cursor)?;
+    let token_index = read_string_index_v1(data, cursor)?;
+    let category_index = read_index_lists(data, cursor)?;
+    let rank_index = read_index_lists(data, cursor)?;
 
     Ok(Some(LoadedIndex {
+        version: INDEX_VERSION_V1,
+        entries,
+        name_index,
+        tag_index,
+        platform_index,
+        token_index,
+        category_index,
+        rank_index,
+    }))
+}
+
+fn load_index_v2(data: &[u8], cursor: &mut usize) -> CoreResult<Option<LoadedIndex>> {
+    let table = read_string_table(data, cursor)?;
+    let entry_count = read_u32(data, cursor)? as usize;
+    let mut entries = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let manifest_id = read_u32(data, cursor)?;
+        let manifest_path = string_from_id(&table, manifest_id)?;
+        let size = read_u64(data, cursor)?;
+        let mtime = read_u64(data, cursor)?;
+        let hash = read_u64(data, cursor)?;
+        let metadata = read_metadata_v2(data, cursor, &table)?;
+        entries.push(CachedEntry {
+            manifest_path,
+            fingerprint: crate::hash::FileFingerprint { size, mtime, hash },
+            metadata,
+        });
+    }
+    let name_index = read_phf_map_option_v2(data, cursor, &table)?;
+    let tag_index = read_string_index_v2(data, cursor, &table)?;
+    let platform_index = read_string_index_v2(data, cursor, &table)?;
+    let token_index = read_string_index_v2(data, cursor, &table)?;
+    let category_index = read_index_lists(data, cursor)?;
+    let rank_index = read_index_lists(data, cursor)?;
+
+    Ok(Some(LoadedIndex {
+        version: INDEX_VERSION_V2,
         entries,
         name_index,
         tag_index,
@@ -633,21 +783,26 @@ fn load_index(path: &Path) -> CoreResult<Option<LoadedIndex>> {
 }
 
 fn save_index(path: &Path, entries: &[CachedEntry], catalog: &ModuleCatalog) -> CoreResult<()> {
+    let mut builder = StringTableBuilder::new();
+    collect_strings(&mut builder, entries, catalog);
+    let table = builder.finish();
+
     let mut out = Vec::new();
     out.extend_from_slice(INDEX_MAGIC);
     write_u32(&mut out, INDEX_VERSION);
+    write_string_table(&mut out, &table);
     write_u32(&mut out, entries.len() as u32);
     for entry in entries {
-        write_string(&mut out, &entry.manifest_path);
+        write_u32(&mut out, table.id_of(&entry.manifest_path)?);
         write_u64(&mut out, entry.fingerprint.size);
         write_u64(&mut out, entry.fingerprint.mtime);
         write_u64(&mut out, entry.fingerprint.hash);
-        write_metadata(&mut out, &entry.metadata);
+        write_metadata_v2(&mut out, &entry.metadata, &table)?;
     }
-    write_phf_map_option(&mut out, &catalog.name_index)?;
-    write_string_index(&mut out, &catalog.tag_index)?;
-    write_string_index(&mut out, &catalog.platform_index)?;
-    write_string_index(&mut out, &catalog.token_index)?;
+    write_phf_map_option_v2(&mut out, &catalog.name_index, &table)?;
+    write_string_index_v2(&mut out, &catalog.tag_index, &table)?;
+    write_string_index_v2(&mut out, &catalog.platform_index, &table)?;
+    write_string_index_v2(&mut out, &catalog.token_index, &table)?;
     write_index_lists(&mut out, &catalog.category_index)?;
     write_index_lists(&mut out, &catalog.rank_index)?;
 
@@ -655,7 +810,34 @@ fn save_index(path: &Path, entries: &[CachedEntry], catalog: &ModuleCatalog) -> 
     Ok(())
 }
 
-fn write_string_index(out: &mut Vec<u8>, index: &Option<StringIndex>) -> CoreResult<()> {
+fn write_string_table(out: &mut Vec<u8>, table: &StringTable) {
+    write_u32(out, table.values.len() as u32);
+    for value in &table.values {
+        write_string(out, value);
+    }
+}
+
+fn read_string_table(data: &[u8], cursor: &mut usize) -> CoreResult<StringTable> {
+    let count = read_u32(data, cursor)? as usize;
+    let mut values = Vec::with_capacity(count);
+    let mut map = HashMap::with_capacity(count);
+    for idx in 0..count {
+        let value = read_string(data, cursor)?;
+        map.insert(value.clone(), idx as u32);
+        values.push(value);
+    }
+    Ok(StringTable { values, map })
+}
+
+fn string_from_id(table: &StringTable, id: u32) -> CoreResult<String> {
+    Ok(table.get(id)?.to_string())
+}
+
+fn write_string_index_v2(
+    out: &mut Vec<u8>,
+    index: &Option<StringIndex>,
+    table: &StringTable,
+) -> CoreResult<()> {
     match index {
         None => {
             write_u8(out, 0);
@@ -663,7 +845,7 @@ fn write_string_index(out: &mut Vec<u8>, index: &Option<StringIndex>) -> CoreRes
         }
         Some(index) => {
             write_u8(out, 1);
-            write_phf_map(out, &index.map)?;
+            write_phf_map_v2(out, &index.map, table)?;
             write_u32(out, index.ranges.len() as u32);
             for range in &index.ranges {
                 write_u32(out, range.start as u32);
@@ -678,12 +860,210 @@ fn write_string_index(out: &mut Vec<u8>, index: &Option<StringIndex>) -> CoreRes
     }
 }
 
-fn read_string_index(data: &[u8], cursor: &mut usize) -> CoreResult<Option<StringIndex>> {
+fn read_string_index_v2(
+    data: &[u8],
+    cursor: &mut usize,
+    table: &StringTable,
+) -> CoreResult<Option<StringIndex>> {
     let present = read_u8(data, cursor)?;
     if present == 0 {
         return Ok(None);
     }
-    let map = read_phf_map(data, cursor)?;
+    let map = read_phf_map_v2(data, cursor, table)?;
+    let ranges_len = read_u32(data, cursor)? as usize;
+    let mut ranges = Vec::with_capacity(ranges_len);
+    for _ in 0..ranges_len {
+        let start = read_u32(data, cursor)? as usize;
+        let len = read_u32(data, cursor)? as usize;
+        ranges.push(TagRange { start, len });
+    }
+    let entries_len = read_u32(data, cursor)? as usize;
+    let mut entries = Vec::with_capacity(entries_len);
+    for _ in 0..entries_len {
+        entries.push(read_u32(data, cursor)? as usize);
+    }
+    Ok(Some(StringIndex { map, ranges, entries }))
+}
+
+fn write_phf_map_option_v2(
+    out: &mut Vec<u8>,
+    map: &Option<PhfMap<usize>>,
+    table: &StringTable,
+) -> CoreResult<()> {
+    match map {
+        None => {
+            write_u8(out, 0);
+            Ok(())
+        }
+        Some(map) => {
+            write_u8(out, 1);
+            write_phf_map_v2(out, map, table)
+        }
+    }
+}
+
+fn read_phf_map_option_v2(
+    data: &[u8],
+    cursor: &mut usize,
+    table: &StringTable,
+) -> CoreResult<Option<PhfMap<usize>>> {
+    let present = read_u8(data, cursor)?;
+    if present == 0 {
+        return Ok(None);
+    }
+    Ok(Some(read_phf_map_v2(data, cursor, table)?))
+}
+
+fn write_phf_map_v2(
+    out: &mut Vec<u8>,
+    map: &PhfMap<usize>,
+    table: &StringTable,
+) -> CoreResult<()> {
+    write_u32(out, map.len() as u32);
+    write_u32(out, map.seeds().len() as u32);
+    for &seed in map.seeds() {
+        write_i64(out, seed);
+    }
+    write_u32(out, map.slots().len() as u32);
+    for slot in map.slots() {
+        match slot {
+            None => write_u8(out, 0),
+            Some(entry) => {
+                write_u8(out, 1);
+                let key_id = table.id_of(entry.key())?;
+                write_u32(out, key_id);
+                write_u32(out, *entry.value() as u32);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_phf_map_v2(
+    data: &[u8],
+    cursor: &mut usize,
+    table: &StringTable,
+) -> CoreResult<PhfMap<usize>> {
+    let size = read_u32(data, cursor)? as usize;
+    let seeds_len = read_u32(data, cursor)? as usize;
+    let mut seeds = Vec::with_capacity(seeds_len);
+    for _ in 0..seeds_len {
+        seeds.push(read_i64(data, cursor)?);
+    }
+    let slots_len = read_u32(data, cursor)? as usize;
+    let mut slots = Vec::with_capacity(slots_len);
+    for _ in 0..slots_len {
+        let present = read_u8(data, cursor)?;
+        if present == 0 {
+            slots.push(None);
+        } else {
+            let key_id = read_u32(data, cursor)?;
+            let key = string_from_id(table, key_id)?;
+            let value = read_u32(data, cursor)? as usize;
+            slots.push(Some(phf::Slot::new(key, value)));
+        }
+    }
+    Ok(PhfMap::from_parts(seeds, slots, size))
+}
+
+fn write_metadata_v2(
+    out: &mut Vec<u8>,
+    metadata: &ModuleMetadata,
+    table: &StringTable,
+) -> CoreResult<()> {
+    write_u32(out, table.id_of(&metadata.name)?);
+    write_u32(out, table.id_of(&metadata.description)?);
+    write_u8(out, category_to_u8(&metadata.category));
+    write_u8(out, rank_to_u8(metadata.rank));
+    write_u32(out, table.id_of(&metadata.author)?);
+    write_u32(out, metadata.platforms.len() as u32);
+    for platform in &metadata.platforms {
+        write_u32(out, table.id_of(platform)?);
+    }
+    write_u32(out, metadata.tags.len() as u32);
+    for tag in &metadata.tags {
+        write_u32(out, table.id_of(tag)?);
+    }
+    match &metadata.entrypoint {
+        Some(entrypoint) => {
+            write_u8(out, 1);
+            write_u32(out, table.id_of(entrypoint)?);
+        }
+        None => write_u8(out, 0),
+    }
+    write_u32(out, metadata.references.len() as u32);
+    for reference in &metadata.references {
+        write_u32(out, table.id_of(&reference.kind)?);
+        write_u32(out, table.id_of(&reference.value)?);
+    }
+    Ok(())
+}
+
+fn read_metadata_v2(
+    data: &[u8],
+    cursor: &mut usize,
+    table: &StringTable,
+) -> CoreResult<ModuleMetadata> {
+    let name_id = read_u32(data, cursor)?;
+    let desc_id = read_u32(data, cursor)?;
+    let category = u8_to_category(read_u8(data, cursor)?);
+    let rank = u8_to_rank(read_u8(data, cursor)?);
+    let author_id = read_u32(data, cursor)?;
+    let name = table.get(name_id)?.to_string();
+    let description = table.get(desc_id)?.to_string();
+    let author = table.get(author_id)?.to_string();
+    let platforms_len = read_u32(data, cursor)? as usize;
+    let mut platforms = Vec::with_capacity(platforms_len);
+    for _ in 0..platforms_len {
+        let id = read_u32(data, cursor)?;
+        platforms.push(table.get(id)?.to_string());
+    }
+    let tags_len = read_u32(data, cursor)? as usize;
+    let mut tags = Vec::with_capacity(tags_len);
+    for _ in 0..tags_len {
+        let id = read_u32(data, cursor)?;
+        tags.push(table.get(id)?.to_string());
+    }
+    let entrypoint = match read_u8(data, cursor)? {
+        0 => None,
+        _ => {
+            let id = read_u32(data, cursor)?;
+            Some(table.get(id)?.to_string())
+        }
+    };
+    let ref_count = read_u32(data, cursor)? as usize;
+    let mut references = Vec::with_capacity(ref_count);
+    for _ in 0..ref_count {
+        let kind_id = read_u32(data, cursor)?;
+        let value_id = read_u32(data, cursor)?;
+        references.push(ModuleReference {
+            kind: table.get(kind_id)?.to_string(),
+            value: table.get(value_id)?.to_string(),
+        });
+    }
+
+    let mut metadata = ModuleMetadata::new(&name, &description, category, &author).with_rank(rank);
+    for platform in platforms {
+        metadata = metadata.with_platform(&platform);
+    }
+    for tag in tags {
+        metadata = metadata.with_tag(&tag);
+    }
+    if let Some(entrypoint) = entrypoint {
+        metadata = metadata.with_entrypoint(&entrypoint);
+    }
+    for reference in references {
+        metadata = metadata.with_reference(&reference.kind, &reference.value);
+    }
+    Ok(metadata)
+}
+
+fn read_string_index_v1(data: &[u8], cursor: &mut usize) -> CoreResult<Option<StringIndex>> {
+    let present = read_u8(data, cursor)?;
+    if present == 0 {
+        return Ok(None);
+    }
+    let map = read_phf_map_v1(data, cursor)?;
     let ranges_len = read_u32(data, cursor)? as usize;
     let mut ranges = Vec::with_capacity(ranges_len);
     for _ in 0..ranges_len {
@@ -724,48 +1104,15 @@ fn read_index_lists(data: &[u8], cursor: &mut usize) -> CoreResult<Vec<Vec<usize
     Ok(lists)
 }
 
-fn write_phf_map_option(out: &mut Vec<u8>, map: &Option<PhfMap<usize>>) -> CoreResult<()> {
-    match map {
-        None => {
-            write_u8(out, 0);
-            Ok(())
-        }
-        Some(map) => {
-            write_u8(out, 1);
-            write_phf_map(out, map)
-        }
-    }
-}
-
-fn read_phf_map_option(data: &[u8], cursor: &mut usize) -> CoreResult<Option<PhfMap<usize>>> {
+fn read_phf_map_option_v1(data: &[u8], cursor: &mut usize) -> CoreResult<Option<PhfMap<usize>>> {
     let present = read_u8(data, cursor)?;
     if present == 0 {
         return Ok(None);
     }
-    Ok(Some(read_phf_map(data, cursor)?))
+    Ok(Some(read_phf_map_v1(data, cursor)?))
 }
 
-fn write_phf_map(out: &mut Vec<u8>, map: &PhfMap<usize>) -> CoreResult<()> {
-    write_u32(out, map.len() as u32);
-    write_u32(out, map.seeds().len() as u32);
-    for &seed in map.seeds() {
-        write_i64(out, seed);
-    }
-    write_u32(out, map.slots().len() as u32);
-    for slot in map.slots() {
-        match slot {
-            None => write_u8(out, 0),
-            Some(entry) => {
-                write_u8(out, 1);
-                write_string(out, entry.key());
-                write_u32(out, *entry.value() as u32);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn read_phf_map(data: &[u8], cursor: &mut usize) -> CoreResult<PhfMap<usize>> {
+fn read_phf_map_v1(data: &[u8], cursor: &mut usize) -> CoreResult<PhfMap<usize>> {
     let size = read_u32(data, cursor)? as usize;
     let seeds_len = read_u32(data, cursor)? as usize;
     let mut seeds = Vec::with_capacity(seeds_len);
@@ -787,23 +1134,7 @@ fn read_phf_map(data: &[u8], cursor: &mut usize) -> CoreResult<PhfMap<usize>> {
     Ok(PhfMap::from_parts(seeds, slots, size))
 }
 
-fn write_metadata(out: &mut Vec<u8>, metadata: &ModuleMetadata) {
-    write_string(out, &metadata.name);
-    write_string(out, &metadata.description);
-    write_u8(out, category_to_u8(&metadata.category));
-    write_u8(out, rank_to_u8(metadata.rank));
-    write_string(out, &metadata.author);
-    write_vec_string(out, &metadata.platforms);
-    write_vec_string(out, &metadata.tags);
-    write_optional_string(out, metadata.entrypoint.as_deref());
-    write_u32(out, metadata.references.len() as u32);
-    for reference in &metadata.references {
-        write_string(out, &reference.kind);
-        write_string(out, &reference.value);
-    }
-}
-
-fn read_metadata(data: &[u8], cursor: &mut usize) -> CoreResult<ModuleMetadata> {
+fn read_metadata_v1(data: &[u8], cursor: &mut usize) -> CoreResult<ModuleMetadata> {
     let name = read_string(data, cursor)?;
     let description = read_string(data, cursor)?;
     let category = u8_to_category(read_u8(data, cursor)?);
@@ -905,23 +1236,6 @@ fn write_i64(out: &mut Vec<u8>, value: i64) {
 fn write_string(out: &mut Vec<u8>, value: &str) {
     write_u32(out, value.len() as u32);
     out.extend_from_slice(value.as_bytes());
-}
-
-fn write_vec_string(out: &mut Vec<u8>, values: &[String]) {
-    write_u32(out, values.len() as u32);
-    for value in values {
-        write_string(out, value);
-    }
-}
-
-fn write_optional_string(out: &mut Vec<u8>, value: Option<&str>) {
-    match value {
-        Some(value) => {
-            write_u8(out, 1);
-            write_string(out, value);
-        }
-        None => write_u8(out, 0),
-    }
 }
 
 fn read_bytes<'a>(data: &'a [u8], cursor: &mut usize, len: usize) -> CoreResult<&'a [u8]> {
