@@ -56,7 +56,8 @@ impl Repl {
         loop {
             let prompt = self.prompt_text();
             let completer = ReplCompleter { repl: self };
-            let line = read_line(&prompt, &completer).map_err(|e| ReplError::Io(e.to_string()))?;
+            let line = read_line(&prompt, &completer, self.history.entries())
+                .map_err(|e| ReplError::Io(e.to_string()))?;
             let Some(line) = line else {
                 break;
             };

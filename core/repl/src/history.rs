@@ -26,6 +26,10 @@ impl History {
         self.entries.iter().enumerate()
     }
 
+    pub fn entries(&self) -> &[String] {
+        &self.entries
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
