@@ -51,4 +51,11 @@ impl NetAddr {
         }
         Ok(resolved)
     }
+
+    pub fn from_socket(addr: SocketAddr) -> Self {
+        NetAddr {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+        }
+    }
 }

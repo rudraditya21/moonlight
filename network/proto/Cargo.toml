@@ -5,3 +5,9 @@ edition = "2021"
 
 [dependencies]
 corelib = { path = "../../core/core" }
+net = { path = "../net" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
+rustls = "0.22"
+tokio-rustls = "0.25"
+webpki-roots = "0.26"
+rustls-pemfile = "2"
