@@ -8,7 +8,8 @@ use net::NetAddr;
 
 use crate::framing::{LengthPrefixedFramer, Framer};
 use crate::transport::{
-    AsyncTcpTransport, AsyncUdpTransport, StreamTransport, TcpTransport, UdpTransport,
+    AsyncStreamTransport, AsyncTcpTransport, AsyncUdpTransport, StreamTransport, TcpTransport,
+    UdpTransport,
 };
 use crate::util::Timeouts;
 

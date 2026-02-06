@@ -138,7 +138,10 @@ pub struct TlsClientConfig {
 
 impl TlsClientConfig {
     pub fn with_webpki_roots() -> CoreResult<Self> {
-        let root_store = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let mut root_store = RootCertStore::empty();
+        root_store
+            .roots
+            .extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let config = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
@@ -148,7 +151,8 @@ impl TlsClientConfig {
     }
 
     pub fn with_root_certificates(certs: Vec<CertificateDer<'static>>) -> CoreResult<Self> {
-        let root_store = RootCertStore::from_iter(certs.into_iter());
+        let mut root_store = RootCertStore::empty();
+        root_store.add_parsable_certificates(certs.into_iter());
         let config = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
@@ -207,7 +211,7 @@ pub fn load_private_key_from_pem(path: &str) -> CoreResult<PrivateKeyDer<'static
         .transpose()
         .map_err(|err| CoreError::Message(err.to_string()))?
     {
-        return Ok(key);
+        return Ok(PrivateKeyDer::Pkcs8(key));
     }
     let mut reader = std::io::BufReader::new(std::io::Cursor::new(buf));
     if let Some(key) = rustls_pemfile::rsa_private_keys(&mut reader)
@@ -215,7 +219,7 @@ pub fn load_private_key_from_pem(path: &str) -> CoreResult<PrivateKeyDer<'static
         .transpose()
         .map_err(|err| CoreError::Message(err.to_string()))?
     {
-        return Ok(key);
+        return Ok(PrivateKeyDer::Pkcs1(key));
     }
     Err(CoreError::Parse("no private key found".to_string()))
 }
@@ -242,7 +246,7 @@ impl TlsStreamTransport {
                         .map_err(CoreError::Io)?;
                     let server_name = ServerName::try_from(server_name)
                         .map_err(|_| CoreError::Parse("invalid server name".to_string()))?;
-                    let conn = rustls::ClientConnection::new(config.inner(), server_name)
+                    let conn = rustls::ClientConnection::new(config.inner(), server_name.to_owned())
                         .map_err(|err| CoreError::Message(err.to_string()))?;
                     return Ok(Self::Client(rustls::StreamOwned::new(conn, stream)));
                 }
@@ -292,12 +296,10 @@ impl StreamTransport for TlsStreamTransport {
         match self {
             Self::Client(stream) => stream
                 .get_ref()
-                .1
                 .shutdown(std::net::Shutdown::Both)
                 .map_err(CoreError::Io),
             Self::Server(stream) => stream
                 .get_ref()
-                .1
                 .shutdown(std::net::Shutdown::Both)
                 .map_err(CoreError::Io),
         }
@@ -305,8 +307,8 @@ impl StreamTransport for TlsStreamTransport {
 
     fn peer_addr(&self) -> CoreResult<SocketAddr> {
         match self {
-            Self::Client(stream) => stream.get_ref().1.peer_addr().map_err(CoreError::Io),
-            Self::Server(stream) => stream.get_ref().1.peer_addr().map_err(CoreError::Io),
+            Self::Client(stream) => stream.get_ref().peer_addr().map_err(CoreError::Io),
+            Self::Server(stream) => stream.get_ref().peer_addr().map_err(CoreError::Io),
         }
     }
 
@@ -314,12 +316,10 @@ impl StreamTransport for TlsStreamTransport {
         match self {
             Self::Client(stream) => stream
                 .get_ref()
-                .1
                 .set_read_timeout(timeout)
                 .map_err(CoreError::Io),
             Self::Server(stream) => stream
                 .get_ref()
-                .1
                 .set_read_timeout(timeout)
                 .map_err(CoreError::Io),
         }
@@ -329,12 +329,10 @@ impl StreamTransport for TlsStreamTransport {
         match self {
             Self::Client(stream) => stream
                 .get_ref()
-                .1
                 .set_write_timeout(timeout)
                 .map_err(CoreError::Io),
             Self::Server(stream) => stream
                 .get_ref()
-                .1
                 .set_write_timeout(timeout)
                 .map_err(CoreError::Io),
         }
@@ -388,7 +386,13 @@ impl AsyncStreamTransport for AsyncTcpTransport {
     }
 
     fn read_exact<'a>(&'a mut self, buf: &'a mut [u8]) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
-        Box::pin(async move { self.stream.read_exact(buf).await.map_err(CoreError::Io) })
+        Box::pin(async move {
+            self.stream
+                .read_exact(buf)
+                .await
+                .map(|_| ())
+                .map_err(CoreError::Io)
+        })
     }
 
     fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
@@ -442,7 +446,8 @@ impl AsyncTlsClientTransport {
     ) -> CoreResult<Self> {
         let tcp = AsyncTcpTransport::connect(addr, timeouts).await?;
         let server_name = ServerName::try_from(server_name)
-            .map_err(|_| CoreError::Parse("invalid server name".to_string()))?;
+            .map_err(|_| CoreError::Parse("invalid server name".to_string()))?
+            .to_owned();
         let connector = TlsConnector::from(config.inner());
         let stream = connector
             .connect(server_name, tcp.stream)
@@ -458,7 +463,13 @@ impl AsyncStreamTransport for AsyncTlsClientTransport {
     }
 
     fn read_exact<'a>(&'a mut self, buf: &'a mut [u8]) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
-        Box::pin(async move { self.stream.read_exact(buf).await.map_err(CoreError::Io) })
+        Box::pin(async move {
+            self.stream
+                .read_exact(buf)
+                .await
+                .map(|_| ())
+                .map_err(CoreError::Io)
+        })
     }
 
     fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {

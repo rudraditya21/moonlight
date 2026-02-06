@@ -809,7 +809,8 @@ mod tests {
                 3 => HttpMethod::Delete,
                 _ => HttpMethod::Other("CUSTOM".to_string()),
             };
-            let path = format!("/{}", rng.next_string(5 + (rng.next_u8() % 10) as usize));
+            let extra = rng.next_u8() % 10;
+            let path = format!("/{}", rng.next_string(5 + extra as usize));
             let mut req = HttpRequest::new(method, path);
             let body_len = (rng.next_u8() % 64) as usize;
             req.body = rng.next_bytes(body_len);
