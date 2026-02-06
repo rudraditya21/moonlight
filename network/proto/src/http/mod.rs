@@ -524,14 +524,20 @@ fn handle_connection(
                 request.body = read_chunked_body(&mut transport, &mut buffer, max_body)?;
             }
         }
-        let mut response = (handler)(request);
+        let mut response = (handler)(request.clone());
         let connection = header_map.get("connection").map(|v| v.to_ascii_lowercase());
-        if connection.as_deref() == Some("close") {
+        let should_close = match request.version {
+            HttpVersion::Http10 => connection.as_deref() != Some("keep-alive"),
+            HttpVersion::Http11 => connection.as_deref() == Some("close"),
+        };
+        if should_close {
             response.set_header("Connection", "close");
+        } else if matches!(request.version, HttpVersion::Http10) {
+            response.set_header("Connection", "keep-alive");
         }
         let bytes = response.to_bytes()?;
         transport.write_all(&bytes)?;
-        if connection.as_deref() == Some("close") {
+        if should_close {
             break;
         }
     }
@@ -764,14 +770,20 @@ async fn handle_connection_async(
                 request.body = read_chunked_body_async(&mut transport, &mut buffer, max_body).await?;
             }
         }
-        let mut response = (handler)(request);
+        let mut response = (handler)(request.clone());
         let connection = header_map.get("connection").map(|v| v.to_ascii_lowercase());
-        if connection.as_deref() == Some("close") {
+        let should_close = match request.version {
+            HttpVersion::Http10 => connection.as_deref() != Some("keep-alive"),
+            HttpVersion::Http11 => connection.as_deref() == Some("close"),
+        };
+        if should_close {
             response.set_header("Connection", "close");
+        } else if matches!(request.version, HttpVersion::Http10) {
+            response.set_header("Connection", "keep-alive");
         }
         let bytes = response.to_bytes()?;
         transport.write_all(&bytes).await?;
-        if connection.as_deref() == Some("close") {
+        if should_close {
             break;
         }
     }

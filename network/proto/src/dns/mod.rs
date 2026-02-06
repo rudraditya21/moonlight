@@ -6,10 +6,12 @@ use std::thread;
 use corelib::error::{CoreError, CoreResult};
 use net::NetAddr;
 
-use crate::framing::{LengthPrefixedFramer, Framer};
+use crate::framing::{Framer, LengthPrefixedFramer};
+use crate::http::{AsyncHttpClient, HttpClient, HttpMethod, HttpRequest, HttpVersion};
 use crate::transport::{
-    AsyncStreamTransport, AsyncTcpTransport, AsyncUdpTransport, StreamTransport, TcpTransport,
-    UdpTransport,
+    AsyncStreamTransport, AsyncTcpTransport, AsyncTlsClientTransport, AsyncTlsServer,
+    AsyncTlsServerTransport, AsyncUdpTransport, StreamTransport, TcpTransport, TlsClientConfig,
+    TlsServerConfig, TlsStreamTransport, UdpTransport,
 };
 use crate::util::Timeouts;
 
@@ -89,6 +91,12 @@ pub struct DnsRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsOption {
+    pub code: u16,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsRecordData {
     A(Ipv4Addr),
     AAAA(Ipv6Addr),
@@ -98,6 +106,13 @@ pub enum DnsRecordData {
     MX { preference: u16, exchange: String },
     TXT(String),
     SRV { priority: u16, weight: u16, port: u16, target: String },
+    OPT {
+        udp_payload_size: u16,
+        extended_rcode: u8,
+        version: u8,
+        flags: u16,
+        options: Vec<DnsOption>,
+    },
     Unknown(Vec<u8>),
 }
 
@@ -164,8 +179,23 @@ impl DnsMessage {
         {
             encode_name(&record.name, &mut buf, &mut compression)?;
             buf.extend_from_slice(&record.rtype.to_be_bytes());
-            buf.extend_from_slice(&record.class.to_be_bytes());
-            buf.extend_from_slice(&record.ttl.to_be_bytes());
+            let (class, ttl) = match &record.data {
+                DnsRecordData::OPT {
+                    udp_payload_size,
+                    extended_rcode,
+                    version,
+                    flags,
+                    ..
+                } => {
+                    let ttl = ((*extended_rcode as u32) << 24)
+                        | ((*version as u32) << 16)
+                        | (*flags as u32);
+                    (*udp_payload_size, ttl)
+                }
+                _ => (record.class, record.ttl),
+            };
+            buf.extend_from_slice(&class.to_be_bytes());
+            buf.extend_from_slice(&ttl.to_be_bytes());
             let rdlen_pos = buf.len();
             buf.extend_from_slice(&0u16.to_be_bytes());
             let start = buf.len();
@@ -335,6 +365,13 @@ fn encode_rdata(
             buf.extend_from_slice(&port.to_be_bytes());
             encode_name(target, buf, compression)?;
         }
+        DnsRecordData::OPT { options, .. } => {
+            for opt in options {
+                buf.extend_from_slice(&opt.code.to_be_bytes());
+                buf.extend_from_slice(&(opt.data.len() as u16).to_be_bytes());
+                buf.extend_from_slice(&opt.data);
+            }
+        }
         DnsRecordData::Unknown(raw) => buf.extend_from_slice(raw),
     }
     Ok(buf.len() - start)
@@ -345,6 +382,8 @@ fn decode_rdata(
     offset: &mut usize,
     rtype: u16,
     rdlen: usize,
+    class: u16,
+    ttl: u32,
 ) -> CoreResult<DnsRecordData> {
     let start = *offset;
     let end = start + rdlen;
@@ -413,6 +452,29 @@ fn decode_rdata(
             *offset = next;
             DnsRecordData::SRV { priority, weight, port, target }
         }
+        41 => {
+            let mut options = Vec::new();
+            while *offset + 4 <= end {
+                let code = read_u16(msg, offset)?;
+                let len = read_u16(msg, offset)? as usize;
+                if *offset + len > end {
+                    return Err(CoreError::Parse("invalid opt record".to_string()));
+                }
+                let data = msg[*offset..*offset + len].to_vec();
+                *offset += len;
+                options.push(DnsOption { code, data });
+            }
+            let extended_rcode = ((ttl >> 24) & 0xff) as u8;
+            let version = ((ttl >> 16) & 0xff) as u8;
+            let flags = (ttl & 0xffff) as u16;
+            DnsRecordData::OPT {
+                udp_payload_size: class,
+                extended_rcode,
+                version,
+                flags,
+                options,
+            }
+        }
         _ => {
             let raw = msg[start..end].to_vec();
             *offset = end;
@@ -429,7 +491,7 @@ fn decode_record(msg: &[u8], offset: &mut usize) -> CoreResult<DnsRecord> {
     let class = read_u16(msg, offset)?;
     let ttl = read_u32(msg, offset)?;
     let rdlen = read_u16(msg, offset)? as usize;
-    let data = decode_rdata(msg, offset, rtype, rdlen)?;
+    let data = decode_rdata(msg, offset, rtype, rdlen, class, ttl)?;
     Ok(DnsRecord { name, rtype, class, ttl, data })
 }
 
@@ -506,6 +568,33 @@ impl DnsClient {
         }
         Err(CoreError::Parse("unexpected eof".to_string()))
     }
+
+    pub fn query_tls(
+        &self,
+        message: &DnsMessage,
+        server_name: &str,
+        tls: &TlsClientConfig,
+    ) -> CoreResult<DnsMessage> {
+        let addr = NetAddr::from_socket(self.server);
+        let mut transport = TlsStreamTransport::connect(&addr, server_name, tls, self.timeouts)?;
+        let framer = LengthPrefixedFramer::new(2, self.max_packet)?;
+        let bytes = message.encode()?;
+        let framed = framer.frame(&bytes)?;
+        transport.write_all(&framed)?;
+        let mut buf = Vec::new();
+        loop {
+            let mut chunk = [0u8; 2048];
+            let read = transport.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..read]);
+            if let Some(frame) = framer.deframe(&mut buf)? {
+                return DnsMessage::decode(&frame.payload);
+            }
+        }
+        Err(CoreError::Parse("unexpected eof".to_string()))
+    }
 }
 
 pub struct AsyncDnsClient {
@@ -556,6 +645,182 @@ impl AsyncDnsClient {
         }
         Err(CoreError::Parse("unexpected eof".to_string()))
     }
+
+    pub async fn query_tls(
+        &self,
+        message: &DnsMessage,
+        server_name: &str,
+        tls: &TlsClientConfig,
+    ) -> CoreResult<DnsMessage> {
+        let addr = NetAddr::from_socket(self.server);
+        let mut transport = AsyncTlsClientTransport::connect(&addr, server_name, tls, self.timeouts)
+            .await?;
+        let framer = LengthPrefixedFramer::new(2, self.max_packet)?;
+        let bytes = message.encode()?;
+        let framed = framer.frame(&bytes)?;
+        transport.write_all(&framed).await?;
+        let mut buf = Vec::new();
+        loop {
+            let mut chunk = [0u8; 2048];
+            let read = tokio::time::timeout(self.timeouts.read, transport.read(&mut chunk))
+                .await
+                .map_err(|_| CoreError::Parse("dns tls timeout".to_string()))??;
+            if read == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..read]);
+            if let Some(frame) = framer.deframe(&mut buf)? {
+                return DnsMessage::decode(&frame.payload);
+            }
+        }
+        Err(CoreError::Parse("unexpected eof".to_string()))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DohClient {
+    url: DohUrl,
+    timeouts: Timeouts,
+    max_packet: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AsyncDohClient {
+    url: DohUrl,
+    timeouts: Timeouts,
+    max_packet: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DohUrl {
+    scheme: String,
+    host: String,
+    host_header: String,
+    port: u16,
+    path: String,
+}
+
+impl DohUrl {
+    fn parse(url: &str) -> CoreResult<Self> {
+        let (scheme, rest) = url
+            .split_once("://")
+            .ok_or_else(|| CoreError::Parse("invalid doh url".to_string()))?;
+        let scheme = scheme.to_lowercase();
+        let default_port = if scheme == "https" { 443 } else { 80 };
+        let (host_port, path) = if let Some((host, path)) = rest.split_once('/') {
+            (host, format!("/{}", path))
+        } else {
+            (rest, "/dns-query".to_string())
+        };
+        let (host, host_header, port) = if host_port.starts_with('[') {
+            let end = host_port
+                .find(']')
+                .ok_or_else(|| CoreError::Parse("invalid ipv6 host".to_string()))?;
+            let host = host_port[1..end].to_string();
+            let port = host_port
+                .get(end + 1..)
+                .and_then(|s| s.strip_prefix(':'))
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(default_port);
+            (host.clone(), format!("[{}]", host), port)
+        } else if let Some((host, port)) = host_port.rsplit_once(':') {
+            if let Ok(port) = port.parse::<u16>() {
+                (host.to_string(), host.to_string(), port)
+            } else {
+                (host_port.to_string(), host_port.to_string(), default_port)
+            }
+        } else {
+            (host_port.to_string(), host_port.to_string(), default_port)
+        };
+        Ok(Self {
+            scheme,
+            host,
+            host_header,
+            port,
+            path,
+        })
+    }
+}
+
+impl DohClient {
+    pub fn new(url: &str, timeouts: Timeouts) -> CoreResult<Self> {
+        Ok(Self {
+            url: DohUrl::parse(url)?,
+            timeouts,
+            max_packet: DNS_MAX_PACKET,
+        })
+    }
+
+    pub fn max_packet(mut self, max_packet: usize) -> Self {
+        self.max_packet = max_packet;
+        self
+    }
+
+    pub fn query(&self, message: &DnsMessage) -> CoreResult<DnsMessage> {
+        let mut req = HttpRequest::new(HttpMethod::Post, self.url.path.clone());
+        req.version = HttpVersion::Http11;
+        req.set_header("Host", &self.url.host_header);
+        req.set_header("Content-Type", "application/dns-message");
+        req.set_header("Accept", "application/dns-message");
+        req.body = message.encode()?;
+        let addr = NetAddr::new(&self.url.host, self.url.port);
+        let response = if self.url.scheme == "https" {
+            let tls = TlsClientConfig::with_webpki_roots()?;
+            let mut client = HttpClient::connect_tls(&addr, &self.url.host, &tls, self.timeouts)?;
+            client.send(&req)?
+        } else {
+            let mut client = HttpClient::connect(&addr, self.timeouts)?;
+            client.send(&req)?
+        };
+        if response.status_code != 200 {
+            return Err(CoreError::Parse("doh non-200 response".to_string()));
+        }
+        if response.body.len() > self.max_packet {
+            return Err(CoreError::Parse("doh response too large".to_string()));
+        }
+        DnsMessage::decode(&response.body)
+    }
+}
+
+impl AsyncDohClient {
+    pub fn new(url: &str, timeouts: Timeouts) -> CoreResult<Self> {
+        Ok(Self {
+            url: DohUrl::parse(url)?,
+            timeouts,
+            max_packet: DNS_MAX_PACKET,
+        })
+    }
+
+    pub fn max_packet(mut self, max_packet: usize) -> Self {
+        self.max_packet = max_packet;
+        self
+    }
+
+    pub async fn query(&self, message: &DnsMessage) -> CoreResult<DnsMessage> {
+        let mut req = HttpRequest::new(HttpMethod::Post, self.url.path.clone());
+        req.version = HttpVersion::Http11;
+        req.set_header("Host", &self.url.host_header);
+        req.set_header("Content-Type", "application/dns-message");
+        req.set_header("Accept", "application/dns-message");
+        req.body = message.encode()?;
+        let addr = NetAddr::new(&self.url.host, self.url.port);
+        let response = if self.url.scheme == "https" {
+            let tls = TlsClientConfig::with_webpki_roots()?;
+            let mut client =
+                AsyncHttpClient::connect_tls(&addr, &self.url.host, &tls, self.timeouts).await?;
+            client.send(&req).await?
+        } else {
+            let mut client = AsyncHttpClient::connect(&addr, self.timeouts).await?;
+            client.send(&req).await?
+        };
+        if response.status_code != 200 {
+            return Err(CoreError::Parse("doh non-200 response".to_string()));
+        }
+        if response.body.len() > self.max_packet {
+            return Err(CoreError::Parse("doh response too large".to_string()));
+        }
+        DnsMessage::decode(&response.body)
+    }
 }
 
 pub struct DnsServer {
@@ -597,6 +862,21 @@ impl DnsServer {
             });
         }
         Ok(())
+    }
+
+    pub fn serve_tls<F>(&self, config: &TlsServerConfig, handler: F) -> CoreResult<()>
+    where
+        F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind(self.tcp_addr).map_err(CoreError::Io)?;
+        let handler = Arc::new(handler);
+        loop {
+            let handler = Arc::clone(&handler);
+            let transport = TlsStreamTransport::accept(&listener, config, Timeouts::default())?;
+            thread::spawn(move || {
+                let _ = handle_framed_stream(transport, handler);
+            });
+        }
     }
 }
 
@@ -646,13 +926,40 @@ impl AsyncDnsServer {
             });
         }
     }
+
+    pub async fn serve_tls<F>(&self, config: &TlsServerConfig, handler: F) -> CoreResult<()>
+    where
+        F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind(self.tcp_addr).await.map_err(CoreError::Io)?;
+        let acceptor = AsyncTlsServer::new(config);
+        let handler = Arc::new(handler);
+        loop {
+            let (stream, _) = listener.accept().await.map_err(CoreError::Io)?;
+            let handler = Arc::clone(&handler);
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                if let Ok(tls) = acceptor.accept(stream).await {
+                    let transport = AsyncTlsServerTransport::from_stream(tls);
+                    let _ = handle_framed_stream_async(transport, handler).await;
+                }
+            });
+        }
+    }
 }
 
 async fn handle_tcp_client_async(
     stream: tokio::net::TcpStream,
     handler: Arc<dyn Fn(DnsMessage) -> DnsMessage + Send + Sync>,
 ) -> CoreResult<()> {
-    let mut transport = AsyncTcpTransport::from_stream(stream);
+    let transport = AsyncTcpTransport::from_stream(stream);
+    handle_framed_stream_async(transport, handler).await
+}
+
+async fn handle_framed_stream_async<T: AsyncStreamTransport>(
+    mut transport: T,
+    handler: Arc<dyn Fn(DnsMessage) -> DnsMessage + Send + Sync>,
+) -> CoreResult<()> {
     let framer = LengthPrefixedFramer::new(2, DNS_MAX_PACKET)?;
     let mut buf = Vec::new();
     loop {
@@ -676,7 +983,14 @@ fn handle_tcp_client(
     stream: std::net::TcpStream,
     handler: Arc<dyn Fn(DnsMessage) -> DnsMessage + Send + Sync>,
 ) -> CoreResult<()> {
-    let mut transport = TcpTransport::from_stream(stream, Timeouts::default())?;
+    let transport = TcpTransport::from_stream(stream, Timeouts::default())?;
+    handle_framed_stream(transport, handler)
+}
+
+fn handle_framed_stream<T: StreamTransport>(
+    mut transport: T,
+    handler: Arc<dyn Fn(DnsMessage) -> DnsMessage + Send + Sync>,
+) -> CoreResult<()> {
     let framer = LengthPrefixedFramer::new(2, DNS_MAX_PACKET)?;
     let mut buf = Vec::new();
     loop {

@@ -481,6 +481,41 @@ impl AsyncStreamTransport for AsyncTlsClientTransport {
     }
 }
 
+pub struct AsyncTlsServerTransport {
+    stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+}
+
+impl AsyncTlsServerTransport {
+    pub fn from_stream(stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>) -> Self {
+        Self { stream }
+    }
+}
+
+impl AsyncStreamTransport for AsyncTlsServerTransport {
+    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Pin<Box<dyn Future<Output = CoreResult<usize>> + Send + 'a>> {
+        Box::pin(async move { self.stream.read(buf).await.map_err(CoreError::Io) })
+    }
+
+    fn read_exact<'a>(&'a mut self, buf: &'a mut [u8]) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.stream
+                .read_exact(buf)
+                .await
+                .map(|_| ())
+                .map_err(CoreError::Io)
+        })
+    }
+
+    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
+        Box::pin(async move { self.stream.write_all(buf).await.map_err(CoreError::Io) })
+    }
+
+    fn shutdown<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
+        Box::pin(async move { self.stream.shutdown().await.map_err(CoreError::Io) })
+    }
+}
+
+#[derive(Clone)]
 pub struct AsyncTlsServer {
     acceptor: TlsAcceptor,
 }
