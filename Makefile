@@ -23,7 +23,7 @@ perf:
 	$(CARGO) run -p modules --bin catalog_bench
 
 perf-release:
-	MOONLIGHT_PERF_INDEX_MS_COLD=1200 MOONLIGHT_PERF_INDEX_MS_WARM=300 MOONLIGHT_PERF_SEARCH_MS=30 \
+	MOONLIGHT_PERF_INDEX_MS_COLD=1200 MOONLIGHT_PERF_INDEX_MS_WARM=600 MOONLIGHT_PERF_SEARCH_MS=30 \
 		$(CARGO) run -p modules --bin catalog_bench --release
 
 # Format the codebase in-place

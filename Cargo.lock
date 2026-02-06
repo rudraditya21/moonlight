@@ -21,6 +21,7 @@ name = "modules"
 version = "0.1.0"
 dependencies = [
  "corelib",
+ "libc",
  "md5",
  "phf",
  "sha1",

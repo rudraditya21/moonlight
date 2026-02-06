@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use corelib::ids::Id;
 use modules::{
-    Module, ModuleCatalog, ModuleCategory, ModuleContext, ModuleRank, ModuleRegistry, SearchQuery,
+    load_dyn_module, Module, ModuleCatalog, ModuleCategory, ModuleContext, ModuleRank,
+    ModuleRegistry, SearchQuery,
 };
 
 use crate::ansi::Palette;
@@ -133,6 +134,29 @@ impl Repl {
         }
         let name = &tokens[1];
         let Some(module) = self.registry.create(name) else {
+            if let Some(catalog) = &self.catalog {
+                if let Some(record) = catalog.get_by_name(name) {
+                    if let Some(entrypoint) = &record.entrypoint_path {
+                        match load_dyn_module(entrypoint) {
+                            Ok(module) => {
+                                self.active = Some(module);
+                                println!(
+                                    "{}",
+                                    self.palette.success(&format!("Using module: {name}"))
+                                );
+                                return;
+                            }
+                            Err(err) => {
+                                println!(
+                                    "{}",
+                                    self.palette.error(&format!("Module load failed: {err}"))
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
             println!("{}", self.palette.error(&format!("Module not found: {name}")));
             return;
         };
@@ -334,7 +358,12 @@ impl Repl {
         }
         let results = catalog.search(&query);
         if results.is_empty() {
-            println!("{}", self.palette.warning("No matching modules."));
+            println!(
+                "{}",
+                self.palette.warning(
+                    "No matching modules. Search requires term, tag, platform, category, or rank."
+                )
+            );
             return;
         }
         let mut rows = Vec::with_capacity(results.len());

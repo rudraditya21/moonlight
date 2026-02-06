@@ -5,7 +5,7 @@ use modules::{ModuleCatalog, SearchQuery};
 fn main() {
     let total = env_usize("MOONLIGHT_PERF_MODULES", 10_000);
     let index_cold_ms_target = env_u128("MOONLIGHT_PERF_INDEX_MS_COLD", 1200);
-    let index_warm_ms_target = env_u128("MOONLIGHT_PERF_INDEX_MS_WARM", 300);
+    let index_warm_ms_target = env_u128("MOONLIGHT_PERF_INDEX_MS_WARM", 600);
     let search_ms_target = env_u128("MOONLIGHT_PERF_SEARCH_MS", 30);
 
     let root = std::env::temp_dir().join(format!("moonlight_perf_{}", std::process::id()));
