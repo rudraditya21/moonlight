@@ -1,7 +1,9 @@
 use std::io::{self, Write};
 
 use corelib::ids::Id;
-use modules::{Module, ModuleContext, ModuleRegistry};
+use modules::{
+    Module, ModuleCatalog, ModuleCategory, ModuleContext, ModuleRank, ModuleRegistry, SearchQuery,
+};
 
 use crate::history::History;
 use crate::parser::tokenize;
@@ -28,16 +30,18 @@ impl std::error::Error for ReplError {}
 pub struct Repl {
     prompt: String,
     registry: ModuleRegistry,
+    catalog: Option<ModuleCatalog>,
     history: History,
     active: Option<Box<dyn Module>>,
     session_id: Id,
 }
 
 impl Repl {
-    pub fn new(prompt: String, registry: ModuleRegistry) -> Self {
+    pub fn new(prompt: String, registry: ModuleRegistry, catalog: Option<ModuleCatalog>) -> Self {
         Repl {
             prompt,
             registry,
+            catalog,
             history: History::new(500),
             active: None,
             session_id: Id::next(),
@@ -48,10 +52,14 @@ impl Repl {
         let stdin = io::stdin();
         loop {
             print!("{}", self.prompt);
-            io::stdout().flush().map_err(|e| ReplError::Io(e.to_string()))?;
+            io::stdout()
+                .flush()
+                .map_err(|e| ReplError::Io(e.to_string()))?;
 
             let mut line = String::new();
-            let bytes = stdin.read_line(&mut line).map_err(|e| ReplError::Io(e.to_string()))?;
+            let bytes = stdin
+                .read_line(&mut line)
+                .map_err(|e| ReplError::Io(e.to_string()))?;
             if bytes == 0 {
                 break;
             }
@@ -86,6 +94,7 @@ impl Repl {
             "history" => self.cmd_history(),
             "use" => self.cmd_use(tokens),
             "show" => self.cmd_show(tokens),
+            "search" => self.cmd_search(tokens),
             "set" => self.cmd_set(tokens),
             "get" => self.cmd_get(tokens),
             "run" => self.cmd_run(),
@@ -100,6 +109,7 @@ impl Repl {
         println!("  show modules         List modules");
         println!("  use <name>           Select module");
         println!("  show options         Show module options");
+        println!("  search <query>       Search modules");
         println!("  set <opt> <value>    Set module option");
         println!("  get <opt>            Get module option");
         println!("  run                  Execute module");
@@ -134,7 +144,24 @@ impl Repl {
         }
         match tokens[1].as_str() {
             "modules" => {
-                if self.registry.is_empty() {
+                if let Some(catalog) = &self.catalog {
+                    let limit = tokens
+                        .get(2)
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(50);
+                    let total = catalog.len();
+                    if total == 0 {
+                        println!("No modules indexed.");
+                        return;
+                    }
+                    println!("Indexed modules: {total}. Showing up to {limit}.");
+                    for record in catalog.iter().take(limit) {
+                        println!("{} - {}", record.metadata.name, record.metadata.description);
+                    }
+                    if total > limit {
+                        println!("Use: search <term> [--category <cat>] [--rank <rank>] [--platform <platform>] [--tag <tag>]");
+                    }
+                } else if self.registry.is_empty() {
                     println!("No modules registered.");
                 } else {
                     for meta in self.registry.iter_metadata() {
@@ -151,7 +178,13 @@ impl Repl {
                 for opt in module.options().iter() {
                     let value = opt.value_as_string();
                     let required = if opt.required { "yes" } else { "no" };
-                    println!("  {:<16} {:<8} {:<6} {}", opt.name, opt.kind_string(), required, value);
+                    println!(
+                        "  {:<16} {:<8} {:<6} {}",
+                        opt.name,
+                        opt.kind_string(),
+                        required,
+                        value
+                    );
                 }
             }
             _ => println!("Unknown show target: {}", tokens[1]),
@@ -189,6 +222,86 @@ impl Repl {
             return;
         };
         println!("{} = {}", opt.name, opt.value_as_string());
+    }
+
+    fn cmd_search(&self, tokens: &[String]) {
+        let Some(catalog) = &self.catalog else {
+            println!("No module catalog loaded.");
+            return;
+        };
+        if tokens.len() < 2 {
+            println!("Usage: search <term> [--category <cat>] [--rank <rank>] [--platform <platform>] [--tag <tag>] [--limit <n>]");
+            return;
+        }
+        let mut query = SearchQuery::new();
+        let mut terms = Vec::new();
+        let mut i = 1;
+        while i < tokens.len() {
+            match tokens[i].as_str() {
+                "--category" | "--cat" => {
+                    i += 1;
+                    if let Some(val) = tokens.get(i) {
+                        let category = ModuleCategory::parse(val);
+                        if category == ModuleCategory::Unknown {
+                            println!("Unknown category: {val}");
+                        } else {
+                            query.category = Some(category);
+                        }
+                    }
+                }
+                "--rank" => {
+                    i += 1;
+                    if let Some(val) = tokens.get(i) {
+                        let rank = ModuleRank::parse(val);
+                        if rank == ModuleRank::Unknown {
+                            println!("Unknown rank: {val}");
+                        } else {
+                            query.rank = Some(rank);
+                        }
+                    }
+                }
+                "--platform" => {
+                    i += 1;
+                    if let Some(val) = tokens.get(i) {
+                        query.platform = Some(val.to_string());
+                    }
+                }
+                "--tag" => {
+                    i += 1;
+                    if let Some(val) = tokens.get(i) {
+                        query.tags.push(val.to_string());
+                    }
+                }
+                "--limit" => {
+                    i += 1;
+                    if let Some(val) = tokens.get(i) {
+                        if let Ok(limit) = val.parse::<usize>() {
+                            query.limit = Some(limit);
+                        }
+                    }
+                }
+                other => {
+                    terms.push(other.to_string());
+                }
+            }
+            i += 1;
+        }
+        if !terms.is_empty() {
+            query.term = Some(terms.join(" "));
+        }
+        let results = catalog.search(&query);
+        if results.is_empty() {
+            println!("No matching modules.");
+            return;
+        }
+        for record in results {
+            let rank = record.metadata.rank.as_str();
+            let category = record.metadata.category.as_str();
+            println!(
+                "{} [{}] [{}] - {}",
+                record.metadata.name, category, rank, record.metadata.description
+            );
+        }
     }
 
     fn cmd_run(&mut self) {

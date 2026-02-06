@@ -60,7 +60,9 @@ impl<V> PhfMap<V> {
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.slots.iter().filter_map(|slot| slot.as_ref().map(|s| s.key.as_str()))
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.as_ref().map(|s| s.key.as_str()))
     }
 }
 

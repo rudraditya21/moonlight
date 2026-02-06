@@ -81,8 +81,6 @@ impl ModuleBase {
     }
 
     pub fn validate(&self) -> Result<(), ModuleError> {
-        self.options
-            .validate()
-            .map_err(ModuleError::Validation)
+        self.options.validate().map_err(ModuleError::Validation)
     }
 }

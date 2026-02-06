@@ -1,5 +1,5 @@
-use std::fmt;
 use phf::PhfMap;
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModuleOptionKind {
@@ -77,7 +77,9 @@ impl ModuleOption {
                 ModuleOptionValue::Bool(v)
             }
             ModuleOptionKind::Integer => {
-                let v: i64 = input.parse().map_err(|_| format!("invalid integer: {input}"))?;
+                let v: i64 = input
+                    .parse()
+                    .map_err(|_| format!("invalid integer: {input}"))?;
                 ModuleOptionValue::Integer(v)
             }
             ModuleOptionKind::Address => {
@@ -87,7 +89,9 @@ impl ModuleOption {
                 ModuleOptionValue::Address(input.to_string())
             }
             ModuleOptionKind::Port => {
-                let v: u16 = input.parse().map_err(|_| format!("invalid port: {input}"))?;
+                let v: u16 = input
+                    .parse()
+                    .map_err(|_| format!("invalid port: {input}"))?;
                 ModuleOptionValue::Port(v)
             }
         };
@@ -138,7 +142,9 @@ impl ModuleOptions {
                 return self.options.get(*idx);
             }
         }
-        self.options.iter().find(|opt| opt.name.eq_ignore_ascii_case(name))
+        self.options
+            .iter()
+            .find(|opt| opt.name.eq_ignore_ascii_case(name))
     }
 
     pub fn set(&mut self, name: &str, value: &str) -> Result<(), String> {

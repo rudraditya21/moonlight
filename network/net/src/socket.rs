@@ -20,7 +20,9 @@ impl TcpClient {
                 Err(err) => last_err = Some(err),
             }
         }
-        Err(last_err.map(CoreError::Io).unwrap_or_else(|| CoreError::Parse("unable to connect".to_string())))
+        Err(last_err
+            .map(CoreError::Io)
+            .unwrap_or_else(|| CoreError::Parse("unable to connect".to_string())))
     }
 
     pub fn connect_timeout(addr: &NetAddr, timeout: Duration) -> CoreResult<Self> {
@@ -31,7 +33,9 @@ impl TcpClient {
                 Err(err) => last_err = Some(err),
             }
         }
-        Err(last_err.map(CoreError::Io).unwrap_or_else(|| CoreError::Parse("unable to connect".to_string())))
+        Err(last_err
+            .map(CoreError::Io)
+            .unwrap_or_else(|| CoreError::Parse("unable to connect".to_string())))
     }
 
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> CoreResult<()> {
@@ -39,7 +43,9 @@ impl TcpClient {
     }
 
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> CoreResult<()> {
-        self.stream.set_write_timeout(timeout).map_err(CoreError::Io)
+        self.stream
+            .set_write_timeout(timeout)
+            .map_err(CoreError::Io)
     }
 
     pub fn peer_addr(&self) -> CoreResult<SocketAddr> {
@@ -65,7 +71,9 @@ impl TcpClient {
                 break;
             }
             if buf.len() + read > max_bytes {
-                return Err(CoreError::Parse("response exceeds maximum size".to_string()));
+                return Err(CoreError::Parse(
+                    "response exceeds maximum size".to_string(),
+                ));
             }
             buf.extend_from_slice(&chunk[..read]);
         }

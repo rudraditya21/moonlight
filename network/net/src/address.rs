@@ -18,7 +18,9 @@ impl NetAddr {
 
     pub fn parse(input: &str) -> CoreResult<Self> {
         if input.starts_with('[') {
-            let end = input.find(']').ok_or_else(|| CoreError::Parse("invalid IPv6 bracket".to_string()))?;
+            let end = input
+                .find(']')
+                .ok_or_else(|| CoreError::Parse("invalid IPv6 bracket".to_string()))?;
             let host = &input[1..end];
             let port_part = input.get(end + 1..).unwrap_or("");
             let port = port_part
@@ -43,10 +45,7 @@ impl NetAddr {
 
     pub fn resolve(&self) -> CoreResult<Vec<SocketAddr>> {
         let addr = format!("{}:{}", self.host, self.port);
-        let resolved: Vec<SocketAddr> = addr
-            .to_socket_addrs()
-            .map_err(CoreError::Io)?
-            .collect();
+        let resolved: Vec<SocketAddr> = addr.to_socket_addrs().map_err(CoreError::Io)?.collect();
         if resolved.is_empty() {
             return Err(CoreError::Parse("unable to resolve address".to_string()));
         }
