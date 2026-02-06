@@ -1,5 +1,5 @@
 use crate::config::Config;
-use modules::{ModuleCatalog, ModuleRegistry, ModuleRegistryBuilder, RegistryError};
+use modules::{register_builtin_modules, ModuleCatalog, ModuleRegistry, ModuleRegistryBuilder, RegistryError};
 use repl::{Repl, ReplError};
 use std::path::Path;
 
@@ -18,6 +18,7 @@ pub fn run(config: Config) -> Result<(), ReplError> {
 }
 
 fn build_registry() -> Result<ModuleRegistry, RegistryError> {
-    // Empty registry for now; modules will be added as they are implemented.
-    ModuleRegistryBuilder::new().build()
+    let mut builder = ModuleRegistryBuilder::new();
+    register_builtin_modules(&mut builder);
+    builder.build()
 }

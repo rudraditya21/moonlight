@@ -9,6 +9,11 @@ members = [
   "core/repl",
   "modules/modules",
   "storage/phf",
+  "crypt/md5",
+  "crypt/sha1",
+  "crypt/sha256",
+  "crypt/sha384",
+  "crypt/sha512",
   "network/net",
   "network/proto",
 ]

@@ -7,11 +7,20 @@ name = "corelib"
 version = "0.1.0"
 
 [[package]]
+name = "md5"
+version = "0.1.0"
+
+[[package]]
 name = "modules"
 version = "0.1.0"
 dependencies = [
  "corelib",
+ "md5",
  "phf",
+ "sha1",
+ "sha256",
+ "sha384",
+ "sha512",
 ]
 
 [[package]]
@@ -51,3 +60,19 @@ dependencies = [
  "corelib",
  "modules",
 ]
+
+[[package]]
+name = "sha1"
+version = "0.1.0"
+
+[[package]]
+name = "sha256"
+version = "0.1.0"
+
+[[package]]
+name = "sha384"
+version = "0.1.0"
+
+[[package]]
+name = "sha512"
+version = "0.1.0"

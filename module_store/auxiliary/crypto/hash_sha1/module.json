@@ -1,0 +1,10 @@
+{
+  "name": "auxiliary/crypto/hash_sha1",
+  "description": "Compute or verify SHA1 hashes",
+  "category": "auxiliary",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": ["cross"],
+  "tags": ["crypto", "hash", "sha1"],
+  "entrypoint": "module.rs"
+}

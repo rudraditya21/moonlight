@@ -1,0 +1,10 @@
+{
+  "name": "auxiliary/crypto/hash_sha384",
+  "description": "Compute or verify SHA384 hashes",
+  "category": "auxiliary",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": ["cross"],
+  "tags": ["crypto", "hash", "sha384"],
+  "entrypoint": "module.rs"
+}
