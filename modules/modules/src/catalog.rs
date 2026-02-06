@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread;
 
 use corelib::error::{CoreError, CoreResult};
 use phf::PhfMap;
 
-use crate::cache::{CachedEntry, ModuleCache};
+use crate::cache::CachedEntry;
 use crate::hash::{
     ensure_dir, file_fingerprint_with_hash, file_metadata_fingerprint, read_to_string,
 };
 use crate::manifest::ModuleManifest;
-use crate::metadata::{ModuleCategory, ModuleMetadata, ModuleRank};
+use crate::metadata::{ModuleCategory, ModuleMetadata, ModuleRank, ModuleReference};
 
 #[derive(Debug, Clone)]
 pub struct ModuleRecord {
@@ -94,6 +96,17 @@ impl StringIndex {
 }
 
 #[derive(Debug, Clone)]
+struct LoadedIndex {
+    entries: Vec<CachedEntry>,
+    name_index: Option<PhfMap<usize>>,
+    tag_index: Option<StringIndex>,
+    platform_index: Option<StringIndex>,
+    token_index: Option<StringIndex>,
+    category_index: Vec<Vec<usize>>,
+    rank_index: Vec<Vec<usize>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModuleCatalog {
     records: Vec<ModuleRecord>,
     name_index: Option<PhfMap<usize>>,
@@ -110,54 +123,52 @@ impl ModuleCatalog {
             return ModuleCatalog::from_records(Vec::new());
         }
         ensure_dir(cache_dir).map_err(CoreError::Io)?;
-        let cache_path = cache_dir.join("module_index.bin");
-        let cache = ModuleCache::load(&cache_path)?;
-        let cache_map = cache.as_ref().map(|c| c.as_map()).unwrap_or_default();
+        let index_path = cache_dir.join("module_index.bin");
+        let loaded_index = load_index(&index_path)?;
+        let cache_map = loaded_index
+            .as_ref()
+            .map(|idx| cached_entry_map(&idx.entries))
+            .unwrap_or_default();
 
         let manifest_files = find_manifest_files(root)?;
-        let mut records = Vec::with_capacity(manifest_files.len());
-        let mut cached_entries = Vec::with_capacity(manifest_files.len());
-
-        for manifest_path in manifest_files {
-            let (size, mtime) = file_metadata_fingerprint(&manifest_path)?;
-            let rel_path = manifest_path
-                .strip_prefix(root)
-                .unwrap_or(&manifest_path)
-                .to_string_lossy()
-                .to_string();
-            if let Some(entry) = cache_map.get(&rel_path) {
-                if entry.fingerprint.matches_fast(size, mtime) {
-                    let metadata = entry.metadata.clone();
-                    let fingerprint = entry.fingerprint.clone();
-                    let record = build_record(metadata.clone(), &manifest_path);
-                    records.push(record);
-                    cached_entries.push(CachedEntry {
-                        manifest_path: rel_path,
-                        fingerprint,
-                        metadata,
-                    });
-                    continue;
+        let tasks = manifest_files
+            .iter()
+            .map(|manifest_path| {
+                let rel_path = manifest_path
+                    .strip_prefix(root)
+                    .unwrap_or(manifest_path)
+                    .to_string_lossy()
+                    .to_string();
+                ManifestTask {
+                    manifest_path: manifest_path.to_path_buf(),
+                    rel_path,
                 }
-            }
-            let content = read_to_string(&manifest_path)?;
-            let manifest = ModuleManifest::parse_str(&content)
-                .map_err(|e| CoreError::Parse(format!("{}: {}", rel_path, e)))?;
-            let metadata = manifest.metadata.clone();
-            let fingerprint = file_fingerprint_with_hash(&manifest_path, size, mtime)?;
-            let record = build_record(metadata.clone(), &manifest_path);
+            })
+            .collect::<Vec<_>>();
+        let mut results = process_manifest_tasks(tasks, &cache_map)?;
+
+        let unchanged = loaded_index.is_some()
+            && results.len() == cache_map.len()
+            && results.iter().all(|item| item.fast_match);
+        if unchanged {
+            return Ok(catalog_from_index(loaded_index.unwrap(), root));
+        }
+
+        results.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        let mut records = Vec::with_capacity(results.len());
+        let mut cached_entries = Vec::with_capacity(results.len());
+        for item in results {
+            let record = build_record(item.metadata.clone(), &item.manifest_path);
             records.push(record);
             cached_entries.push(CachedEntry {
-                manifest_path: rel_path,
-                fingerprint,
-                metadata,
+                manifest_path: item.rel_path,
+                fingerprint: item.fingerprint,
+                metadata: item.metadata,
             });
         }
 
         let catalog = ModuleCatalog::from_records(records)?;
-        let cache = ModuleCache {
-            entries: cached_entries,
-        };
-        cache.save(&cache_path)?;
+        save_index(&index_path, &cached_entries, &catalog)?;
         Ok(catalog)
     }
 
@@ -167,6 +178,10 @@ impl ModuleCatalog {
 
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+
+    pub fn has_name_index(&self) -> bool {
+        self.name_index.is_some()
     }
 
     pub fn get_by_name(&self, name: &str) -> Option<&ModuleRecord> {
@@ -185,26 +200,32 @@ impl ModuleCatalog {
 
     pub fn search(&self, query: &SearchQuery) -> Vec<&ModuleRecord> {
         let mut candidates: Option<Vec<usize>> = None;
+        let mut constrained = false;
 
         if let Some(category) = query.category {
             let idx = category_to_index(category);
             let list = self.category_index.get(idx).cloned().unwrap_or_default();
             candidates = Some(list);
+            constrained = true;
         }
 
         if let Some(rank) = query.rank {
             let idx = rank_to_index(rank);
             let list = self.rank_index.get(idx).cloned().unwrap_or_default();
             candidates = Some(intersect_candidates(candidates, &list));
+            constrained = true;
         }
 
         if let Some(platform) = &query.platform {
             if let Some(index) = &self.platform_index {
                 if let Some(list) = index.get(platform) {
                     candidates = Some(intersect_candidates(candidates, list));
+                    constrained = true;
                 } else {
                     return Vec::new();
                 }
+            } else {
+                return Vec::new();
             }
         }
 
@@ -218,6 +239,8 @@ impl ModuleCatalog {
                         return Vec::new();
                     }
                 }
+            } else {
+                return Vec::new();
             }
             if !lists.is_empty() {
                 lists.sort_by_key(|l| l.len());
@@ -229,6 +252,7 @@ impl ModuleCatalog {
                     }
                 }
                 candidates = Some(intersect_candidates(candidates, &filtered));
+                constrained = true;
             }
         }
 
@@ -255,9 +279,10 @@ impl ModuleCatalog {
                             filtered.push(idx);
                         }
                     }
+                    constrained = true;
                     Some(filtered)
                 } else {
-                    None
+                    return Vec::new();
                 }
             } else {
                 None
@@ -269,6 +294,10 @@ impl ModuleCatalog {
         let mut base = candidates;
         if let Some(token_list) = token_candidates {
             base = Some(intersect_candidates(base, &token_list));
+        }
+
+        if !constrained {
+            return Vec::new();
         }
 
         let iter: Box<dyn Iterator<Item = usize>> = if let Some(list) = base {
@@ -341,6 +370,113 @@ impl ModuleCatalog {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ManifestTask {
+    manifest_path: PathBuf,
+    rel_path: String,
+}
+
+#[derive(Debug, Clone)]
+struct ManifestProcessed {
+    manifest_path: PathBuf,
+    rel_path: String,
+    metadata: ModuleMetadata,
+    fingerprint: crate::hash::FileFingerprint,
+    fast_match: bool,
+}
+
+fn process_manifest_tasks(
+    tasks: Vec<ManifestTask>,
+    cache_map: &HashMap<String, CachedEntry>,
+) -> CoreResult<Vec<ManifestProcessed>> {
+    if tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let workers = worker_count.min(tasks.len()).max(1);
+    let chunk_size = (tasks.len() + workers - 1) / workers;
+    let cache_map = Arc::new(cache_map.clone());
+    let mut handles = Vec::with_capacity(workers);
+    for chunk in tasks.chunks(chunk_size) {
+        let cache_map = Arc::clone(&cache_map);
+        let chunk_vec = chunk.to_vec();
+        handles.push(thread::spawn(move || -> CoreResult<Vec<ManifestProcessed>> {
+            let mut out = Vec::with_capacity(chunk_vec.len());
+            for task in chunk_vec {
+                out.push(process_manifest_task(task, &cache_map)?);
+            }
+            Ok(out)
+        }));
+    }
+
+    let mut results = Vec::with_capacity(tasks.len());
+    for handle in handles {
+        let chunk = handle
+            .join()
+            .map_err(|_| CoreError::Message("manifest worker panicked".to_string()))??;
+        results.extend(chunk);
+    }
+    Ok(results)
+}
+
+fn process_manifest_task(
+    task: ManifestTask,
+    cache_map: &HashMap<String, CachedEntry>,
+) -> CoreResult<ManifestProcessed> {
+    let (size, mtime) = file_metadata_fingerprint(&task.manifest_path)?;
+    if let Some(entry) = cache_map.get(&task.rel_path) {
+        if entry.fingerprint.matches_fast(size, mtime) {
+            return Ok(ManifestProcessed {
+                manifest_path: task.manifest_path,
+                rel_path: task.rel_path,
+                metadata: entry.metadata.clone(),
+                fingerprint: entry.fingerprint.clone(),
+                fast_match: true,
+            });
+        }
+    }
+    let content = read_to_string(&task.manifest_path)?;
+    let manifest = ModuleManifest::parse_str(&content)
+        .map_err(|e| CoreError::Parse(format!("{}: {}", task.rel_path, e)))?;
+    let metadata = manifest.metadata;
+    let fingerprint = file_fingerprint_with_hash(&task.manifest_path, size, mtime)?;
+    Ok(ManifestProcessed {
+        manifest_path: task.manifest_path,
+        rel_path: task.rel_path,
+        metadata,
+        fingerprint,
+        fast_match: false,
+    })
+}
+
+fn cached_entry_map(entries: &[CachedEntry]) -> HashMap<String, CachedEntry> {
+    let mut map = HashMap::with_capacity(entries.len());
+    for entry in entries {
+        map.insert(entry.manifest_path.clone(), entry.clone());
+    }
+    map
+}
+
+fn catalog_from_index(index: LoadedIndex, root: &Path) -> ModuleCatalog {
+    let mut records = Vec::with_capacity(index.entries.len());
+    for entry in index.entries {
+        let manifest_path = root.join(&entry.manifest_path);
+        let record = build_record(entry.metadata, &manifest_path);
+        records.push(record);
+    }
+    ModuleCatalog {
+        records,
+        name_index: index.name_index,
+        tag_index: index.tag_index,
+        platform_index: index.platform_index,
+        token_index: index.token_index,
+        category_index: index.category_index,
+        rank_index: index.rank_index,
+    }
+}
+
 fn intersect_candidates(existing: Option<Vec<usize>>, list: &[usize]) -> Vec<usize> {
     match existing {
         None => list.to_vec(),
@@ -388,6 +524,8 @@ fn build_record(metadata: ModuleMetadata, manifest_path: &Path) -> ModuleRecord 
 
 const CATEGORY_COUNT: usize = 7;
 const RANK_COUNT: usize = 8;
+const INDEX_MAGIC: &[u8; 4] = b"MLMI";
+const INDEX_VERSION: u32 = 1;
 
 fn category_to_index(category: ModuleCategory) -> usize {
     match category {
@@ -447,6 +585,401 @@ fn tokenize_text(input: &str) -> Vec<String> {
     tokens.sort();
     tokens.dedup();
     tokens
+}
+
+fn load_index(path: &Path) -> CoreResult<Option<LoadedIndex>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read(path).map_err(CoreError::Io)?;
+    let mut cursor = 0;
+    if read_bytes(&data, &mut cursor, 4)? != INDEX_MAGIC {
+        return Ok(None);
+    }
+    let version = read_u32(&data, &mut cursor)?;
+    if version != INDEX_VERSION {
+        return Ok(None);
+    }
+    let entry_count = read_u32(&data, &mut cursor)? as usize;
+    let mut entries = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let manifest_path = read_string(&data, &mut cursor)?;
+        let size = read_u64(&data, &mut cursor)?;
+        let mtime = read_u64(&data, &mut cursor)?;
+        let hash = read_u64(&data, &mut cursor)?;
+        let metadata = read_metadata(&data, &mut cursor)?;
+        entries.push(CachedEntry {
+            manifest_path,
+            fingerprint: crate::hash::FileFingerprint { size, mtime, hash },
+            metadata,
+        });
+    }
+    let name_index = read_phf_map_option(&data, &mut cursor)?;
+    let tag_index = read_string_index(&data, &mut cursor)?;
+    let platform_index = read_string_index(&data, &mut cursor)?;
+    let token_index = read_string_index(&data, &mut cursor)?;
+    let category_index = read_index_lists(&data, &mut cursor)?;
+    let rank_index = read_index_lists(&data, &mut cursor)?;
+
+    Ok(Some(LoadedIndex {
+        entries,
+        name_index,
+        tag_index,
+        platform_index,
+        token_index,
+        category_index,
+        rank_index,
+    }))
+}
+
+fn save_index(path: &Path, entries: &[CachedEntry], catalog: &ModuleCatalog) -> CoreResult<()> {
+    let mut out = Vec::new();
+    out.extend_from_slice(INDEX_MAGIC);
+    write_u32(&mut out, INDEX_VERSION);
+    write_u32(&mut out, entries.len() as u32);
+    for entry in entries {
+        write_string(&mut out, &entry.manifest_path);
+        write_u64(&mut out, entry.fingerprint.size);
+        write_u64(&mut out, entry.fingerprint.mtime);
+        write_u64(&mut out, entry.fingerprint.hash);
+        write_metadata(&mut out, &entry.metadata);
+    }
+    write_phf_map_option(&mut out, &catalog.name_index)?;
+    write_string_index(&mut out, &catalog.tag_index)?;
+    write_string_index(&mut out, &catalog.platform_index)?;
+    write_string_index(&mut out, &catalog.token_index)?;
+    write_index_lists(&mut out, &catalog.category_index)?;
+    write_index_lists(&mut out, &catalog.rank_index)?;
+
+    std::fs::write(path, out).map_err(CoreError::Io)?;
+    Ok(())
+}
+
+fn write_string_index(out: &mut Vec<u8>, index: &Option<StringIndex>) -> CoreResult<()> {
+    match index {
+        None => {
+            write_u8(out, 0);
+            Ok(())
+        }
+        Some(index) => {
+            write_u8(out, 1);
+            write_phf_map(out, &index.map)?;
+            write_u32(out, index.ranges.len() as u32);
+            for range in &index.ranges {
+                write_u32(out, range.start as u32);
+                write_u32(out, range.len as u32);
+            }
+            write_u32(out, index.entries.len() as u32);
+            for &value in &index.entries {
+                write_u32(out, value as u32);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn read_string_index(data: &[u8], cursor: &mut usize) -> CoreResult<Option<StringIndex>> {
+    let present = read_u8(data, cursor)?;
+    if present == 0 {
+        return Ok(None);
+    }
+    let map = read_phf_map(data, cursor)?;
+    let ranges_len = read_u32(data, cursor)? as usize;
+    let mut ranges = Vec::with_capacity(ranges_len);
+    for _ in 0..ranges_len {
+        let start = read_u32(data, cursor)? as usize;
+        let len = read_u32(data, cursor)? as usize;
+        ranges.push(TagRange { start, len });
+    }
+    let entries_len = read_u32(data, cursor)? as usize;
+    let mut entries = Vec::with_capacity(entries_len);
+    for _ in 0..entries_len {
+        entries.push(read_u32(data, cursor)? as usize);
+    }
+    Ok(Some(StringIndex { map, ranges, entries }))
+}
+
+fn write_index_lists(out: &mut Vec<u8>, lists: &[Vec<usize>]) -> CoreResult<()> {
+    write_u32(out, lists.len() as u32);
+    for list in lists {
+        write_u32(out, list.len() as u32);
+        for &value in list {
+            write_u32(out, value as u32);
+        }
+    }
+    Ok(())
+}
+
+fn read_index_lists(data: &[u8], cursor: &mut usize) -> CoreResult<Vec<Vec<usize>>> {
+    let count = read_u32(data, cursor)? as usize;
+    let mut lists = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = read_u32(data, cursor)? as usize;
+        let mut list = Vec::with_capacity(len);
+        for _ in 0..len {
+            list.push(read_u32(data, cursor)? as usize);
+        }
+        lists.push(list);
+    }
+    Ok(lists)
+}
+
+fn write_phf_map_option(out: &mut Vec<u8>, map: &Option<PhfMap<usize>>) -> CoreResult<()> {
+    match map {
+        None => {
+            write_u8(out, 0);
+            Ok(())
+        }
+        Some(map) => {
+            write_u8(out, 1);
+            write_phf_map(out, map)
+        }
+    }
+}
+
+fn read_phf_map_option(data: &[u8], cursor: &mut usize) -> CoreResult<Option<PhfMap<usize>>> {
+    let present = read_u8(data, cursor)?;
+    if present == 0 {
+        return Ok(None);
+    }
+    Ok(Some(read_phf_map(data, cursor)?))
+}
+
+fn write_phf_map(out: &mut Vec<u8>, map: &PhfMap<usize>) -> CoreResult<()> {
+    write_u32(out, map.len() as u32);
+    write_u32(out, map.seeds().len() as u32);
+    for &seed in map.seeds() {
+        write_i64(out, seed);
+    }
+    write_u32(out, map.slots().len() as u32);
+    for slot in map.slots() {
+        match slot {
+            None => write_u8(out, 0),
+            Some(entry) => {
+                write_u8(out, 1);
+                write_string(out, entry.key());
+                write_u32(out, *entry.value() as u32);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_phf_map(data: &[u8], cursor: &mut usize) -> CoreResult<PhfMap<usize>> {
+    let size = read_u32(data, cursor)? as usize;
+    let seeds_len = read_u32(data, cursor)? as usize;
+    let mut seeds = Vec::with_capacity(seeds_len);
+    for _ in 0..seeds_len {
+        seeds.push(read_i64(data, cursor)?);
+    }
+    let slots_len = read_u32(data, cursor)? as usize;
+    let mut slots = Vec::with_capacity(slots_len);
+    for _ in 0..slots_len {
+        let present = read_u8(data, cursor)?;
+        if present == 0 {
+            slots.push(None);
+        } else {
+            let key = read_string(data, cursor)?;
+            let value = read_u32(data, cursor)? as usize;
+            slots.push(Some(phf::Slot::new(key, value)));
+        }
+    }
+    Ok(PhfMap::from_parts(seeds, slots, size))
+}
+
+fn write_metadata(out: &mut Vec<u8>, metadata: &ModuleMetadata) {
+    write_string(out, &metadata.name);
+    write_string(out, &metadata.description);
+    write_u8(out, category_to_u8(&metadata.category));
+    write_u8(out, rank_to_u8(metadata.rank));
+    write_string(out, &metadata.author);
+    write_vec_string(out, &metadata.platforms);
+    write_vec_string(out, &metadata.tags);
+    write_optional_string(out, metadata.entrypoint.as_deref());
+    write_u32(out, metadata.references.len() as u32);
+    for reference in &metadata.references {
+        write_string(out, &reference.kind);
+        write_string(out, &reference.value);
+    }
+}
+
+fn read_metadata(data: &[u8], cursor: &mut usize) -> CoreResult<ModuleMetadata> {
+    let name = read_string(data, cursor)?;
+    let description = read_string(data, cursor)?;
+    let category = u8_to_category(read_u8(data, cursor)?);
+    let rank = u8_to_rank(read_u8(data, cursor)?);
+    let author = read_string(data, cursor)?;
+    let platforms = read_vec_string(data, cursor)?;
+    let tags = read_vec_string(data, cursor)?;
+    let entrypoint = read_optional_string(data, cursor)?;
+    let ref_count = read_u32(data, cursor)? as usize;
+    let mut references = Vec::with_capacity(ref_count);
+    for _ in 0..ref_count {
+        let kind = read_string(data, cursor)?;
+        let value = read_string(data, cursor)?;
+        references.push(ModuleReference { kind, value });
+    }
+
+    let mut metadata = ModuleMetadata::new(&name, &description, category, &author).with_rank(rank);
+    for platform in platforms {
+        metadata = metadata.with_platform(&platform);
+    }
+    for tag in tags {
+        metadata = metadata.with_tag(&tag);
+    }
+    if let Some(entrypoint) = entrypoint {
+        metadata = metadata.with_entrypoint(&entrypoint);
+    }
+    for reference in references {
+        metadata = metadata.with_reference(&reference.kind, &reference.value);
+    }
+    Ok(metadata)
+}
+
+fn category_to_u8(category: &ModuleCategory) -> u8 {
+    match category {
+        ModuleCategory::Core => 1,
+        ModuleCategory::Exploit => 2,
+        ModuleCategory::Payload => 3,
+        ModuleCategory::Auxiliary => 4,
+        ModuleCategory::Post => 5,
+        ModuleCategory::Evasion => 6,
+        ModuleCategory::Unknown => 0,
+    }
+}
+
+fn u8_to_category(value: u8) -> ModuleCategory {
+    match value {
+        1 => ModuleCategory::Core,
+        2 => ModuleCategory::Exploit,
+        3 => ModuleCategory::Payload,
+        4 => ModuleCategory::Auxiliary,
+        5 => ModuleCategory::Post,
+        6 => ModuleCategory::Evasion,
+        _ => ModuleCategory::Unknown,
+    }
+}
+
+fn rank_to_u8(rank: ModuleRank) -> u8 {
+    match rank {
+        ModuleRank::Manual => 1,
+        ModuleRank::Low => 2,
+        ModuleRank::Average => 3,
+        ModuleRank::Normal => 4,
+        ModuleRank::Good => 5,
+        ModuleRank::Great => 6,
+        ModuleRank::Excellent => 7,
+        ModuleRank::Unknown => 0,
+    }
+}
+
+fn u8_to_rank(value: u8) -> ModuleRank {
+    match value {
+        1 => ModuleRank::Manual,
+        2 => ModuleRank::Low,
+        3 => ModuleRank::Average,
+        4 => ModuleRank::Normal,
+        5 => ModuleRank::Good,
+        6 => ModuleRank::Great,
+        7 => ModuleRank::Excellent,
+        _ => ModuleRank::Unknown,
+    }
+}
+
+fn write_u8(out: &mut Vec<u8>, value: u8) {
+    out.push(value);
+}
+
+fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_i64(out: &mut Vec<u8>, value: i64) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_string(out: &mut Vec<u8>, value: &str) {
+    write_u32(out, value.len() as u32);
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn write_vec_string(out: &mut Vec<u8>, values: &[String]) {
+    write_u32(out, values.len() as u32);
+    for value in values {
+        write_string(out, value);
+    }
+}
+
+fn write_optional_string(out: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            write_u8(out, 1);
+            write_string(out, value);
+        }
+        None => write_u8(out, 0),
+    }
+}
+
+fn read_bytes<'a>(data: &'a [u8], cursor: &mut usize, len: usize) -> CoreResult<&'a [u8]> {
+    if *cursor + len > data.len() {
+        return Err(CoreError::Parse("unexpected EOF".to_string()));
+    }
+    let slice = &data[*cursor..*cursor + len];
+    *cursor += len;
+    Ok(slice)
+}
+
+fn read_u8(data: &[u8], cursor: &mut usize) -> CoreResult<u8> {
+    let value = read_bytes(data, cursor, 1)?[0];
+    Ok(value)
+}
+
+fn read_u32(data: &[u8], cursor: &mut usize) -> CoreResult<u32> {
+    let bytes = read_bytes(data, cursor, 4)?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_u64(data: &[u8], cursor: &mut usize) -> CoreResult<u64> {
+    let bytes = read_bytes(data, cursor, 8)?;
+    Ok(u64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
+}
+
+fn read_i64(data: &[u8], cursor: &mut usize) -> CoreResult<i64> {
+    let bytes = read_bytes(data, cursor, 8)?;
+    Ok(i64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
+}
+
+fn read_string(data: &[u8], cursor: &mut usize) -> CoreResult<String> {
+    let len = read_u32(data, cursor)? as usize;
+    let bytes = read_bytes(data, cursor, len)?;
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| CoreError::Parse("invalid UTF-8".to_string()))?;
+    Ok(text.to_string())
+}
+
+fn read_vec_string(data: &[u8], cursor: &mut usize) -> CoreResult<Vec<String>> {
+    let count = read_u32(data, cursor)? as usize;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(read_string(data, cursor)?);
+    }
+    Ok(values)
+}
+
+fn read_optional_string(data: &[u8], cursor: &mut usize) -> CoreResult<Option<String>> {
+    let present = read_u8(data, cursor)?;
+    if present == 0 {
+        return Ok(None);
+    }
+    Ok(Some(read_string(data, cursor)?))
 }
 
 #[cfg(test)]

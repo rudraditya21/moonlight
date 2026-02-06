@@ -6,6 +6,20 @@ pub struct Slot<V> {
     pub(crate) value: V,
 }
 
+impl<V> Slot<V> {
+    pub fn new(key: String, value: V) -> Self {
+        Slot { key, value }
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn value(&self) -> &V {
+        &self.value
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PhfMap<V> {
     pub(crate) seeds: Vec<i64>,
@@ -63,6 +77,18 @@ impl<V> PhfMap<V> {
         self.slots
             .iter()
             .filter_map(|slot| slot.as_ref().map(|s| s.key.as_str()))
+    }
+
+    pub fn seeds(&self) -> &[i64] {
+        &self.seeds
+    }
+
+    pub fn slots(&self) -> &[Option<Slot<V>>] {
+        &self.slots
+    }
+
+    pub fn from_parts(seeds: Vec<i64>, slots: Vec<Option<Slot<V>>>, size: usize) -> Self {
+        PhfMap { seeds, slots, size }
     }
 }
 
