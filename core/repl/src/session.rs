@@ -1,11 +1,13 @@
-use std::io::{self, Write};
+use std::collections::HashSet;
 
 use corelib::ids::Id;
 use modules::{
     Module, ModuleCatalog, ModuleCategory, ModuleContext, ModuleRank, ModuleRegistry, SearchQuery,
 };
 
+use crate::ansi::Palette;
 use crate::history::History;
+use crate::line::{read_line, Completer, CompletionResult};
 use crate::parser::tokenize;
 
 #[derive(Debug)]
@@ -28,41 +30,36 @@ impl std::fmt::Display for ReplError {
 impl std::error::Error for ReplError {}
 
 pub struct Repl {
-    prompt: String,
+    prompt_base: String,
     registry: ModuleRegistry,
     catalog: Option<ModuleCatalog>,
     history: History,
     active: Option<Box<dyn Module>>,
     session_id: Id,
+    palette: Palette,
 }
 
 impl Repl {
     pub fn new(prompt: String, registry: ModuleRegistry, catalog: Option<ModuleCatalog>) -> Self {
         Repl {
-            prompt,
+            prompt_base: normalize_prompt(&prompt),
             registry,
             catalog,
             history: History::new(500),
             active: None,
             session_id: Id::next(),
+            palette: Palette::new(),
         }
     }
 
     pub fn run(&mut self) -> Result<(), ReplError> {
-        let stdin = io::stdin();
         loop {
-            print!("{}", self.prompt);
-            io::stdout()
-                .flush()
-                .map_err(|e| ReplError::Io(e.to_string()))?;
-
-            let mut line = String::new();
-            let bytes = stdin
-                .read_line(&mut line)
-                .map_err(|e| ReplError::Io(e.to_string()))?;
-            if bytes == 0 {
+            let prompt = self.prompt_text();
+            let completer = ReplCompleter { repl: self };
+            let line = read_line(&prompt, &completer).map_err(|e| ReplError::Io(e.to_string()))?;
+            let Some(line) = line else {
                 break;
-            }
+            };
             let line = line.trim_end();
             if line.is_empty() {
                 continue;
@@ -72,7 +69,7 @@ impl Repl {
             let tokens = match tokenize(line) {
                 Ok(tokens) => tokens,
                 Err(err) => {
-                    println!("Error: {err}");
+                    println!("{}", self.palette.error(&format!("Error: {err}")));
                     continue;
                 }
             };
@@ -98,7 +95,11 @@ impl Repl {
             "set" => self.cmd_set(tokens),
             "get" => self.cmd_get(tokens),
             "run" => self.cmd_run(),
-            _ => println!("Unknown command: {}", tokens[0]),
+            "info" => self.cmd_info(tokens),
+            _ => println!(
+                "{}",
+                self.palette.error(&format!("Unknown command: {}", tokens[0]))
+            ),
         }
         false
     }
@@ -110,6 +111,7 @@ impl Repl {
         println!("  use <name>           Select module");
         println!("  show options         Show module options");
         println!("  search <query>       Search modules");
+        println!("  info [module]        Show module details");
         println!("  set <opt> <value>    Set module option");
         println!("  get <opt>            Get module option");
         println!("  run                  Execute module");
@@ -125,21 +127,21 @@ impl Repl {
 
     fn cmd_use(&mut self, tokens: &[String]) {
         if tokens.len() < 2 {
-            println!("Usage: use <module>");
+            println!("{}", self.palette.warning("Usage: use <module>"));
             return;
         }
         let name = &tokens[1];
         let Some(module) = self.registry.create(name) else {
-            println!("Module not found: {name}");
+            println!("{}", self.palette.error(&format!("Module not found: {name}")));
             return;
         };
         self.active = Some(module);
-        println!("Using module: {name}");
+        println!("{}", self.palette.success(&format!("Using module: {name}")));
     }
 
     fn cmd_show(&self, tokens: &[String]) {
         if tokens.len() < 2 {
-            println!("Usage: show <modules|options>");
+            println!("{}", self.palette.warning("Usage: show <modules|options>"));
             return;
         }
         match tokens[1].as_str() {
@@ -151,30 +153,55 @@ impl Repl {
                         .unwrap_or(50);
                     let total = catalog.len();
                     if total == 0 {
-                        println!("No modules indexed.");
+                        println!("{}", self.palette.warning("No modules indexed."));
                         return;
                     }
-                    println!("Indexed modules: {total}. Showing up to {limit}.");
-                    for record in catalog.iter().take(limit) {
-                        println!("{} - {}", record.metadata.name, record.metadata.description);
-                    }
+                    println!(
+                        "{}",
+                        self.palette.info(&format!(
+                            "Indexed modules: {total}. Showing up to {limit}."
+                        ))
+                    );
+                    let rows: Vec<(&str, &str)> = catalog
+                        .iter()
+                        .take(limit)
+                        .map(|record| {
+                            (
+                                record.metadata.name.as_str(),
+                                record.metadata.description.as_str(),
+                            )
+                        })
+                        .collect();
+                    print_aligned_rows(&rows);
                     if total > limit {
-                        println!("Use: search <term> [--category <cat>] [--rank <rank>] [--platform <platform>] [--tag <tag>]");
+                        println!(
+                            "{}",
+                            self.palette.dim(
+                                "Use: search <term> [--category <cat>] [--rank <rank>] [--platform <platform>] [--tag <tag>]"
+                            )
+                        );
                     }
                 } else if self.registry.is_empty() {
-                    println!("No modules registered.");
+                    println!("{}", self.palette.warning("No modules registered."));
                 } else {
-                    for meta in self.registry.iter_metadata() {
-                        println!("{} - {}", meta.name, meta.description);
-                    }
+                    let rows: Vec<(&str, &str)> = self
+                        .registry
+                        .iter_metadata()
+                        .map(|meta| (meta.name.as_str(), meta.description.as_str()))
+                        .collect();
+                    print_aligned_rows(&rows);
                 }
             }
             "options" => {
                 let Some(module) = &self.active else {
-                    println!("No active module.");
+                    println!("{}", self.palette.warning("No active module."));
                     return;
                 };
-                println!("Options for {}:", module.metadata().name);
+                println!(
+                    "{}",
+                    self.palette
+                        .info(&format!("Options for {}:", module.metadata().name))
+                );
                 for opt in module.options().iter() {
                     let value = opt.value_as_string();
                     let required = if opt.required { "yes" } else { "no" };
@@ -187,38 +214,42 @@ impl Repl {
                     );
                 }
             }
-            _ => println!("Unknown show target: {}", tokens[1]),
+            _ => println!(
+                "{}",
+                self.palette
+                    .error(&format!("Unknown show target: {}", tokens[1]))
+            ),
         }
     }
 
     fn cmd_set(&mut self, tokens: &[String]) {
         if tokens.len() < 3 {
-            println!("Usage: set <option> <value>");
+            println!("{}", self.palette.warning("Usage: set <option> <value>"));
             return;
         }
         let Some(module) = &mut self.active else {
-            println!("No active module.");
+            println!("{}", self.palette.warning("No active module."));
             return;
         };
         let key = &tokens[1];
         let value = tokens[2..].join(" ");
         if let Err(err) = module.options_mut().set(key, &value) {
-            println!("Error: {err}");
+            println!("{}", self.palette.error(&format!("Error: {err}")));
         }
     }
 
     fn cmd_get(&self, tokens: &[String]) {
         if tokens.len() < 2 {
-            println!("Usage: get <option>");
+            println!("{}", self.palette.warning("Usage: get <option>"));
             return;
         }
         let Some(module) = &self.active else {
-            println!("No active module.");
+            println!("{}", self.palette.warning("No active module."));
             return;
         };
         let key = &tokens[1];
         let Some(opt) = module.options().get(key) else {
-            println!("Unknown option: {key}");
+            println!("{}", self.palette.error(&format!("Unknown option: {key}")));
             return;
         };
         println!("{} = {}", opt.name, opt.value_as_string());
@@ -226,11 +257,16 @@ impl Repl {
 
     fn cmd_search(&self, tokens: &[String]) {
         let Some(catalog) = &self.catalog else {
-            println!("No module catalog loaded.");
+            println!("{}", self.palette.warning("No module catalog loaded."));
             return;
         };
         if tokens.len() < 2 {
-            println!("Usage: search <term> [--category <cat>] [--rank <rank>] [--platform <platform>] [--tag <tag>] [--limit <n>]");
+            println!(
+                "{}",
+                self.palette.warning(
+                    "Usage: search <term> [--category <cat>] [--rank <rank>] [--platform <platform>] [--tag <tag>] [--limit <n>]"
+                )
+            );
             return;
         }
         let mut query = SearchQuery::new();
@@ -243,7 +279,10 @@ impl Repl {
                     if let Some(val) = tokens.get(i) {
                         let category = ModuleCategory::parse(val);
                         if category == ModuleCategory::Unknown {
-                            println!("Unknown category: {val}");
+                            println!(
+                                "{}",
+                                self.palette.error(&format!("Unknown category: {val}"))
+                            );
                         } else {
                             query.category = Some(category);
                         }
@@ -254,7 +293,10 @@ impl Repl {
                     if let Some(val) = tokens.get(i) {
                         let rank = ModuleRank::parse(val);
                         if rank == ModuleRank::Unknown {
-                            println!("Unknown rank: {val}");
+                            println!(
+                                "{}",
+                                self.palette.error(&format!("Unknown rank: {val}"))
+                            );
                         } else {
                             query.rank = Some(rank);
                         }
@@ -291,26 +333,29 @@ impl Repl {
         }
         let results = catalog.search(&query);
         if results.is_empty() {
-            println!("No matching modules.");
+            println!("{}", self.palette.warning("No matching modules."));
             return;
         }
+        let mut rows = Vec::with_capacity(results.len());
         for record in results {
             let rank = record.metadata.rank.as_str();
             let category = record.metadata.category.as_str();
-            println!(
-                "{} [{}] [{}] - {}",
-                record.metadata.name, category, rank, record.metadata.description
-            );
+            let label = format!("{} [{}] [{}]", record.metadata.name, category, rank);
+            rows.push((label, record.metadata.description.as_str()));
         }
+        print_aligned_owned_rows(&rows);
     }
 
     fn cmd_run(&mut self) {
         let Some(module) = &mut self.active else {
-            println!("No active module.");
+            println!("{}", self.palette.warning("No active module."));
             return;
         };
         if let Err(err) = module.options().validate() {
-            println!("Option validation failed: {err}");
+            println!(
+                "{}",
+                self.palette.error(&format!("Option validation failed: {err}"))
+            );
             return;
         }
         let ctx = ModuleContext {
@@ -319,12 +364,105 @@ impl Repl {
         match module.run(&ctx) {
             Ok(result) => {
                 if result.success {
-                    println!("Success: {}", result.message);
+                    println!(
+                        "{}",
+                        self.palette.success(&format!("Success: {}", result.message))
+                    );
                 } else {
-                    println!("Failed: {}", result.message);
+                    println!(
+                        "{}",
+                        self.palette.error(&format!("Failed: {}", result.message))
+                    );
                 }
             }
-            Err(err) => println!("Module error: {err}"),
+            Err(err) => println!("{}", self.palette.error(&format!("Module error: {err}"))),
+        }
+    }
+
+    fn cmd_info(&self, tokens: &[String]) {
+        let mut name = None;
+        if tokens.len() > 1 {
+            name = Some(tokens[1].as_str());
+        }
+        if name.is_none() {
+            if let Some(module) = &self.active {
+                self.print_module_info(module.metadata(), Some(module.options()));
+                return;
+            }
+            println!("{}", self.palette.warning("Usage: info [module]"));
+            return;
+        }
+        let name = name.unwrap();
+        if let Some(entry) = self.registry.get_entry(name) {
+            let module = entry.create();
+            self.print_module_info(entry.metadata(), Some(module.options()));
+            return;
+        }
+        if let Some(catalog) = &self.catalog {
+            if let Some(record) = catalog
+                .iter()
+                .find(|m| m.metadata.name.eq_ignore_ascii_case(name))
+            {
+                self.print_module_info(&record.metadata, None);
+                return;
+            }
+        }
+        println!(
+            "{}",
+            self.palette.error(&format!("Module not found: {name}"))
+        );
+    }
+
+    fn print_module_info(
+        &self,
+        metadata: &modules::ModuleMetadata,
+        options: Option<&modules::ModuleOptions>,
+    ) {
+        println!("{}", self.palette.info("Module Information"));
+        println!("Name:        {}", metadata.name);
+        println!("Description: {}", metadata.description);
+        println!("Category:    {}", metadata.category.as_str());
+        println!("Rank:        {}", metadata.rank.as_str());
+        println!("Author:      {}", metadata.author);
+        if !metadata.platforms.is_empty() {
+            println!("Platforms:   {}", metadata.platforms.join(", "));
+        }
+        if !metadata.tags.is_empty() {
+            println!("Tags:        {}", metadata.tags.join(", "));
+        }
+        if let Some(entrypoint) = &metadata.entrypoint {
+            if !entrypoint.is_empty() {
+                println!("Entrypoint:  {}", entrypoint);
+            }
+        }
+        if let Some(options) = options {
+            println!();
+            println!("{}", self.palette.info("Options"));
+            for opt in options.iter() {
+                let required = if opt.required { "yes" } else { "no" };
+                println!(
+                    "  {:<16} {:<8} {:<6} {}",
+                    opt.name,
+                    opt.kind_string(),
+                    required,
+                    opt.value_as_string()
+                );
+            }
+        }
+    }
+
+    fn prompt_text(&self) -> String {
+        let base = if self.prompt_base.is_empty() {
+            "moonlight"
+        } else {
+            self.prompt_base.as_str()
+        };
+        let base = self.palette.prompt_base(base);
+        if let Some(module) = &self.active {
+            let module_name = self.palette.prompt_module(module.metadata().name.as_str());
+            format!("{}({})> ", base, module_name)
+        } else {
+            format!("{}> ", base)
         }
     }
 }
@@ -342,5 +480,158 @@ impl ModuleOptionExt for modules::ModuleOption {
             modules::ModuleOptionKind::Address => "addr",
             modules::ModuleOptionKind::Port => "port",
         }
+    }
+}
+
+fn normalize_prompt(prompt: &str) -> String {
+    let trimmed = prompt.trim_end();
+    let base = trimmed.strip_suffix('>').unwrap_or(trimmed);
+    let base = base.trim_end();
+    if base.is_empty() {
+        "moonlight".to_string()
+    } else {
+        base.to_string()
+    }
+}
+
+struct ReplCompleter<'a> {
+    repl: &'a Repl,
+}
+
+impl<'a> Completer for ReplCompleter<'a> {
+    fn complete(&self, line: &str) -> CompletionResult {
+        self.repl.complete(line)
+    }
+}
+
+impl Repl {
+    fn complete(&self, line: &str) -> CompletionResult {
+        let trimmed_end = line.trim_end_matches(|c: char| c.is_whitespace());
+        let ends_with_space = trimmed_end.len() != line.len();
+        let (start, current) = if ends_with_space {
+            (line.len(), "")
+        } else if let Some(pos) = line.rfind(|c: char| c.is_whitespace()) {
+            (pos + 1, &line[pos + 1..])
+        } else {
+            (0, line)
+        };
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let token_index = if ends_with_space {
+            tokens.len()
+        } else {
+            tokens.len().saturating_sub(1)
+        };
+        let mut candidates = Vec::new();
+
+        if tokens.is_empty() || token_index == 0 {
+            candidates = command_candidates(current);
+        } else {
+            let cmd = tokens[0].to_lowercase();
+            match cmd.as_str() {
+                "use" | "info" => {
+                    if token_index == 1 {
+                        candidates = module_candidates(self, current);
+                    }
+                }
+                "set" | "get" => {
+                    if token_index == 1 {
+                        candidates = option_candidates(self, current);
+                    }
+                }
+                "show" => {
+                    if token_index == 1 {
+                        candidates = ["modules", "options"]
+                            .iter()
+                            .filter(|v| v.starts_with(current))
+                            .map(|v| v.to_string())
+                            .collect();
+                    }
+                }
+                "search" => {
+                    candidates = search_flag_candidates(current);
+                }
+                _ => {}
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        CompletionResult { start, candidates }
+    }
+}
+
+fn command_candidates(prefix: &str) -> Vec<String> {
+    let commands = [
+        "help", "show", "use", "search", "set", "get", "run", "history", "info", "exit",
+        "quit",
+    ];
+    commands
+        .iter()
+        .filter(|cmd| cmd.starts_with(prefix))
+        .map(|cmd| cmd.to_string())
+        .collect()
+}
+
+fn module_candidates(repl: &Repl, prefix: &str) -> Vec<String> {
+    let mut names = HashSet::new();
+    for meta in repl.registry.iter_metadata() {
+        if meta.name.starts_with(prefix) {
+            names.insert(meta.name.clone());
+        }
+    }
+    if let Some(catalog) = &repl.catalog {
+        for record in catalog.iter() {
+            if record.metadata.name.starts_with(prefix) {
+                names.insert(record.metadata.name.clone());
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+fn option_candidates(repl: &Repl, prefix: &str) -> Vec<String> {
+    let Some(module) = &repl.active else {
+        return Vec::new();
+    };
+    module
+        .options()
+        .iter()
+        .map(|opt| opt.name.clone())
+        .filter(|name| name.starts_with(prefix))
+        .collect()
+}
+
+fn search_flag_candidates(prefix: &str) -> Vec<String> {
+    let flags = [
+        "--category",
+        "--cat",
+        "--rank",
+        "--platform",
+        "--tag",
+        "--limit",
+    ];
+    flags
+        .iter()
+        .filter(|flag| flag.starts_with(prefix))
+        .map(|flag| flag.to_string())
+        .collect()
+}
+
+fn print_aligned_rows(rows: &[(&str, &str)]) {
+    if rows.is_empty() {
+        return;
+    }
+    let max_width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+    for (name, desc) in rows {
+        println!("{name:<width$} - {desc}", width = max_width);
+    }
+}
+
+fn print_aligned_owned_rows(rows: &[(String, &str)]) {
+    if rows.is_empty() {
+        return;
+    }
+    let max_width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+    for (name, desc) in rows {
+        println!("{name:<width$} - {desc}", width = max_width);
     }
 }

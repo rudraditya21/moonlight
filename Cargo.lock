@@ -7,6 +7,12 @@ name = "corelib"
 version = "0.1.0"
 
 [[package]]
+name = "libc"
+version = "0.2.180"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
+
+[[package]]
 name = "md5"
 version = "0.1.0"
 
@@ -58,6 +64,7 @@ name = "repl"
 version = "0.1.0"
 dependencies = [
  "corelib",
+ "libc",
  "modules",
 ]
 

@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 corelib = { path = "../core" }
 modules = { path = "../../modules/modules" }
+libc = "0.2"
