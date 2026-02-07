@@ -8,8 +8,11 @@ use h2::server;
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use net::NetAddr;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_rustls::TlsAcceptor;
 
 use crate::transport::TlsClientConfig;
+use crate::transport::TlsServerConfig;
 use crate::util::Timeouts;
 
 const DEFAULT_MAX_BODY: usize = 8 * 1024 * 1024;
@@ -195,7 +198,7 @@ impl Http2Client {
         let server_name = rustls::pki_types::ServerName::try_from(server_name)
             .map_err(|_| CoreError::Parse("invalid server name".to_string()))?
             .to_owned();
-        let connector = tokio_rustls::TlsConnector::from(config.inner());
+        let connector = tokio_rustls::TlsConnector::from(config.with_alpn(&[b"h2"]).inner());
         let tls = connector
             .connect(server_name, stream)
             .await
@@ -272,17 +275,69 @@ impl Http2Server {
             let handler = Arc::clone(&handler);
             let max_body = self.max_body;
             tokio::spawn(async move {
-                let _ = handle_connection(stream, max_body, handler).await;
+                let _ = handle_connection_io(stream, max_body, handler).await;
             });
         }
     }
 }
 
-async fn handle_connection(
-    stream: TcpStream,
+pub struct Http2TlsServer {
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    max_body: usize,
+}
+
+impl Http2TlsServer {
+    pub async fn bind(addr: SocketAddr, config: &TlsServerConfig) -> CoreResult<Self> {
+        let listener = TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let config = config.with_alpn(&[b"h2"]);
+        let acceptor = TlsAcceptor::from(config.inner());
+        Ok(Self {
+            listener,
+            acceptor,
+            max_body: DEFAULT_MAX_BODY,
+        })
+    }
+
+    pub fn max_body(mut self, max_body: usize) -> Self {
+        self.max_body = max_body;
+        self
+    }
+
+    pub fn local_addr(&self) -> CoreResult<SocketAddr> {
+        self.listener.local_addr().map_err(CoreError::Io)
+    }
+
+    pub async fn serve<F>(&self, handler: F) -> CoreResult<()>
+    where
+        F: Fn(Http2Request) -> Http2Response + Send + Sync + 'static,
+    {
+        let handler = Arc::new(handler);
+        loop {
+            let (stream, _) = self.listener.accept().await.map_err(CoreError::Io)?;
+            let handler = Arc::clone(&handler);
+            let acceptor = self.acceptor.clone();
+            let max_body = self.max_body;
+            tokio::spawn(async move {
+                match acceptor.accept(stream).await {
+                    Ok(tls) => {
+                        let _ = handle_connection_io(tls, max_body, handler).await;
+                    }
+                    Err(_) => {}
+                }
+            });
+        }
+    }
+}
+
+async fn handle_connection_io<T>(
+    stream: T,
     max_body: usize,
     handler: Arc<dyn Fn(Http2Request) -> Http2Response + Send + Sync>,
-) -> CoreResult<()> {
+) -> CoreResult<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut connection = server::handshake(stream)
         .await
         .map_err(|err| CoreError::Message(err.to_string()))?;

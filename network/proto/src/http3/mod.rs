@@ -207,7 +207,13 @@ impl Http3Client {
             if start.elapsed() > Duration::from_secs(5) {
                 return Err(CoreError::Parse("http3 handshake timeout".to_string()));
             }
-            let (len, from) = self.socket.recv_from(&mut buf).await.map_err(CoreError::Io)?;
+            let remaining = Duration::from_secs(5)
+                .saturating_sub(start.elapsed())
+                .max(Duration::from_millis(100));
+            let (len, from) = tokio::time::timeout(remaining, self.socket.recv_from(&mut buf))
+                .await
+                .map_err(|_| CoreError::Parse("http3 handshake timeout".to_string()))?
+                .map_err(CoreError::Io)?;
             let recv_info = quiche::RecvInfo {
                 from,
                 to: self.local_addr,
@@ -246,7 +252,13 @@ impl Http3Client {
             if start.elapsed() > Duration::from_secs(10) {
                 return Err(CoreError::Parse("http3 response timeout".to_string()));
             }
-            let (len, from) = self.socket.recv_from(&mut buf).await.map_err(CoreError::Io)?;
+            let remaining = Duration::from_secs(10)
+                .saturating_sub(start.elapsed())
+                .max(Duration::from_millis(100));
+            let (len, from) = tokio::time::timeout(remaining, self.socket.recv_from(&mut buf))
+                .await
+                .map_err(|_| CoreError::Parse("http3 response timeout".to_string()))?
+                .map_err(CoreError::Io)?;
             let recv_info = quiche::RecvInfo {
                 from,
                 to: self.local_addr,
@@ -432,6 +444,8 @@ impl Http3Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use net::NetAddr;
 
     #[test]
     fn header_roundtrip() {
@@ -446,5 +460,46 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(parsed[0].0, "server");
         assert_eq!(headers[0].name(), b":method");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires QUIC handshake on local UDP socket; run manually to validate environment"]
+    async fn http3_roundtrip() {
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
+
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join("moonlight_http3_test_cert.pem");
+        let key_path = dir.join("moonlight_http3_test_key.pem");
+        fs::write(&cert_path, cert_pem).unwrap();
+        fs::write(&key_path, key_pem).unwrap();
+
+        let server = Http3Server::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        )
+        .await
+        .expect("bind");
+        let addr = server.local_addr();
+        tokio::spawn(async move {
+            let _ = server
+                .serve(|_req| {
+                    let mut resp = Http3Response::new(200);
+                    resp.body = b"ok".to_vec();
+                    resp
+                })
+                .await;
+        });
+
+        let mut client = Http3Client::connect(&NetAddr::from_socket(addr), "localhost")
+            .await
+            .expect("connect");
+        let req = Http3Request::new("POST", "/dns-query");
+        let resp = client.request(&req).await.expect("request");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"ok".to_vec());
     }
 }

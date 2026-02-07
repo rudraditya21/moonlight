@@ -1,3 +1,5 @@
+pub mod auth;
+
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -83,6 +85,22 @@ impl HttpMethod {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpTarget {
+    Origin(String),
+    Absolute {
+        scheme: String,
+        host: String,
+        port: u16,
+        path: String,
+    },
+    Authority {
+        host: String,
+        port: u16,
+    },
+    Asterisk,
+}
+
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
     pub method: HttpMethod,
@@ -105,6 +123,44 @@ impl HttpRequest {
 
     pub fn set_header(&mut self, name: &str, value: &str) {
         set_header(&mut self.headers, name, value);
+    }
+
+    pub fn target(&self) -> CoreResult<HttpTarget> {
+        if self.path == "*" {
+            return Ok(HttpTarget::Asterisk);
+        }
+        if matches!(self.method, HttpMethod::Connect) {
+            let (host, port) = parse_authority(&self.path)?;
+            return Ok(HttpTarget::Authority { host, port });
+        }
+        if let Some(rest) = self.path.strip_prefix("http://") {
+            let (host, port, path) = parse_absolute(rest, 80)?;
+            return Ok(HttpTarget::Absolute {
+                scheme: "http".to_string(),
+                host,
+                port,
+                path,
+            });
+        }
+        if let Some(rest) = self.path.strip_prefix("https://") {
+            let (host, port, path) = parse_absolute(rest, 443)?;
+            return Ok(HttpTarget::Absolute {
+                scheme: "https".to_string(),
+                host,
+                port,
+                path,
+            });
+        }
+        Ok(HttpTarget::Origin(self.path.clone()))
+    }
+
+    pub fn set_absolute_uri(&mut self, scheme: &str, host: &str, port: u16, path: &str) {
+        let default = if scheme == "https" { 443 } else { 80 };
+        if port == default {
+            self.path = format!("{}://{}{}", scheme, host, path);
+        } else {
+            self.path = format!("{}://{}:{}{}", scheme, host, port, path);
+        }
     }
 
     pub fn to_bytes(&self) -> CoreResult<Vec<u8>> {
@@ -218,6 +274,55 @@ fn parse_headers(lines: &[&str]) -> CoreResult<Vec<(String, String)>> {
         headers.push((name.to_string(), value.to_string()));
     }
     Ok(headers)
+}
+
+fn parse_authority(value: &str) -> CoreResult<(String, u16)> {
+    if value.starts_with('[') {
+        let end = value
+            .find(']')
+            .ok_or_else(|| CoreError::Parse("invalid ipv6 authority".to_string()))?;
+        let host = value[1..end].to_string();
+        let port = value
+            .get(end + 1..)
+            .and_then(|s| s.strip_prefix(':'))
+            .ok_or_else(|| CoreError::Parse("missing port".to_string()))?
+            .parse::<u16>()
+            .map_err(|_| CoreError::Parse("invalid port".to_string()))?;
+        return Ok((host, port));
+    }
+    if let Some((host, port)) = value.rsplit_once(':') {
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| CoreError::Parse("invalid port".to_string()))?;
+        return Ok((host.to_string(), port));
+    }
+    Err(CoreError::Parse("missing port".to_string()))
+}
+
+fn parse_absolute(rest: &str, default_port: u16) -> CoreResult<(String, u16, String)> {
+    let (host_port, path) = if let Some((host, path)) = rest.split_once('/') {
+        (host, format!("/{}", path))
+    } else {
+        (rest, "/".to_string())
+    };
+    if host_port.starts_with('[') {
+        let end = host_port
+            .find(']')
+            .ok_or_else(|| CoreError::Parse("invalid ipv6 host".to_string()))?;
+        let host = host_port[1..end].to_string();
+        let port = host_port
+            .get(end + 1..)
+            .and_then(|s| s.strip_prefix(':'))
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return Ok((host, port, path));
+    }
+    if let Some((host, port)) = host_port.rsplit_once(':') {
+        if let Ok(port) = port.parse::<u16>() {
+            return Ok((host.to_string(), port, path));
+        }
+    }
+    Ok((host_port.to_string(), default_port, path))
 }
 
 fn read_until_delim<T: StreamTransport>(
@@ -502,6 +607,108 @@ impl HttpServer {
     }
 }
 
+pub struct ProxyConnect {
+    pub host: String,
+    pub port: u16,
+    pub stream: TcpStream,
+    pub buffered: Vec<u8>,
+}
+
+pub struct ProxyServer {
+    listener: TcpListener,
+    timeouts: Timeouts,
+    max_body: usize,
+}
+
+pub struct AsyncProxyConnect {
+    pub host: String,
+    pub port: u16,
+    pub stream: tokio::net::TcpStream,
+    pub buffered: Vec<u8>,
+}
+
+pub struct AsyncProxyServer {
+    listener: tokio::net::TcpListener,
+    max_body: usize,
+}
+
+impl AsyncProxyServer {
+    pub async fn bind(addr: SocketAddr) -> CoreResult<Self> {
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        Ok(Self {
+            listener,
+            max_body: DEFAULT_MAX_BODY,
+        })
+    }
+
+    pub fn max_body(mut self, max_body: usize) -> Self {
+        self.max_body = max_body;
+        self
+    }
+
+    pub fn local_addr(&self) -> CoreResult<SocketAddr> {
+        self.listener.local_addr().map_err(CoreError::Io)
+    }
+
+    pub async fn serve<F, C>(&self, handler: F, connect_handler: C) -> CoreResult<()>
+    where
+        F: Fn(HttpRequest) -> HttpResponse + Send + Sync + 'static,
+        C: Fn(AsyncProxyConnect) -> CoreResult<()> + Send + Sync + 'static,
+    {
+        let handler = Arc::new(handler);
+        let connect_handler = Arc::new(connect_handler);
+        loop {
+            let (stream, _) = self.listener.accept().await.map_err(CoreError::Io)?;
+            let handler = Arc::clone(&handler);
+            let connect_handler = Arc::clone(&connect_handler);
+            let max_body = self.max_body;
+            tokio::spawn(async move {
+                let _ = handle_proxy_connection_async(stream, max_body, handler, connect_handler).await;
+            });
+        }
+    }
+}
+
+impl ProxyServer {
+    pub fn bind(addr: SocketAddr, timeouts: Timeouts) -> CoreResult<Self> {
+        let listener = TcpListener::bind(addr).map_err(CoreError::Io)?;
+        Ok(Self {
+            listener,
+            timeouts,
+            max_body: DEFAULT_MAX_BODY,
+        })
+    }
+
+    pub fn max_body(mut self, max_body: usize) -> Self {
+        self.max_body = max_body;
+        self
+    }
+
+    pub fn local_addr(&self) -> CoreResult<SocketAddr> {
+        self.listener.local_addr().map_err(CoreError::Io)
+    }
+
+    pub fn serve<F, C>(&self, handler: F, connect_handler: C) -> CoreResult<()>
+    where
+        F: Fn(HttpRequest) -> HttpResponse + Send + Sync + 'static,
+        C: Fn(ProxyConnect) -> CoreResult<()> + Send + Sync + 'static,
+    {
+        let handler = Arc::new(handler);
+        let connect_handler = Arc::new(connect_handler);
+        for stream in self.listener.incoming() {
+            let stream = stream.map_err(CoreError::Io)?;
+            let handler = Arc::clone(&handler);
+            let connect_handler = Arc::clone(&connect_handler);
+            let timeouts = self.timeouts;
+            let max_body = self.max_body;
+            thread::spawn(move || {
+                let _ = handle_proxy_connection(stream, timeouts, max_body, handler, connect_handler);
+            });
+        }
+        Ok(())
+    }
+}
+
 fn handle_connection(
     stream: TcpStream,
     timeouts: Timeouts,
@@ -544,6 +751,137 @@ fn handle_connection(
     Ok(())
 }
 
+fn handle_proxy_connection(
+    stream: TcpStream,
+    timeouts: Timeouts,
+    max_body: usize,
+    handler: Arc<dyn Fn(HttpRequest) -> HttpResponse + Send + Sync>,
+    connect_handler: Arc<dyn Fn(ProxyConnect) -> CoreResult<()> + Send + Sync>,
+) -> CoreResult<()> {
+    let mut transport = TcpTransport::from_stream(stream, timeouts)?;
+    let mut buffer = Vec::new();
+    loop {
+        let header_bytes = read_until_delim(&mut transport, &mut buffer, b"\r\n\r\n", MAX_HEADER_BYTES)?;
+        let (mut request, header_map) = parse_request(&header_bytes)?;
+        if let Some(len) = header_map.get("content-length") {
+            let len = len.parse::<usize>().map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
+            request.body = read_exact_body(&mut transport, &mut buffer, len)?;
+        } else if let Some(te) = header_map.get("transfer-encoding") {
+            if te.to_ascii_lowercase().contains("chunked") {
+                request.body = read_chunked_body(&mut transport, &mut buffer, max_body)?;
+            }
+        }
+
+        let target = request.target()?;
+        if matches!(request.method, HttpMethod::Connect) {
+            if let HttpTarget::Authority { host, port } = target {
+                let mut response = HttpResponse::new(200);
+                response.reason = "Connection Established".to_string();
+                response.set_header("Connection", "keep-alive");
+                let bytes = response.to_bytes()?;
+                transport.write_all(&bytes)?;
+                let stream = transport.into_inner();
+                let buffered = buffer.split_off(0);
+                (connect_handler)(ProxyConnect {
+                    host,
+                    port,
+                    stream,
+                    buffered,
+                })?;
+                break;
+            } else {
+                let mut response = HttpResponse::new(400);
+                response.reason = "Bad Request".to_string();
+                let bytes = response.to_bytes()?;
+                transport.write_all(&bytes)?;
+                break;
+            }
+        }
+
+        let mut response = (handler)(request.clone());
+        let connection = header_map.get("connection").map(|v| v.to_ascii_lowercase());
+        let should_close = match request.version {
+            HttpVersion::Http10 => connection.as_deref() != Some("keep-alive"),
+            HttpVersion::Http11 => connection.as_deref() == Some("close"),
+        };
+        if should_close {
+            response.set_header("Connection", "close");
+        } else if matches!(request.version, HttpVersion::Http10) {
+            response.set_header("Connection", "keep-alive");
+        }
+        let bytes = response.to_bytes()?;
+        transport.write_all(&bytes)?;
+        if should_close {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_proxy_connection_async(
+    stream: tokio::net::TcpStream,
+    max_body: usize,
+    handler: Arc<dyn Fn(HttpRequest) -> HttpResponse + Send + Sync>,
+    connect_handler: Arc<dyn Fn(AsyncProxyConnect) -> CoreResult<()> + Send + Sync>,
+) -> CoreResult<()> {
+    let mut transport = AsyncTcpTransport::from_stream(stream);
+    let mut buffer = Vec::new();
+    loop {
+        let header_bytes = read_until_delim_async(&mut transport, &mut buffer, b"\r\n\r\n", MAX_HEADER_BYTES).await?;
+        let (mut request, header_map) = parse_request(&header_bytes)?;
+        if let Some(len) = header_map.get("content-length") {
+            let len = len.parse::<usize>().map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
+            request.body = read_exact_body_async(&mut transport, &mut buffer, len).await?;
+        } else if let Some(te) = header_map.get("transfer-encoding") {
+            if te.to_ascii_lowercase().contains("chunked") {
+                request.body = read_chunked_body_async(&mut transport, &mut buffer, max_body).await?;
+            }
+        }
+
+        let target = request.target()?;
+        if matches!(request.method, HttpMethod::Connect) {
+            if let HttpTarget::Authority { host, port } = target {
+                let mut response = HttpResponse::new(200);
+                response.reason = "Connection Established".to_string();
+                response.set_header("Connection", "keep-alive");
+                let bytes = response.to_bytes()?;
+                transport.write_all(&bytes).await?;
+                let stream = transport.into_inner();
+                let buffered = buffer.split_off(0);
+                return (connect_handler)(AsyncProxyConnect {
+                    host,
+                    port,
+                    stream,
+                    buffered,
+                });
+            } else {
+                let mut response = HttpResponse::new(400);
+                response.reason = "Bad Request".to_string();
+                let bytes = response.to_bytes()?;
+                transport.write_all(&bytes).await?;
+                break;
+            }
+        }
+
+        let mut response = (handler)(request.clone());
+        let connection = header_map.get("connection").map(|v| v.to_ascii_lowercase());
+        let should_close = match request.version {
+            HttpVersion::Http10 => connection.as_deref() != Some("keep-alive"),
+            HttpVersion::Http11 => connection.as_deref() == Some("close"),
+        };
+        if should_close {
+            response.set_header("Connection", "close");
+        } else if matches!(request.version, HttpVersion::Http10) {
+            response.set_header("Connection", "keep-alive");
+        }
+        let bytes = response.to_bytes()?;
+        transport.write_all(&bytes).await?;
+        if should_close {
+            break;
+        }
+    }
+    Ok(())
+}
 pub struct AsyncHttpClient<T: AsyncStreamTransport> {
     transport: T,
     read_buf: Vec<u8>,
@@ -808,6 +1146,31 @@ mod tests {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
         let (resp, _) = parse_response(raw).expect("parse response");
         assert_eq!(resp.status_code, 200);
+    }
+
+    #[test]
+    fn parse_targets() {
+        let mut req = HttpRequest::new(HttpMethod::Get, "http://example.com:8080/test");
+        let target = req.target().expect("target");
+        match target {
+            HttpTarget::Absolute { scheme, host, port, path } => {
+                assert_eq!(scheme, "http");
+                assert_eq!(host, "example.com");
+                assert_eq!(port, 8080);
+                assert_eq!(path, "/test");
+            }
+            _ => panic!("expected absolute target"),
+        }
+        req.method = HttpMethod::Connect;
+        req.path = "example.com:443".to_string();
+        let target = req.target().expect("connect target");
+        match target {
+            HttpTarget::Authority { host, port } => {
+                assert_eq!(host, "example.com");
+                assert_eq!(port, 443);
+            }
+            _ => panic!("expected authority target"),
+        }
     }
 
     #[test]

@@ -164,6 +164,14 @@ impl TlsClientConfig {
     pub fn inner(&self) -> Arc<ClientConfig> {
         Arc::clone(&self.inner)
     }
+
+    pub fn with_alpn(&self, protos: &[&[u8]]) -> Self {
+        let mut cfg = (*self.inner).clone();
+        cfg.alpn_protocols = protos.iter().map(|p| p.to_vec()).collect();
+        Self {
+            inner: Arc::new(cfg),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -184,6 +192,14 @@ impl TlsServerConfig {
 
     pub fn inner(&self) -> Arc<ServerConfig> {
         Arc::clone(&self.inner)
+    }
+
+    pub fn with_alpn(&self, protos: &[&[u8]]) -> Self {
+        let mut cfg = (*self.inner).clone();
+        cfg.alpn_protocols = protos.iter().map(|p| p.to_vec()).collect();
+        Self {
+            inner: Arc::new(cfg),
+        }
     }
 }
 
@@ -377,6 +393,10 @@ impl AsyncTcpTransport {
 
     pub fn from_stream(stream: tokio::net::TcpStream) -> Self {
         Self { stream }
+    }
+
+    pub fn into_inner(self) -> tokio::net::TcpStream {
+        self.stream
     }
 }
 

@@ -10,12 +10,17 @@ pub mod util;
 
 pub use codec::Codec;
 pub use dns::{
-    AsyncDnsClient, AsyncDnsServer, AsyncDohClient, DohClient, DnsClient, DnsMessage, DnsOption,
-    DnsQuestion, DnsRecord, DnsRecordData, DnsServer,
+    AsyncDnsClient, AsyncDnsServer, AsyncDoh2Client, AsyncDoh3Client, AsyncDohClient,
+    AsyncMdnsClient, AsyncMdnsServer, DohClient, DnsClient, DnsDnskey, DnsDs, DnsMessage,
+    DnsNsec, DnsNsec3, DnsOption, DnsQuestion, DnsRecord, DnsRecordData, DnsRrsig, DnsServer,
+    MdnsClient, MdnsServer,
 };
 pub use framing::{DelimiterFramer, FixedSizeFramer, Frame, Framer, LengthPrefixedFramer};
-pub use http::{AsyncHttpClient, AsyncHttpServer, HttpClient, HttpRequest, HttpResponse, HttpServer};
-pub use http2::{Http2Client, Http2Request, Http2Response, Http2Server};
+pub use http::{
+    auth as http_auth, AsyncHttpClient, AsyncHttpServer, AsyncProxyConnect, AsyncProxyServer,
+    HttpClient, HttpRequest, HttpResponse, HttpServer, HttpTarget, ProxyConnect, ProxyServer,
+};
+pub use http2::{Http2Client, Http2Request, Http2Response, Http2Server, Http2TlsServer};
 pub use http3::{Http3Client, Http3Request, Http3Response, Http3Server};
 pub use state::{StateMachine, StateTransition};
 pub use transport::{

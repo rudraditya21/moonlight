@@ -1,10 +1,12 @@
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use corelib::error::{CoreError, CoreResult};
 use net::NetAddr;
+use tokio::net::UdpSocket as TokioUdpSocket;
 
 use crate::framing::{Framer, LengthPrefixedFramer};
 use crate::http::{AsyncHttpClient, HttpClient, HttpMethod, HttpRequest, HttpVersion};
@@ -97,6 +99,111 @@ pub struct DnsOption {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsClientSubnet {
+    pub family: u16,
+    pub source_prefix: u8,
+    pub scope_prefix: u8,
+    pub address: Vec<u8>,
+}
+
+impl DnsOption {
+    pub fn ecs(family: u16, source_prefix: u8, scope_prefix: u8, address: Vec<u8>) -> Self {
+        let mut data = Vec::new();
+        data.extend_from_slice(&family.to_be_bytes());
+        data.push(source_prefix);
+        data.push(scope_prefix);
+        data.extend_from_slice(&address);
+        Self { code: 8, data }
+    }
+
+    pub fn cookie(client: &[u8], server: Option<&[u8]>) -> Self {
+        let mut data = Vec::new();
+        data.extend_from_slice(client);
+        if let Some(server) = server {
+            data.extend_from_slice(server);
+        }
+        Self { code: 10, data }
+    }
+
+    pub fn padding(len: usize) -> Self {
+        Self { code: 12, data: vec![0u8; len] }
+    }
+
+    pub fn tcp_keepalive(timeout: Option<u16>) -> Self {
+        let mut data = Vec::new();
+        if let Some(timeout) = timeout {
+            data.extend_from_slice(&timeout.to_be_bytes());
+        }
+        Self { code: 11, data }
+    }
+
+    pub fn nsid() -> Self {
+        Self { code: 3, data: Vec::new() }
+    }
+
+    pub fn parse_ecs(&self) -> Option<DnsClientSubnet> {
+        if self.code != 8 || self.data.len() < 4 {
+            return None;
+        }
+        let family = u16::from_be_bytes([self.data[0], self.data[1]]);
+        let source_prefix = self.data[2];
+        let scope_prefix = self.data[3];
+        let address = self.data[4..].to_vec();
+        Some(DnsClientSubnet {
+            family,
+            source_prefix,
+            scope_prefix,
+            address,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsDnskey {
+    pub flags: u16,
+    pub protocol: u8,
+    pub algorithm: u8,
+    pub public_key: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsDs {
+    pub key_tag: u16,
+    pub algorithm: u8,
+    pub digest_type: u8,
+    pub digest: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsRrsig {
+    pub type_covered: u16,
+    pub algorithm: u8,
+    pub labels: u8,
+    pub original_ttl: u32,
+    pub signature_expiration: u32,
+    pub signature_inception: u32,
+    pub key_tag: u16,
+    pub signer_name: String,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsNsec {
+    pub next_domain: String,
+    pub type_bitmaps: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsNsec3 {
+    pub hash_alg: u8,
+    pub flags: u8,
+    pub iterations: u16,
+    pub salt: Vec<u8>,
+    pub next_hashed_owner: Vec<u8>,
+    pub type_bitmaps: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsRecordData {
     A(Ipv4Addr),
     AAAA(Ipv6Addr),
@@ -106,6 +213,11 @@ pub enum DnsRecordData {
     MX { preference: u16, exchange: String },
     TXT(String),
     SRV { priority: u16, weight: u16, port: u16, target: String },
+    DNSKEY(DnsDnskey),
+    DS(DnsDs),
+    RRSIG(DnsRrsig),
+    NSEC(DnsNsec),
+    NSEC3(DnsNsec3),
     OPT {
         udp_payload_size: u16,
         extended_rcode: u8,
@@ -365,6 +477,43 @@ fn encode_rdata(
             buf.extend_from_slice(&port.to_be_bytes());
             encode_name(target, buf, compression)?;
         }
+        DnsRecordData::DNSKEY(key) => {
+            buf.extend_from_slice(&key.flags.to_be_bytes());
+            buf.push(key.protocol);
+            buf.push(key.algorithm);
+            buf.extend_from_slice(&key.public_key);
+        }
+        DnsRecordData::DS(ds) => {
+            buf.extend_from_slice(&ds.key_tag.to_be_bytes());
+            buf.push(ds.algorithm);
+            buf.push(ds.digest_type);
+            buf.extend_from_slice(&ds.digest);
+        }
+        DnsRecordData::RRSIG(sig) => {
+            buf.extend_from_slice(&sig.type_covered.to_be_bytes());
+            buf.push(sig.algorithm);
+            buf.push(sig.labels);
+            buf.extend_from_slice(&sig.original_ttl.to_be_bytes());
+            buf.extend_from_slice(&sig.signature_expiration.to_be_bytes());
+            buf.extend_from_slice(&sig.signature_inception.to_be_bytes());
+            buf.extend_from_slice(&sig.key_tag.to_be_bytes());
+            encode_name(&sig.signer_name, buf, compression)?;
+            buf.extend_from_slice(&sig.signature);
+        }
+        DnsRecordData::NSEC(nsec) => {
+            encode_name(&nsec.next_domain, buf, compression)?;
+            buf.extend_from_slice(&nsec.type_bitmaps);
+        }
+        DnsRecordData::NSEC3(nsec3) => {
+            buf.push(nsec3.hash_alg);
+            buf.push(nsec3.flags);
+            buf.extend_from_slice(&nsec3.iterations.to_be_bytes());
+            buf.push(nsec3.salt.len() as u8);
+            buf.extend_from_slice(&nsec3.salt);
+            buf.push(nsec3.next_hashed_owner.len() as u8);
+            buf.extend_from_slice(&nsec3.next_hashed_owner);
+            buf.extend_from_slice(&nsec3.type_bitmaps);
+        }
         DnsRecordData::OPT { options, .. } => {
             for opt in options {
                 buf.extend_from_slice(&opt.code.to_be_bytes());
@@ -452,6 +601,105 @@ fn decode_rdata(
             *offset = next;
             DnsRecordData::SRV { priority, weight, port, target }
         }
+        48 => {
+            let flags = read_u16(msg, offset)?;
+            let protocol = read_u8(msg, offset)?;
+            let algorithm = read_u8(msg, offset)?;
+            if *offset > end {
+                return Err(CoreError::Parse("invalid dnskey".to_string()));
+            }
+            let public_key = msg[*offset..end].to_vec();
+            *offset = end;
+            DnsRecordData::DNSKEY(DnsDnskey {
+                flags,
+                protocol,
+                algorithm,
+                public_key,
+            })
+        }
+        43 => {
+            let key_tag = read_u16(msg, offset)?;
+            let algorithm = read_u8(msg, offset)?;
+            let digest_type = read_u8(msg, offset)?;
+            if *offset > end {
+                return Err(CoreError::Parse("invalid ds record".to_string()));
+            }
+            let digest = msg[*offset..end].to_vec();
+            *offset = end;
+            DnsRecordData::DS(DnsDs {
+                key_tag,
+                algorithm,
+                digest_type,
+                digest,
+            })
+        }
+        46 => {
+            let type_covered = read_u16(msg, offset)?;
+            let algorithm = read_u8(msg, offset)?;
+            let labels = read_u8(msg, offset)?;
+            let original_ttl = read_u32(msg, offset)?;
+            let signature_expiration = read_u32(msg, offset)?;
+            let signature_inception = read_u32(msg, offset)?;
+            let key_tag = read_u16(msg, offset)?;
+            let (signer_name, next) = decode_name(msg, *offset)?;
+            *offset = next;
+            if *offset > end {
+                return Err(CoreError::Parse("invalid rrsig".to_string()));
+            }
+            let signature = msg[*offset..end].to_vec();
+            *offset = end;
+            DnsRecordData::RRSIG(DnsRrsig {
+                type_covered,
+                algorithm,
+                labels,
+                original_ttl,
+                signature_expiration,
+                signature_inception,
+                key_tag,
+                signer_name,
+                signature,
+            })
+        }
+        47 => {
+            let (next_domain, next) = decode_name(msg, *offset)?;
+            *offset = next;
+            if *offset > end {
+                return Err(CoreError::Parse("invalid nsec".to_string()));
+            }
+            let type_bitmaps = msg[*offset..end].to_vec();
+            *offset = end;
+            DnsRecordData::NSEC(DnsNsec {
+                next_domain,
+                type_bitmaps,
+            })
+        }
+        50 => {
+            let hash_alg = read_u8(msg, offset)?;
+            let flags = read_u8(msg, offset)?;
+            let iterations = read_u16(msg, offset)?;
+            let salt_len = read_u8(msg, offset)? as usize;
+            if *offset + salt_len > end {
+                return Err(CoreError::Parse("invalid nsec3".to_string()));
+            }
+            let salt = msg[*offset..*offset + salt_len].to_vec();
+            *offset += salt_len;
+            let next_len = read_u8(msg, offset)? as usize;
+            if *offset + next_len > end {
+                return Err(CoreError::Parse("invalid nsec3".to_string()));
+            }
+            let next_hashed_owner = msg[*offset..*offset + next_len].to_vec();
+            *offset += next_len;
+            let type_bitmaps = msg[*offset..end].to_vec();
+            *offset = end;
+            DnsRecordData::NSEC3(DnsNsec3 {
+                hash_alg,
+                flags,
+                iterations,
+                salt,
+                next_hashed_owner,
+                type_bitmaps,
+            })
+        }
         41 => {
             let mut options = Vec::new();
             while *offset + 4 <= end {
@@ -504,6 +752,15 @@ fn read_u16(msg: &[u8], offset: &mut usize) -> CoreResult<u16> {
     Ok(value)
 }
 
+fn read_u8(msg: &[u8], offset: &mut usize) -> CoreResult<u8> {
+    if *offset + 1 > msg.len() {
+        return Err(CoreError::Parse("unexpected eof".to_string()));
+    }
+    let value = msg[*offset];
+    *offset += 1;
+    Ok(value)
+}
+
 fn read_u32(msg: &[u8], offset: &mut usize) -> CoreResult<u32> {
     if *offset + 4 > msg.len() {
         return Err(CoreError::Parse("unexpected eof".to_string()));
@@ -516,6 +773,348 @@ fn read_u32(msg: &[u8], offset: &mut usize) -> CoreResult<u32> {
     ]);
     *offset += 4;
     Ok(value)
+}
+
+pub fn dnskey_tag(key: &DnsDnskey) -> u16 {
+    let mut data = Vec::new();
+    data.extend_from_slice(&key.flags.to_be_bytes());
+    data.push(key.protocol);
+    data.push(key.algorithm);
+    data.extend_from_slice(&key.public_key);
+    let mut sum: u32 = 0;
+    for (i, b) in data.iter().enumerate() {
+        if i % 2 == 0 {
+            sum += (*b as u32) << 8;
+        } else {
+            sum += *b as u32;
+        }
+    }
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    (sum & 0xFFFF) as u16
+}
+
+pub fn compute_ds(owner: &str, key: &DnsDnskey, digest_type: u8) -> CoreResult<Vec<u8>> {
+    let mut data = Vec::new();
+    encode_name_canonical(owner, &mut data)?;
+    data.extend_from_slice(&key.flags.to_be_bytes());
+    data.push(key.protocol);
+    data.push(key.algorithm);
+    data.extend_from_slice(&key.public_key);
+    match digest_type {
+        1 => Ok(sha1::digest(&data).to_vec()),
+        2 => Ok(sha256::digest(&data).to_vec()),
+        4 => Ok(sha384::digest(&data).to_vec()),
+        _ => Err(CoreError::Parse("unsupported ds digest".to_string())),
+    }
+}
+
+pub fn verify_ds(owner: &str, ds: &DnsDs, key: &DnsDnskey) -> CoreResult<bool> {
+    if ds.key_tag != dnskey_tag(key) || ds.algorithm != key.algorithm {
+        return Ok(false);
+    }
+    let digest = compute_ds(owner, key, ds.digest_type)?;
+    Ok(digest == ds.digest)
+}
+
+pub fn verify_rrsig_at(
+    owner: &str,
+    rrset: &[DnsRecord],
+    rrsig: &DnsRrsig,
+    dnskey: &DnsDnskey,
+    now: u32,
+) -> CoreResult<()> {
+    if rrsig.algorithm != dnskey.algorithm {
+        return Err(CoreError::Parse("algorithm mismatch".to_string()));
+    }
+    if rrsig.key_tag != dnskey_tag(dnskey) {
+        return Err(CoreError::Parse("key tag mismatch".to_string()));
+    }
+    if now < rrsig.signature_inception || now > rrsig.signature_expiration {
+        return Err(CoreError::Parse("signature expired".to_string()));
+    }
+    for rr in rrset {
+        if rr.rtype != rrsig.type_covered {
+            return Err(CoreError::Parse("rrset type mismatch".to_string()));
+        }
+    }
+
+    let signed = build_rrsig_signed_data(owner, rrset, rrsig)?;
+    verify_signature(rrsig, dnskey, &signed)
+}
+
+pub fn verify_rrsig(owner: &str, rrset: &[DnsRecord], rrsig: &DnsRrsig, dnskey: &DnsDnskey) -> CoreResult<()> {
+    let now = corelib::time::now_secs() as u32;
+    verify_rrsig_at(owner, rrset, rrsig, dnskey, now)
+}
+
+fn build_rrsig_signed_data(owner: &str, rrset: &[DnsRecord], rrsig: &DnsRrsig) -> CoreResult<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&rrsig.type_covered.to_be_bytes());
+    out.push(rrsig.algorithm);
+    out.push(rrsig.labels);
+    out.extend_from_slice(&rrsig.original_ttl.to_be_bytes());
+    out.extend_from_slice(&rrsig.signature_expiration.to_be_bytes());
+    out.extend_from_slice(&rrsig.signature_inception.to_be_bytes());
+    out.extend_from_slice(&rrsig.key_tag.to_be_bytes());
+    encode_name_canonical(&rrsig.signer_name, &mut out)?;
+
+    let owner_name = wildcard_owner(owner, rrsig.labels);
+    let mut rr_bytes = Vec::new();
+    for rr in rrset {
+        rr_bytes.push(encode_canonical_rr(&owner_name, rr, rrsig.original_ttl)?);
+    }
+    rr_bytes.sort();
+    for rr in rr_bytes {
+        out.extend_from_slice(&rr);
+    }
+    Ok(out)
+}
+
+fn encode_canonical_rr(owner: &str, rr: &DnsRecord, ttl: u32) -> CoreResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    encode_name_canonical(owner, &mut buf)?;
+    buf.extend_from_slice(&rr.rtype.to_be_bytes());
+    buf.extend_from_slice(&rr.class.to_be_bytes());
+    buf.extend_from_slice(&ttl.to_be_bytes());
+    let mut rdata = Vec::new();
+    encode_rdata_canonical(&rr.data, &mut rdata)?;
+    buf.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    buf.extend_from_slice(&rdata);
+    Ok(buf)
+}
+
+fn encode_rdata_canonical(data: &DnsRecordData, buf: &mut Vec<u8>) -> CoreResult<()> {
+    match data {
+        DnsRecordData::A(addr) => buf.extend_from_slice(&addr.octets()),
+        DnsRecordData::AAAA(addr) => buf.extend_from_slice(&addr.octets()),
+        DnsRecordData::CNAME(name)
+        | DnsRecordData::NS(name)
+        | DnsRecordData::PTR(name) => {
+            encode_name_canonical(name, buf)?;
+        }
+        DnsRecordData::MX { preference, exchange } => {
+            buf.extend_from_slice(&preference.to_be_bytes());
+            encode_name_canonical(exchange, buf)?;
+        }
+        DnsRecordData::TXT(text) => {
+            buf.push(text.len() as u8);
+            buf.extend_from_slice(text.as_bytes());
+        }
+        DnsRecordData::SRV { priority, weight, port, target } => {
+            buf.extend_from_slice(&priority.to_be_bytes());
+            buf.extend_from_slice(&weight.to_be_bytes());
+            buf.extend_from_slice(&port.to_be_bytes());
+            encode_name_canonical(target, buf)?;
+        }
+        DnsRecordData::DNSKEY(key) => {
+            buf.extend_from_slice(&key.flags.to_be_bytes());
+            buf.push(key.protocol);
+            buf.push(key.algorithm);
+            buf.extend_from_slice(&key.public_key);
+        }
+        DnsRecordData::DS(ds) => {
+            buf.extend_from_slice(&ds.key_tag.to_be_bytes());
+            buf.push(ds.algorithm);
+            buf.push(ds.digest_type);
+            buf.extend_from_slice(&ds.digest);
+        }
+        DnsRecordData::RRSIG(sig) => {
+            buf.extend_from_slice(&sig.type_covered.to_be_bytes());
+            buf.push(sig.algorithm);
+            buf.push(sig.labels);
+            buf.extend_from_slice(&sig.original_ttl.to_be_bytes());
+            buf.extend_from_slice(&sig.signature_expiration.to_be_bytes());
+            buf.extend_from_slice(&sig.signature_inception.to_be_bytes());
+            buf.extend_from_slice(&sig.key_tag.to_be_bytes());
+            encode_name_canonical(&sig.signer_name, buf)?;
+            buf.extend_from_slice(&sig.signature);
+        }
+        DnsRecordData::NSEC(nsec) => {
+            encode_name_canonical(&nsec.next_domain, buf)?;
+            buf.extend_from_slice(&nsec.type_bitmaps);
+        }
+        DnsRecordData::NSEC3(nsec3) => {
+            buf.push(nsec3.hash_alg);
+            buf.push(nsec3.flags);
+            buf.extend_from_slice(&nsec3.iterations.to_be_bytes());
+            buf.push(nsec3.salt.len() as u8);
+            buf.extend_from_slice(&nsec3.salt);
+            buf.push(nsec3.next_hashed_owner.len() as u8);
+            buf.extend_from_slice(&nsec3.next_hashed_owner);
+            buf.extend_from_slice(&nsec3.type_bitmaps);
+        }
+        DnsRecordData::OPT { options, .. } => {
+            for opt in options {
+                buf.extend_from_slice(&opt.code.to_be_bytes());
+                buf.extend_from_slice(&(opt.data.len() as u16).to_be_bytes());
+                buf.extend_from_slice(&opt.data);
+            }
+        }
+        DnsRecordData::Unknown(raw) => buf.extend_from_slice(raw),
+    }
+    Ok(())
+}
+
+fn encode_name_canonical(name: &str, buf: &mut Vec<u8>) -> CoreResult<()> {
+    if name.is_empty() {
+        buf.push(0);
+        return Ok(());
+    }
+    for label in name.split('.') {
+        let label = label.to_ascii_lowercase();
+        if label.len() > 63 {
+            return Err(CoreError::Parse("label too long".to_string()));
+        }
+        buf.push(label.len() as u8);
+        buf.extend_from_slice(label.as_bytes());
+    }
+    buf.push(0);
+    Ok(())
+}
+
+fn wildcard_owner(owner: &str, labels: u8) -> String {
+    let parts: Vec<&str> = owner.trim_end_matches('.').split('.').collect();
+    if labels as usize >= parts.len() {
+        return owner.to_string();
+    }
+    let suffix = parts[parts.len() - labels as usize..].join(".");
+    format!("*.{}", suffix)
+}
+
+fn verify_signature(rrsig: &DnsRrsig, key: &DnsDnskey, data: &[u8]) -> CoreResult<()> {
+    match key.algorithm {
+        8 => verify_rsa(&ring::signature::RSA_PKCS1_2048_8192_SHA256, key, &rrsig.signature, data),
+        10 => verify_rsa(&ring::signature::RSA_PKCS1_2048_8192_SHA512, key, &rrsig.signature, data),
+        13 => verify_ecdsa(&ring::signature::ECDSA_P256_SHA256_FIXED, key, &rrsig.signature, data),
+        14 => verify_ecdsa(&ring::signature::ECDSA_P384_SHA384_FIXED, key, &rrsig.signature, data),
+        15 => verify_ed25519(key, &rrsig.signature, data),
+        _ => Err(CoreError::Parse("unsupported dnssec algorithm".to_string())),
+    }
+}
+
+fn verify_ed25519(key: &DnsDnskey, signature: &[u8], data: &[u8]) -> CoreResult<()> {
+    let verifier = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key.public_key);
+    verifier
+        .verify(data, signature)
+        .map_err(|_| CoreError::Parse("ed25519 verify failed".to_string()))
+}
+
+fn verify_ecdsa(
+    alg: &'static ring::signature::EcdsaVerificationAlgorithm,
+    key: &DnsDnskey,
+    signature: &[u8],
+    data: &[u8],
+) -> CoreResult<()> {
+    let mut pubkey = Vec::with_capacity(1 + key.public_key.len());
+    pubkey.push(0x04);
+    pubkey.extend_from_slice(&key.public_key);
+    let verifier = ring::signature::UnparsedPublicKey::new(alg, pubkey);
+    verifier
+        .verify(data, signature)
+        .map_err(|_| CoreError::Parse("ecdsa verify failed".to_string()))
+}
+
+fn verify_rsa(
+    alg: &'static ring::signature::RsaParameters,
+    key: &DnsDnskey,
+    signature: &[u8],
+    data: &[u8],
+) -> CoreResult<()> {
+    let (e, n) = parse_rsa_key(&key.public_key)?;
+    let components = ring::signature::RsaPublicKeyComponents { n: &n, e: &e };
+    components
+        .verify(alg, data, signature)
+        .map_err(|_| CoreError::Parse("rsa verify failed".to_string()))
+}
+
+fn parse_rsa_key(data: &[u8]) -> CoreResult<(Vec<u8>, Vec<u8>)> {
+    if data.is_empty() {
+        return Err(CoreError::Parse("invalid rsa key".to_string()));
+    }
+    let (exp_len, offset) = if data[0] == 0 {
+        if data.len() < 3 {
+            return Err(CoreError::Parse("invalid rsa key".to_string()));
+        }
+        let len = u16::from_be_bytes([data[1], data[2]]) as usize;
+        (len, 3)
+    } else {
+        (data[0] as usize, 1)
+    };
+    if data.len() < offset + exp_len {
+        return Err(CoreError::Parse("invalid rsa key".to_string()));
+    }
+    let e = data[offset..offset + exp_len].to_vec();
+    let n = data[offset + exp_len..].to_vec();
+    Ok((e, n))
+}
+
+pub fn nsec_covers(name: &str, owner: &str, next: &str) -> bool {
+    let name = canonical_name(name);
+    let owner = canonical_name(owner);
+    let next = canonical_name(next);
+    if owner < next {
+        name > owner && name < next
+    } else {
+        name > owner || name < next
+    }
+}
+
+pub fn nsec3_hash(name: &str, iterations: u16, salt: &[u8]) -> Vec<u8> {
+    let mut data = canonical_wire_name(name);
+    data.extend_from_slice(salt);
+    let mut digest = sha1::digest(&data).to_vec();
+    for _ in 0..iterations {
+        let mut next = digest.clone();
+        next.extend_from_slice(salt);
+        digest = sha1::digest(&next).to_vec();
+    }
+    digest
+}
+
+pub fn nsec3_hash_base32(name: &str, iterations: u16, salt: &[u8]) -> String {
+    let hash = nsec3_hash(name, iterations, salt);
+    base32hex_encode(&hash)
+}
+
+pub fn nsec3_covers(name_hash: &[u8], owner_hash: &[u8], next_hash: &[u8]) -> bool {
+    if owner_hash < next_hash {
+        name_hash > owner_hash && name_hash < next_hash
+    } else {
+        name_hash > owner_hash || name_hash < next_hash
+    }
+}
+
+fn canonical_wire_name(name: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let _ = encode_name_canonical(name, &mut out);
+    out
+}
+
+fn canonical_name(name: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let _ = encode_name_canonical(name, &mut out);
+    out
+}
+
+fn base32hex_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    let mut out = String::new();
+    let mut buffer: u32 = 0;
+    let mut bits = 0u8;
+    for &b in data {
+        buffer = (buffer << 8) | (b as u32);
+        bits += 8;
+        while bits >= 5 {
+            let index = ((buffer >> (bits - 5)) & 0x1f) as usize;
+            out.push(ALPHABET[index] as char);
+            bits -= 5;
+        }
+    }
+    if bits > 0 {
+        let index = ((buffer << (5 - bits)) & 0x1f) as usize;
+        out.push(ALPHABET[index] as char);
+    }
+    out
 }
 
 pub struct DnsClient {
@@ -594,6 +1193,134 @@ impl DnsClient {
             }
         }
         Err(CoreError::Parse("unexpected eof".to_string()))
+    }
+}
+
+const MDNS_PORT: u16 = 5353;
+const MDNS_IPV4: &str = "224.0.0.251";
+
+pub struct MdnsClient {
+    socket: UdpSocket,
+}
+
+impl MdnsClient {
+    pub fn bind_v4() -> CoreResult<Self> {
+        let socket = UdpSocket::bind(("0.0.0.0", MDNS_PORT)).map_err(CoreError::Io)?;
+        socket.set_read_timeout(Some(Duration::from_secs(3))).map_err(CoreError::Io)?;
+        let mcast: Ipv4Addr = MDNS_IPV4.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        socket.join_multicast_v4(&mcast, &Ipv4Addr::UNSPECIFIED).map_err(CoreError::Io)?;
+        Ok(Self { socket })
+    }
+
+    pub fn send_query(&self, message: &DnsMessage) -> CoreResult<()> {
+        let bytes = message.encode()?;
+        let target: SocketAddr = format!("{}:{}", MDNS_IPV4, MDNS_PORT).parse().unwrap();
+        self.socket.send_to(&bytes, target).map_err(CoreError::Io)?;
+        Ok(())
+    }
+
+    pub fn recv(&self, max_bytes: usize) -> CoreResult<(DnsMessage, SocketAddr)> {
+        let mut buf = vec![0u8; max_bytes];
+        let (len, addr) = self.socket.recv_from(&mut buf).map_err(CoreError::Io)?;
+        buf.truncate(len);
+        let msg = DnsMessage::decode(&buf)?;
+        Ok((msg, addr))
+    }
+}
+
+pub struct MdnsServer {
+    socket: UdpSocket,
+}
+
+impl MdnsServer {
+    pub fn bind_v4() -> CoreResult<Self> {
+        let socket = UdpSocket::bind(("0.0.0.0", MDNS_PORT)).map_err(CoreError::Io)?;
+        let mcast: Ipv4Addr = MDNS_IPV4.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        socket.join_multicast_v4(&mcast, &Ipv4Addr::UNSPECIFIED).map_err(CoreError::Io)?;
+        Ok(Self { socket })
+    }
+
+    pub fn serve<F>(&self, handler: F) -> CoreResult<()>
+    where
+        F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+    {
+        let handler = Arc::new(handler);
+        loop {
+            let mut buf = vec![0u8; DNS_MAX_PACKET];
+            let (len, peer) = self.socket.recv_from(&mut buf).map_err(CoreError::Io)?;
+            buf.truncate(len);
+            let handler = Arc::clone(&handler);
+            let socket = self.socket.try_clone().map_err(CoreError::Io)?;
+            thread::spawn(move || {
+                if let Ok(req) = DnsMessage::decode(&buf) {
+                    if let Ok(resp) = handler(req).encode() {
+                        let _ = socket.send_to(&resp, peer);
+                    }
+                }
+            });
+        }
+    }
+}
+
+pub struct AsyncMdnsClient {
+    socket: TokioUdpSocket,
+}
+
+impl AsyncMdnsClient {
+    pub async fn bind_v4() -> CoreResult<Self> {
+        let socket = TokioUdpSocket::bind(("0.0.0.0", MDNS_PORT)).await.map_err(CoreError::Io)?;
+        let mcast: Ipv4Addr = MDNS_IPV4.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        socket.join_multicast_v4(mcast, Ipv4Addr::UNSPECIFIED).map_err(CoreError::Io)?;
+        Ok(Self { socket })
+    }
+
+    pub async fn send_query(&self, message: &DnsMessage) -> CoreResult<()> {
+        let bytes = message.encode()?;
+        let target: SocketAddr = format!("{}:{}", MDNS_IPV4, MDNS_PORT).parse().unwrap();
+        self.socket.send_to(&bytes, target).await.map_err(CoreError::Io)?;
+        Ok(())
+    }
+
+    pub async fn recv(&self, max_bytes: usize) -> CoreResult<(DnsMessage, SocketAddr)> {
+        let mut buf = vec![0u8; max_bytes];
+        let (len, addr) = self.socket.recv_from(&mut buf).await.map_err(CoreError::Io)?;
+        buf.truncate(len);
+        let msg = DnsMessage::decode(&buf)?;
+        Ok((msg, addr))
+    }
+}
+
+pub struct AsyncMdnsServer {
+    socket: Arc<TokioUdpSocket>,
+}
+
+impl AsyncMdnsServer {
+    pub async fn bind_v4() -> CoreResult<Self> {
+        let socket = TokioUdpSocket::bind(("0.0.0.0", MDNS_PORT)).await.map_err(CoreError::Io)?;
+        let mcast: Ipv4Addr = MDNS_IPV4.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        socket.join_multicast_v4(mcast, Ipv4Addr::UNSPECIFIED).map_err(CoreError::Io)?;
+        Ok(Self { socket: Arc::new(socket) })
+    }
+
+    pub async fn serve<F>(&self, handler: F) -> CoreResult<()>
+    where
+        F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+    {
+        let handler = Arc::new(handler);
+        let mut buf = vec![0u8; DNS_MAX_PACKET];
+        loop {
+            let (len, peer) = self.socket.recv_from(&mut buf).await.map_err(CoreError::Io)?;
+            let data = buf[..len].to_vec();
+            let handler = Arc::clone(&handler);
+            let socket = Arc::clone(&self.socket);
+            tokio::spawn(async move {
+                if let Ok(req) = DnsMessage::decode(&data) {
+                    if let Ok(resp) = handler(req).encode() {
+                        let _ = socket.send_to(&resp, peer).await;
+                    }
+                }
+            });
+        }
     }
 }
 
@@ -688,6 +1415,19 @@ pub struct DohClient {
 pub struct AsyncDohClient {
     url: DohUrl,
     timeouts: Timeouts,
+    max_packet: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AsyncDoh2Client {
+    url: DohUrl,
+    timeouts: Timeouts,
+    max_packet: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AsyncDoh3Client {
+    url: DohUrl,
     max_packet: usize,
 }
 
@@ -818,6 +1558,88 @@ impl AsyncDohClient {
         }
         if response.body.len() > self.max_packet {
             return Err(CoreError::Parse("doh response too large".to_string()));
+        }
+        DnsMessage::decode(&response.body)
+    }
+}
+
+impl AsyncDoh2Client {
+    pub fn new(url: &str, timeouts: Timeouts) -> CoreResult<Self> {
+        Ok(Self {
+            url: DohUrl::parse(url)?,
+            timeouts,
+            max_packet: DNS_MAX_PACKET,
+        })
+    }
+
+    pub fn max_packet(mut self, max_packet: usize) -> Self {
+        self.max_packet = max_packet;
+        self
+    }
+
+    pub async fn query(&self, message: &DnsMessage) -> CoreResult<DnsMessage> {
+        let uri = if (self.url.scheme == "https" && self.url.port == 443)
+            || (self.url.scheme == "http" && self.url.port == 80)
+        {
+            format!("{}://{}{}", self.url.scheme, self.url.host, self.url.path)
+        } else {
+            format!(
+                "{}://{}:{}{}",
+                self.url.scheme, self.url.host, self.url.port, self.url.path
+            )
+        };
+        let mut req = crate::http2::Http2Request::new("POST", uri);
+        req.set_header("content-type", "application/dns-message");
+        req.set_header("accept", "application/dns-message");
+        req.body = message.encode()?;
+        let addr = NetAddr::new(&self.url.host, self.url.port);
+        let tls = TlsClientConfig::with_webpki_roots()?.with_alpn(&[b"h2"]);
+        let mut client = crate::http2::Http2Client::connect_tls(&addr, &self.url.host, &tls, self.timeouts).await?;
+        let response = client.send(&req).await?;
+        if response.status != 200 {
+            return Err(CoreError::Parse("doh2 non-200 response".to_string()));
+        }
+        if response.body.len() > self.max_packet {
+            return Err(CoreError::Parse("doh2 response too large".to_string()));
+        }
+        DnsMessage::decode(&response.body)
+    }
+}
+
+impl AsyncDoh3Client {
+    pub fn new(url: &str) -> CoreResult<Self> {
+        Ok(Self {
+            url: DohUrl::parse(url)?,
+            max_packet: DNS_MAX_PACKET,
+        })
+    }
+
+    pub fn max_packet(mut self, max_packet: usize) -> Self {
+        self.max_packet = max_packet;
+        self
+    }
+
+    pub async fn query(&self, message: &DnsMessage) -> CoreResult<DnsMessage> {
+        let mut req = crate::http3::Http3Request::new("POST", self.url.path.clone());
+        req.scheme = self.url.scheme.clone();
+        req.authority = if (self.url.scheme == "https" && self.url.port == 443)
+            || (self.url.scheme == "http" && self.url.port == 80)
+        {
+            self.url.host.clone()
+        } else {
+            format!("{}:{}", self.url.host, self.url.port)
+        };
+        req.set_header("content-type", "application/dns-message");
+        req.set_header("accept", "application/dns-message");
+        req.body = message.encode()?;
+        let addr = NetAddr::new(&self.url.host, self.url.port);
+        let mut client = crate::http3::Http3Client::connect(&addr, &self.url.host).await?;
+        let response = client.request(&req).await?;
+        if response.status != 200 {
+            return Err(CoreError::Parse("doh3 non-200 response".to_string()));
+        }
+        if response.body.len() > self.max_packet {
+            return Err(CoreError::Parse("doh3 response too large".to_string()));
         }
         DnsMessage::decode(&response.body)
     }
@@ -1013,6 +1835,7 @@ fn handle_framed_stream<T: StreamTransport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::signature::KeyPair;
 
     #[test]
     fn dns_roundtrip_query() {
@@ -1052,6 +1875,47 @@ mod tests {
             DnsRecordData::A(addr) => assert_eq!(addr, Ipv4Addr::new(127, 0, 0, 1)),
             _ => panic!("expected A record"),
         }
+    }
+
+    #[test]
+    fn dnssec_rrsig_ed25519() {
+        let seed = [7u8; 32];
+        let keypair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let dnskey = DnsDnskey {
+            flags: 256,
+            protocol: 3,
+            algorithm: 15,
+            public_key: keypair.public_key().as_ref().to_vec(),
+        };
+        let rrset = vec![DnsRecord {
+            name: "example.com".to_string(),
+            rtype: 1,
+            class: 1,
+            ttl: 3600,
+            data: DnsRecordData::A(Ipv4Addr::new(1, 2, 3, 4)),
+        }];
+        let mut rrsig = DnsRrsig {
+            type_covered: 1,
+            algorithm: 15,
+            labels: 2,
+            original_ttl: 3600,
+            signature_expiration: 2_000_000_000,
+            signature_inception: 1_600_000_000,
+            key_tag: dnskey_tag(&dnskey),
+            signer_name: "example.com".to_string(),
+            signature: Vec::new(),
+        };
+        let signed = build_rrsig_signed_data("example.com", &rrset, &rrsig).unwrap();
+        let sig = keypair.sign(&signed);
+        rrsig.signature = sig.as_ref().to_vec();
+        verify_rrsig_at("example.com", &rrset, &rrsig, &dnskey, 1_700_000_000).unwrap();
+        assert!(verify_rrsig_at("example.com", &rrset, &rrsig, &dnskey, 2_100_000_000).is_err());
+    }
+
+    #[test]
+    fn nsec3_hash_vector() {
+        let hash = nsec3_hash_base32("example.com", 0, b"");
+        assert_eq!(hash, "ONIB9MGUB9H0RML3CDF5BGRJ59DKJHVK");
     }
 
     #[test]
