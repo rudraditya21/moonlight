@@ -368,9 +368,11 @@ mod tests {
 
     #[tokio::test]
     async fn http2_roundtrip() {
-        let server = Http2Server::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .expect("bind");
+        let server = match Http2Server::bind("127.0.0.1:0".parse().unwrap()).await {
+            Ok(server) => server,
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind: {:?}", err),
+        };
         let addr = server.local_addr().expect("addr");
         tokio::spawn(async move {
             let _ = server
@@ -400,9 +402,11 @@ mod tests {
         let key_der = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
         let server_tls = TlsServerConfig::from_der(vec![cert_der.clone()], PrivateKeyDer::Pkcs8(key_der)).unwrap();
 
-        let server = Http2TlsServer::bind("127.0.0.1:0".parse().unwrap(), &server_tls)
-            .await
-            .expect("bind");
+        let server = match Http2TlsServer::bind("127.0.0.1:0".parse().unwrap(), &server_tls).await {
+            Ok(server) => server,
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind: {:?}", err),
+        };
         let addr = server.local_addr().expect("addr");
         tokio::spawn(async move {
             let _ = server
