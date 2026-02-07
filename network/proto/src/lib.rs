@@ -1,5 +1,6 @@
 pub mod codec;
 pub mod acpp;
+pub mod ssh;
 pub mod dns;
 pub mod framing;
 pub mod http;
@@ -11,6 +12,10 @@ pub mod util;
 
 pub use codec::Codec;
 pub use acpp::{AsyncClient as AcppAsyncClient, AsyncServer as AcppAsyncServer, Client as AcppClient, Message as AcppMessage, Server as AcppServer, DEFAULT_PORT as ACPP_DEFAULT_PORT};
+pub use ssh::{
+    AsyncSshClient, AsyncSshServer, AuthConfig, AuthHandler, Channel, HostKey, SshClient, SshConfig,
+    SshServer,
+};
 pub use dns::{
     AsyncDnsClient, AsyncDnsServer, AsyncDoh2Client, AsyncDoh3Client, AsyncDohClient,
     AsyncMdnsClient, AsyncMdnsServer, DohClient, DohServer, DnsClient, DnsDnskey, DnsDs, DnsMessage,
