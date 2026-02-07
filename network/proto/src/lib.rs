@@ -4,6 +4,7 @@ pub mod ssh;
 pub mod ntlm;
 pub mod redis;
 pub mod ldap;
+pub mod ftp;
 pub mod dns;
 pub mod framing;
 pub mod http;
@@ -46,6 +47,10 @@ pub use ldap::{
     Filter, InMemoryBackend, LdapClient, LdapMessage, LdapResult, LdapServer,
     ModifyDnRequest, ModifyOp, ModifyRequest, ProtocolOp, SearchRequest, SearchResultEntry,
     SearchScope, Substring,
+};
+pub use ftp::{
+    AsyncFtpClient, AsyncFtpClientConfig, AsyncFtpServer, FtpClient, FtpClientConfig, FtpCommand,
+    FtpResponse, FtpServer, FtpServerConfig, InMemoryFtpBackend,
 };
 pub use dns::{
     AsyncDnsClient, AsyncDnsServer, AsyncDoh2Client, AsyncDoh3Client, AsyncDohClient,
