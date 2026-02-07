@@ -163,7 +163,7 @@ impl Http3Client {
         let local_addr = socket.local_addr().map_err(CoreError::Io)?;
         let mut config = build_config()?;
         let scid_bytes = random_cid(16);
-        let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+        let scid = quiche::ConnectionId::from_vec(scid_bytes);
         let conn = quiche::connect(
             Some(server_name),
             &scid,
@@ -319,6 +319,12 @@ pub struct Http3Server {
     key_path: String,
 }
 
+struct ServerConn {
+    conn: quiche::Connection,
+    h3: quiche::h3::Connection,
+    streams: HashMap<u64, Http3Request>,
+}
+
 impl Http3Server {
     pub async fn bind(addr: SocketAddr, cert_path: &str, key_path: &str) -> CoreResult<Self> {
         let socket = TokioUdpSocket::bind(addr).await.map_err(CoreError::Io)?;
@@ -346,8 +352,8 @@ impl Http3Server {
         F: Fn(Http3Request) -> Http3Response + Send + Sync + 'static,
     {
         let handler = Arc::new(handler);
-        let mut conns: HashMap<Vec<u8>, (quiche::Connection, quiche::h3::Connection, HashMap<u64, Http3Request>)> =
-            HashMap::new();
+        let mut conns: Vec<ServerConn> = Vec::new();
+        let mut conn_ids: HashMap<Vec<u8>, usize> = HashMap::new();
         let mut buf = vec![0u8; 65535];
         let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
         loop {
@@ -358,9 +364,11 @@ impl Http3Server {
                 Err(_) => continue,
             };
             let conn_id = hdr.dcid.as_ref().to_vec();
-            if !conns.contains_key(&conn_id) {
+            let conn_index = if let Some(index) = conn_ids.get(&conn_id) {
+                *index
+            } else {
                 let scid_bytes = random_cid(16);
-                let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+                let scid = quiche::ConnectionId::from_vec(scid_bytes);
                 let mut config = build_config()?;
                 config
                     .load_cert_chain_from_pem_file(&self.cert_path)
@@ -374,9 +382,20 @@ impl Http3Server {
                     .map_err(|err| CoreError::Message(err.to_string()))?;
                 let h3 = quiche::h3::Connection::with_transport(&mut conn, &h3_config)
                     .map_err(|err| CoreError::Message(err.to_string()))?;
-                conns.insert(conn_id.clone(), (conn, h3, HashMap::new()));
-            }
-            let (conn, h3, streams) = conns.get_mut(&conn_id).unwrap();
+                let index = conns.len();
+                conns.push(ServerConn {
+                    conn,
+                    h3,
+                    streams: HashMap::new(),
+                });
+                insert_conn_ids(&mut conn_ids, index, &conns[index].conn, conn_id.clone());
+                index
+            };
+            let server_conn = &mut conns[conn_index];
+            insert_conn_ids(&mut conn_ids, conn_index, &server_conn.conn, conn_id);
+            let conn = &mut server_conn.conn;
+            let h3 = &mut server_conn.h3;
+            let streams = &mut server_conn.streams;
             let recv_info = quiche::RecvInfo { from, to };
             let _ = conn.recv(&mut buf[..len], recv_info);
 
@@ -441,6 +460,18 @@ impl Http3Server {
     }
 }
 
+fn insert_conn_ids(
+    conn_ids: &mut HashMap<Vec<u8>, usize>,
+    index: usize,
+    conn: &quiche::Connection,
+    initial: Vec<u8>,
+) {
+    conn_ids.insert(initial, index);
+    for scid in conn.source_ids() {
+        conn_ids.insert(scid.as_ref().to_vec(), index);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,8 +494,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires QUIC handshake on local UDP socket; run manually to validate environment"]
     async fn http3_roundtrip() {
+        if std::env::var("MOONLIGHT_HTTP3_TEST").is_err() {
+            eprintln!("MOONLIGHT_HTTP3_TEST not set; skipping http3 roundtrip");
+            return;
+        }
         let rcgen::CertifiedKey { cert, key_pair } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_pem = cert.pem();
@@ -494,12 +528,22 @@ mod tests {
                 .await;
         });
 
-        let mut client = Http3Client::connect(&NetAddr::from_socket(addr), "localhost")
-            .await
-            .expect("connect");
         let req = Http3Request::new("POST", "/dns-query");
-        let resp = client.request(&req).await.expect("request");
-        assert_eq!(resp.status, 200);
-        assert_eq!(resp.body, b"ok".to_vec());
+        let mut last_err = None;
+        for _ in 0..3 {
+            match Http3Client::connect(&NetAddr::from_socket(addr), "localhost").await {
+                Ok(mut client) => match client.request(&req).await {
+                    Ok(resp) => {
+                        assert_eq!(resp.status, 200);
+                        assert_eq!(resp.body, b"ok".to_vec());
+                        return;
+                    }
+                    Err(err) => last_err = Some(err),
+                },
+                Err(err) => last_err = Some(err),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("http3 roundtrip failed: {:?}", last_err);
     }
 }

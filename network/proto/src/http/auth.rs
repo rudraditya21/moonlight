@@ -68,6 +68,17 @@ pub fn digest_authorization(
     method: &str,
     uri: &str,
 ) -> CoreResult<String> {
+    digest_authorization_with_body(challenge, username, password, method, uri, &[])
+}
+
+pub fn digest_authorization_with_body(
+    challenge: &DigestChallenge,
+    username: &str,
+    password: &str,
+    method: &str,
+    uri: &str,
+    body: &[u8],
+) -> CoreResult<String> {
     let qop = challenge
         .qop
         .as_deref()
@@ -79,17 +90,17 @@ pub fn digest_authorization(
     let cnonce = "moonlight";
     let nc = "00000001";
 
-    let ha1 = md5_hex(&format!("{}:{}:{}", username, challenge.realm, password));
+    let ha1 = md5_hex_bytes(format!("{}:{}:{}", username, challenge.realm, password).as_bytes());
     let ha2 = if qop == "auth-int" {
-        md5_hex(&format!("{}:{}:{}", method, uri, md5_hex("")))
+        let body_hash = md5_hex_bytes(body);
+        md5_hex_bytes(format!("{}:{}:{}", method, uri, body_hash).as_bytes())
     } else {
-        md5_hex(&format!("{}:{}", method, uri))
+        md5_hex_bytes(format!("{}:{}", method, uri).as_bytes())
     };
 
-    let response = md5_hex(&format!(
-        "{}:{}:{}:{}:{}:{}",
-        ha1, challenge.nonce, nc, cnonce, qop, ha2
-    ));
+    let response = md5_hex_bytes(
+        format!("{}:{}:{}:{}:{}:{}", ha1, challenge.nonce, nc, cnonce, qop, ha2).as_bytes(),
+    );
 
     let resp = DigestResponse {
         username: username.to_string(),
@@ -173,9 +184,9 @@ fn parse_params(input: &str) -> std::collections::HashMap<String, String> {
     map
 }
 
-fn md5_hex(data: &str) -> String {
+fn md5_hex_bytes(data: &[u8]) -> String {
     let mut hasher = Md5::new();
-    hasher.update(data.as_bytes());
+    hasher.update(data);
     let digest = hasher.finalize();
     let mut out = String::with_capacity(digest.len() * 2);
     for b in digest {
@@ -230,5 +241,24 @@ mod tests {
         assert!(header.starts_with("Digest "));
         assert!(header.contains("username=\"user\""));
         assert!(header.contains("response="));
+    }
+
+    #[test]
+    fn digest_auth_int_body() {
+        let challenge = parse_digest_challenge(
+            "Digest realm=\"test\", nonce=\"xyz\", qop=\"auth-int\"",
+        )
+        .expect("parse");
+        let header = digest_authorization_with_body(&challenge, "user", "pass", "POST", "/upload", b"payload").unwrap();
+        assert!(header.contains("qop=auth-int"));
+        let response_pos = header.find("response=\"").expect("response");
+        let response = &header[response_pos + "response=\"".len()..];
+        let response = response.split('"').next().unwrap();
+
+        let ha1 = md5_hex_bytes(b"user:test:pass");
+        let body_hash = md5_hex_bytes(b"payload");
+        let ha2 = md5_hex_bytes(format!("POST:/upload:{}", body_hash).as_bytes());
+        let expected = md5_hex_bytes(format!("{}:{}:{}:{}:{}:{}", ha1, "xyz", "00000001", "moonlight", "auth-int", ha2).as_bytes());
+        assert_eq!(response, expected);
     }
 }

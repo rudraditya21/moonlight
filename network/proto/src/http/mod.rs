@@ -10,6 +10,7 @@ use net::NetAddr;
 
 use crate::transport::{
     AsyncStreamTransport, AsyncTcpTransport, AsyncTlsClientTransport, StreamTransport, TcpTransport,
+    TlsClientConfig,
 };
 use crate::util::Timeouts;
 
@@ -323,6 +324,27 @@ fn parse_absolute(rest: &str, default_port: u16) -> CoreResult<(String, u16, Str
         }
     }
     Ok((host_port.to_string(), default_port, path))
+}
+
+fn parse_host_header(value: &str, default_port: u16) -> CoreResult<(String, u16)> {
+    if value.starts_with('[') {
+        let end = value
+            .find(']')
+            .ok_or_else(|| CoreError::Parse("invalid ipv6 host".to_string()))?;
+        let host = value[1..end].to_string();
+        let port = value
+            .get(end + 1..)
+            .and_then(|s| s.strip_prefix(':'))
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return Ok((host, port));
+    }
+    if let Some((host, port)) = value.rsplit_once(':') {
+        if let Ok(port) = port.parse::<u16>() {
+            return Ok((host.to_string(), port));
+        }
+    }
+    Ok((value.to_string(), default_port))
 }
 
 fn read_until_delim<T: StreamTransport>(
@@ -707,6 +729,110 @@ impl ProxyServer {
         }
         Ok(())
     }
+
+    pub fn serve_forward(&self) -> CoreResult<()> {
+        for stream in self.listener.incoming() {
+            let stream = stream.map_err(CoreError::Io)?;
+            let timeouts = self.timeouts;
+            let max_body = self.max_body;
+            thread::spawn(move || {
+                let _ = handle_proxy_forward_connection(stream, timeouts, max_body);
+            });
+        }
+        Ok(())
+    }
+}
+
+pub fn proxy_forward(request: &HttpRequest, timeouts: Timeouts) -> CoreResult<HttpResponse> {
+    let target = resolve_forward_target(request)?;
+    let mut outbound = request.clone();
+    outbound.path = target.path;
+    set_header(&mut outbound.headers, "Host", &target.host_header);
+    remove_header(&mut outbound.headers, "Proxy-Connection");
+    if target.scheme == "https" {
+        let tls = TlsClientConfig::with_webpki_roots()?;
+        let addr = NetAddr::new(&target.host, target.port);
+        let mut client = HttpClient::connect_tls(&addr, &target.host, &tls, timeouts)?;
+        client.send(&outbound)
+    } else {
+        let addr = NetAddr::new(&target.host, target.port);
+        let mut client = HttpClient::connect(&addr, timeouts)?;
+        client.send(&outbound)
+    }
+}
+
+pub async fn proxy_forward_async(request: &HttpRequest, timeouts: Timeouts) -> CoreResult<HttpResponse> {
+    let target = resolve_forward_target(request)?;
+    let mut outbound = request.clone();
+    outbound.path = target.path;
+    set_header(&mut outbound.headers, "Host", &target.host_header);
+    remove_header(&mut outbound.headers, "Proxy-Connection");
+    if target.scheme == "https" {
+        let tls = TlsClientConfig::with_webpki_roots()?;
+        let addr = NetAddr::new(&target.host, target.port);
+        let mut client = AsyncHttpClient::connect_tls(&addr, &target.host, &tls, timeouts).await?;
+        client.send(&outbound).await
+    } else {
+        let addr = NetAddr::new(&target.host, target.port);
+        let mut client = AsyncHttpClient::connect(&addr, timeouts).await?;
+        client.send(&outbound).await
+    }
+}
+
+struct ForwardTarget {
+    scheme: String,
+    host: String,
+    host_header: String,
+    port: u16,
+    path: String,
+}
+
+fn resolve_forward_target(request: &HttpRequest) -> CoreResult<ForwardTarget> {
+    match request.target()? {
+        HttpTarget::Absolute {
+            scheme,
+            host,
+            port,
+            path,
+        } => {
+            let host_header = if (scheme == "https" && port == 443) || (scheme == "http" && port == 80) {
+                host.clone()
+            } else {
+                format!("{}:{}", host, port)
+            };
+            Ok(ForwardTarget {
+                scheme,
+                host,
+                host_header,
+                port,
+                path,
+            })
+        }
+        HttpTarget::Origin(path) => {
+            let host = header_value(&request.headers, "host")
+                .ok_or_else(|| CoreError::Parse("missing host header".to_string()))?;
+            let (host, port) = parse_host_header(host, 80)?;
+            let host_header = if port == 80 {
+                host.clone()
+            } else {
+                format!("{}:{}", host, port)
+            };
+            Ok(ForwardTarget {
+                scheme: "http".to_string(),
+                host,
+                host_header,
+                port,
+                path,
+            })
+        }
+        HttpTarget::Authority { .. } | HttpTarget::Asterisk => {
+            Err(CoreError::Parse("unsupported proxy target".to_string()))
+        }
+    }
+}
+
+fn remove_header(headers: &mut Vec<(String, String)>, name: &str) {
+    headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
 }
 
 fn handle_connection(
@@ -799,6 +925,60 @@ fn handle_proxy_connection(
         }
 
         let mut response = (handler)(request.clone());
+        let connection = header_map.get("connection").map(|v| v.to_ascii_lowercase());
+        let should_close = match request.version {
+            HttpVersion::Http10 => connection.as_deref() != Some("keep-alive"),
+            HttpVersion::Http11 => connection.as_deref() == Some("close"),
+        };
+        if should_close {
+            response.set_header("Connection", "close");
+        } else if matches!(request.version, HttpVersion::Http10) {
+            response.set_header("Connection", "keep-alive");
+        }
+        let bytes = response.to_bytes()?;
+        transport.write_all(&bytes)?;
+        if should_close {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn handle_proxy_forward_connection(
+    stream: TcpStream,
+    timeouts: Timeouts,
+    max_body: usize,
+) -> CoreResult<()> {
+    let mut transport = TcpTransport::from_stream(stream, timeouts)?;
+    let mut buffer = Vec::new();
+    loop {
+        let header_bytes = read_until_delim(&mut transport, &mut buffer, b"\r\n\r\n", MAX_HEADER_BYTES)?;
+        let (mut request, header_map) = parse_request(&header_bytes)?;
+        if let Some(len) = header_map.get("content-length") {
+            let len = len.parse::<usize>().map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
+            request.body = read_exact_body(&mut transport, &mut buffer, len)?;
+        } else if let Some(te) = header_map.get("transfer-encoding") {
+            if te.to_ascii_lowercase().contains("chunked") {
+                request.body = read_chunked_body(&mut transport, &mut buffer, max_body)?;
+            }
+        }
+
+        if matches!(request.method, HttpMethod::Connect) {
+            let mut response = HttpResponse::new(405);
+            response.reason = "Method Not Allowed".to_string();
+            let bytes = response.to_bytes()?;
+            transport.write_all(&bytes)?;
+            break;
+        }
+
+        let mut response = match proxy_forward(&request, timeouts) {
+            Ok(resp) => resp,
+            Err(err) => {
+                let mut resp = HttpResponse::new(502);
+                resp.reason = err.to_string();
+                resp
+            }
+        };
         let connection = header_map.get("connection").map(|v| v.to_ascii_lowercase());
         let should_close = match request.version {
             HttpVersion::Http10 => connection.as_deref() != Some("keep-alive"),

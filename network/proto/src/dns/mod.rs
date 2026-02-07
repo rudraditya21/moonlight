@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
 use std::sync::Arc;
 use std::thread;
@@ -9,7 +9,9 @@ use net::NetAddr;
 use tokio::net::UdpSocket as TokioUdpSocket;
 
 use crate::framing::{Framer, LengthPrefixedFramer};
-use crate::http::{AsyncHttpClient, HttpClient, HttpMethod, HttpRequest, HttpVersion};
+use crate::http::{AsyncHttpClient, HttpClient, HttpMethod, HttpRequest, HttpResponse, HttpVersion};
+use crate::http2::{Http2Request, Http2Response, Http2Server, Http2TlsServer};
+use crate::http3::{Http3Request, Http3Response, Http3Server};
 use crate::transport::{
     AsyncStreamTransport, AsyncTcpTransport, AsyncTlsClientTransport, AsyncTlsServer,
     AsyncTlsServerTransport, AsyncUdpTransport, StreamTransport, TcpTransport, TlsClientConfig,
@@ -92,6 +94,24 @@ pub struct DnsRecord {
     pub data: DnsRecordData,
 }
 
+impl DnsRecord {
+    pub fn mdns_cache_flush(&self) -> bool {
+        (self.class & 0x8000) != 0
+    }
+
+    pub fn mdns_class(&self) -> u16 {
+        self.class & 0x7fff
+    }
+
+    pub fn set_mdns_cache_flush(&mut self, enabled: bool) {
+        if enabled {
+            self.class |= 0x8000;
+        } else {
+            self.class &= 0x7fff;
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsOption {
     pub code: u16,
@@ -104,6 +124,26 @@ pub struct DnsClientSubnet {
     pub source_prefix: u8,
     pub scope_prefix: u8,
     pub address: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsOptionValue {
+    ClientSubnet(DnsClientSubnet),
+    Cookie {
+        client: Vec<u8>,
+        server: Vec<u8>,
+    },
+    TcpKeepalive(Option<u16>),
+    Padding(usize),
+    Nsid(Vec<u8>),
+    Dau(Vec<u8>),
+    Dhu(Vec<u8>),
+    N3u(Vec<u8>),
+    Expire(u32),
+    Chain(Vec<u8>),
+    KeyTag(Vec<u16>),
+    ExtendedError { code: u16, text: String },
+    Unknown(u16, Vec<u8>),
 }
 
 impl DnsOption {
@@ -141,6 +181,43 @@ impl DnsOption {
         Self { code: 3, data: Vec::new() }
     }
 
+    pub fn dau(algs: &[u8]) -> Self {
+        Self { code: 5, data: algs.to_vec() }
+    }
+
+    pub fn dhu(algs: &[u8]) -> Self {
+        Self { code: 6, data: algs.to_vec() }
+    }
+
+    pub fn n3u(algs: &[u8]) -> Self {
+        Self { code: 7, data: algs.to_vec() }
+    }
+
+    pub fn expire(seconds: u32) -> Self {
+        Self { code: 9, data: seconds.to_be_bytes().to_vec() }
+    }
+
+    pub fn chain(data: Vec<u8>) -> Self {
+        Self { code: 13, data }
+    }
+
+    pub fn key_tag(tags: &[u16]) -> Self {
+        let mut data = Vec::with_capacity(tags.len() * 2);
+        for tag in tags {
+            data.extend_from_slice(&tag.to_be_bytes());
+        }
+        Self { code: 14, data }
+    }
+
+    pub fn ede(code: u16, text: Option<&str>) -> Self {
+        let mut data = Vec::new();
+        data.extend_from_slice(&code.to_be_bytes());
+        if let Some(text) = text {
+            data.extend_from_slice(text.as_bytes());
+        }
+        Self { code: 15, data }
+    }
+
     pub fn parse_ecs(&self) -> Option<DnsClientSubnet> {
         if self.code != 8 || self.data.len() < 4 {
             return None;
@@ -155,6 +232,73 @@ impl DnsOption {
             scope_prefix,
             address,
         })
+    }
+
+    pub fn parse(&self) -> CoreResult<DnsOptionValue> {
+        match self.code {
+            3 => Ok(DnsOptionValue::Nsid(self.data.clone())),
+            5 => Ok(DnsOptionValue::Dau(self.data.clone())),
+            6 => Ok(DnsOptionValue::Dhu(self.data.clone())),
+            7 => Ok(DnsOptionValue::N3u(self.data.clone())),
+            8 => self
+                .parse_ecs()
+                .map(DnsOptionValue::ClientSubnet)
+                .ok_or_else(|| CoreError::Parse("invalid ecs option".to_string())),
+            9 => {
+                if self.data.len() != 4 {
+                    return Err(CoreError::Parse("invalid expire option".to_string()));
+                }
+                let seconds = u32::from_be_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]);
+                Ok(DnsOptionValue::Expire(seconds))
+            }
+            10 => {
+                if self.data.len() < 8 {
+                    return Err(CoreError::Parse("invalid cookie option".to_string()));
+                }
+                let client = self.data[..8].to_vec();
+                let server = self.data[8..].to_vec();
+                Ok(DnsOptionValue::Cookie { client, server })
+            }
+            11 => {
+                if self.data.is_empty() {
+                    return Ok(DnsOptionValue::TcpKeepalive(None));
+                }
+                if self.data.len() != 2 {
+                    return Err(CoreError::Parse("invalid keepalive option".to_string()));
+                }
+                let timeout = u16::from_be_bytes([self.data[0], self.data[1]]);
+                Ok(DnsOptionValue::TcpKeepalive(Some(timeout)))
+            }
+            12 => Ok(DnsOptionValue::Padding(self.data.len())),
+            13 => Ok(DnsOptionValue::Chain(self.data.clone())),
+            14 => {
+                if self.data.len() % 2 != 0 {
+                    return Err(CoreError::Parse("invalid key tag option".to_string()));
+                }
+                let mut tags = Vec::new();
+                let mut i = 0usize;
+                while i < self.data.len() {
+                    tags.push(u16::from_be_bytes([self.data[i], self.data[i + 1]]));
+                    i += 2;
+                }
+                Ok(DnsOptionValue::KeyTag(tags))
+            }
+            15 => {
+                if self.data.len() < 2 {
+                    return Err(CoreError::Parse("invalid ede option".to_string()));
+                }
+                let code = u16::from_be_bytes([self.data[0], self.data[1]]);
+                let text = if self.data.len() > 2 {
+                    std::str::from_utf8(&self.data[2..])
+                        .map_err(|_| CoreError::Parse("invalid ede text".to_string()))?
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                Ok(DnsOptionValue::ExtendedError { code, text })
+            }
+            _ => Ok(DnsOptionValue::Unknown(self.code, self.data.clone())),
+        }
     }
 }
 
@@ -983,6 +1127,12 @@ fn wildcard_owner(owner: &str, labels: u8) -> String {
 
 fn verify_signature(rrsig: &DnsRrsig, key: &DnsDnskey, data: &[u8]) -> CoreResult<()> {
     match key.algorithm {
+        5 | 7 => verify_rsa(
+            &ring::signature::RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY,
+            key,
+            &rrsig.signature,
+            data,
+        ),
         8 => verify_rsa(&ring::signature::RSA_PKCS1_2048_8192_SHA256, key, &rrsig.signature, data),
         10 => verify_rsa(&ring::signature::RSA_PKCS1_2048_8192_SHA512, key, &rrsig.signature, data),
         13 => verify_ecdsa(&ring::signature::ECDSA_P256_SHA256_FIXED, key, &rrsig.signature, data),
@@ -1046,6 +1196,84 @@ fn parse_rsa_key(data: &[u8]) -> CoreResult<(Vec<u8>, Vec<u8>)> {
     let e = data[offset..offset + exp_len].to_vec();
     let n = data[offset + exp_len..].to_vec();
     Ok((e, n))
+}
+
+pub fn nsec_type_bitmap_contains(type_bitmaps: &[u8], rr_type: u16) -> CoreResult<bool> {
+    let window = (rr_type / 256) as u8;
+    let bit_index = (rr_type % 256) as usize;
+    let byte_index = bit_index / 8;
+    let bit = 0x80u8 >> (bit_index % 8);
+    let mut i = 0usize;
+    while i < type_bitmaps.len() {
+        if i + 2 > type_bitmaps.len() {
+            return Err(CoreError::Parse("invalid type bitmap".to_string()));
+        }
+        let win = type_bitmaps[i];
+        let len = type_bitmaps[i + 1] as usize;
+        i += 2;
+        if len == 0 || len > 32 || i + len > type_bitmaps.len() {
+            return Err(CoreError::Parse("invalid type bitmap".to_string()));
+        }
+        if win == window {
+            if byte_index >= len {
+                return Ok(false);
+            }
+            return Ok((type_bitmaps[i + byte_index] & bit) != 0);
+        }
+        i += len;
+    }
+    Ok(false)
+}
+
+pub fn nsec_type_bitmap_list(type_bitmaps: &[u8]) -> CoreResult<Vec<u16>> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < type_bitmaps.len() {
+        if i + 2 > type_bitmaps.len() {
+            return Err(CoreError::Parse("invalid type bitmap".to_string()));
+        }
+        let window = type_bitmaps[i] as u16;
+        let len = type_bitmaps[i + 1] as usize;
+        i += 2;
+        if len == 0 || len > 32 || i + len > type_bitmaps.len() {
+            return Err(CoreError::Parse("invalid type bitmap".to_string()));
+        }
+        for (byte_index, byte) in type_bitmaps[i..i + len].iter().enumerate() {
+            if *byte == 0 {
+                continue;
+            }
+            for bit in 0..8 {
+                if (byte & (0x80 >> bit)) != 0 {
+                    let rr_type = window * 256 + (byte_index as u16 * 8 + bit as u16);
+                    out.push(rr_type);
+                }
+            }
+        }
+        i += len;
+    }
+    Ok(out)
+}
+
+pub fn nsec_type_bitmap_build(types: &[u16]) -> Vec<u8> {
+    let mut windows: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
+    for rr_type in types {
+        let window = (rr_type / 256) as u8;
+        let bit_index = (rr_type % 256) as usize;
+        let byte_index = bit_index / 8;
+        let bit = 0x80u8 >> (bit_index % 8);
+        let entry = windows.entry(window).or_insert_with(Vec::new);
+        if entry.len() <= byte_index {
+            entry.resize(byte_index + 1, 0u8);
+        }
+        entry[byte_index] |= bit;
+    }
+    let mut out = Vec::new();
+    for (window, bitmap) in windows {
+        out.push(window);
+        out.push(bitmap.len() as u8);
+        out.extend_from_slice(&bitmap);
+    }
+    out
 }
 
 pub fn nsec_covers(name: &str, owner: &str, next: &str) -> bool {
@@ -1198,6 +1426,7 @@ impl DnsClient {
 
 const MDNS_PORT: u16 = 5353;
 const MDNS_IPV4: &str = "224.0.0.251";
+const MDNS_IPV6: &str = "ff02::fb";
 
 pub struct MdnsClient {
     socket: UdpSocket,
@@ -1212,9 +1441,24 @@ impl MdnsClient {
         Ok(Self { socket })
     }
 
+    pub fn bind_v6() -> CoreResult<Self> {
+        let socket = UdpSocket::bind(("::", MDNS_PORT)).map_err(CoreError::Io)?;
+        socket.set_read_timeout(Some(Duration::from_secs(3))).map_err(CoreError::Io)?;
+        let mcast: Ipv6Addr = MDNS_IPV6.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        socket.join_multicast_v6(&mcast, 0).map_err(CoreError::Io)?;
+        Ok(Self { socket })
+    }
+
     pub fn send_query(&self, message: &DnsMessage) -> CoreResult<()> {
         let bytes = message.encode()?;
         let target: SocketAddr = format!("{}:{}", MDNS_IPV4, MDNS_PORT).parse().unwrap();
+        self.socket.send_to(&bytes, target).map_err(CoreError::Io)?;
+        Ok(())
+    }
+
+    pub fn send_query_v6(&self, message: &DnsMessage) -> CoreResult<()> {
+        let bytes = message.encode()?;
+        let target: SocketAddr = format!("[{}]:{}", MDNS_IPV6, MDNS_PORT).parse().unwrap();
         self.socket.send_to(&bytes, target).map_err(CoreError::Io)?;
         Ok(())
     }
@@ -1240,6 +1484,13 @@ impl MdnsServer {
         Ok(Self { socket })
     }
 
+    pub fn bind_v6() -> CoreResult<Self> {
+        let socket = UdpSocket::bind(("::", MDNS_PORT)).map_err(CoreError::Io)?;
+        let mcast: Ipv6Addr = MDNS_IPV6.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        socket.join_multicast_v6(&mcast, 0).map_err(CoreError::Io)?;
+        Ok(Self { socket })
+    }
+
     pub fn serve<F>(&self, handler: F) -> CoreResult<()>
     where
         F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
@@ -1252,11 +1503,11 @@ impl MdnsServer {
             let handler = Arc::clone(&handler);
             let socket = self.socket.try_clone().map_err(CoreError::Io)?;
             thread::spawn(move || {
-                if let Ok(req) = DnsMessage::decode(&buf) {
-                    if let Ok(resp) = handler(req).encode() {
-                        let _ = socket.send_to(&resp, peer);
+                    if let Ok(req) = DnsMessage::decode(&buf) {
+                        if let Ok(resp) = handler(req).encode() {
+                            let _ = socket.send_to(&resp, peer);
+                        }
                     }
-                }
             });
         }
     }
@@ -1274,9 +1525,23 @@ impl AsyncMdnsClient {
         Ok(Self { socket })
     }
 
+    pub async fn bind_v6() -> CoreResult<Self> {
+        let socket = TokioUdpSocket::bind(("::", MDNS_PORT)).await.map_err(CoreError::Io)?;
+        let mcast: Ipv6Addr = MDNS_IPV6.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        socket.join_multicast_v6(&mcast, 0).map_err(CoreError::Io)?;
+        Ok(Self { socket })
+    }
+
     pub async fn send_query(&self, message: &DnsMessage) -> CoreResult<()> {
         let bytes = message.encode()?;
         let target: SocketAddr = format!("{}:{}", MDNS_IPV4, MDNS_PORT).parse().unwrap();
+        self.socket.send_to(&bytes, target).await.map_err(CoreError::Io)?;
+        Ok(())
+    }
+
+    pub async fn send_query_v6(&self, message: &DnsMessage) -> CoreResult<()> {
+        let bytes = message.encode()?;
+        let target: SocketAddr = format!("[{}]:{}", MDNS_IPV6, MDNS_PORT).parse().unwrap();
         self.socket.send_to(&bytes, target).await.map_err(CoreError::Io)?;
         Ok(())
     }
@@ -1299,6 +1564,13 @@ impl AsyncMdnsServer {
         let socket = TokioUdpSocket::bind(("0.0.0.0", MDNS_PORT)).await.map_err(CoreError::Io)?;
         let mcast: Ipv4Addr = MDNS_IPV4.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
         socket.join_multicast_v4(mcast, Ipv4Addr::UNSPECIFIED).map_err(CoreError::Io)?;
+        Ok(Self { socket: Arc::new(socket) })
+    }
+
+    pub async fn bind_v6() -> CoreResult<Self> {
+        let socket = TokioUdpSocket::bind(("::", MDNS_PORT)).await.map_err(CoreError::Io)?;
+        let mcast: Ipv6Addr = MDNS_IPV6.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        socket.join_multicast_v6(&mcast, 0).map_err(CoreError::Io)?;
         Ok(Self { socket: Arc::new(socket) })
     }
 
@@ -1645,6 +1917,394 @@ impl AsyncDoh3Client {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DohServer {
+    config: DohServerConfig,
+}
+
+#[derive(Debug, Clone)]
+struct DohServerConfig {
+    path: String,
+    max_packet: usize,
+}
+
+#[derive(Debug)]
+enum DohError {
+    NotFound,
+    BadRequest(String),
+    Internal(String),
+}
+
+impl DohServer {
+    pub fn new() -> Self {
+        Self {
+            config: DohServerConfig {
+                path: "/dns-query".to_string(),
+                max_packet: DNS_MAX_PACKET,
+            },
+        }
+    }
+
+    pub fn path(mut self, path: impl Into<String>) -> Self {
+        self.config.path = path.into();
+        self
+    }
+
+    pub fn max_packet(mut self, max_packet: usize) -> Self {
+        self.config.max_packet = max_packet;
+        self
+    }
+
+    pub fn serve_http<F>(&self, addr: SocketAddr, timeouts: Timeouts, handler: F) -> CoreResult<()>
+    where
+        F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+    {
+        let server = crate::http::HttpServer::bind(addr, timeouts)?;
+        let handler = Arc::new(handler);
+        let config = self.config.clone();
+        server.serve(move |req| doh_http_response(&config, &handler, req))
+    }
+
+    pub async fn serve_http2<F>(&self, addr: SocketAddr, handler: F) -> CoreResult<()>
+    where
+        F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+    {
+        let server = Http2Server::bind(addr).await?;
+        let handler = Arc::new(handler);
+        let config = self.config.clone();
+        server
+            .serve(move |req| doh_http2_response(&config, &handler, req))
+            .await
+    }
+
+    pub async fn serve_http2_tls<F>(
+        &self,
+        addr: SocketAddr,
+        tls: &TlsServerConfig,
+        handler: F,
+    ) -> CoreResult<()>
+    where
+        F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+    {
+        let server = Http2TlsServer::bind(addr, tls).await?;
+        let handler = Arc::new(handler);
+        let config = self.config.clone();
+        server
+            .serve(move |req| doh_http2_response(&config, &handler, req))
+            .await
+    }
+
+    pub async fn serve_http3<F>(
+        &self,
+        addr: SocketAddr,
+        cert_path: &str,
+        key_path: &str,
+        handler: F,
+    ) -> CoreResult<()>
+    where
+        F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+    {
+        let server = Http3Server::bind(addr, cert_path, key_path).await?;
+        let handler = Arc::new(handler);
+        let config = self.config.clone();
+        server
+            .serve(move |req| doh_http3_response(&config, &handler, req))
+            .await
+    }
+}
+
+fn doh_http_response<F>(
+    config: &DohServerConfig,
+    handler: &Arc<F>,
+    request: HttpRequest,
+) -> HttpResponse
+where
+    F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+{
+    let method = http_method_str(&request.method);
+    match doh_handle_request(config, method, &request.path, &request.headers, &request.body) {
+        Ok(msg) => doh_success_http(config, handler, msg),
+        Err(err) => doh_error_http(err),
+    }
+}
+
+fn doh_http2_response<F>(
+    config: &DohServerConfig,
+    handler: &Arc<F>,
+    request: Http2Request,
+) -> Http2Response
+where
+    F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+{
+    match doh_handle_request(config, &request.method, &request.path, &request.headers, &request.body) {
+        Ok(msg) => doh_success_http2(config, handler, msg),
+        Err(err) => doh_error_http2(err),
+    }
+}
+
+fn doh_http3_response<F>(
+    config: &DohServerConfig,
+    handler: &Arc<F>,
+    request: Http3Request,
+) -> Http3Response
+where
+    F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+{
+    match doh_handle_request(config, &request.method, &request.path, &request.headers, &request.body) {
+        Ok(msg) => doh_success_http3(config, handler, msg),
+        Err(err) => doh_error_http3(err),
+    }
+}
+
+fn doh_handle_request(
+    config: &DohServerConfig,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<DnsMessage, DohError> {
+    let (base_path, query) = split_path_query(path);
+    if base_path != config.path {
+        return Err(DohError::NotFound);
+    }
+    if method.eq_ignore_ascii_case("GET") {
+        let query = query.ok_or_else(|| DohError::BadRequest("missing query".to_string()))?;
+        let value = query_param(query, "dns")
+            .ok_or_else(|| DohError::BadRequest("missing dns param".to_string()))?;
+        let decoded = percent_decode(&value)?;
+        let data = base64url_decode(&decoded)?;
+        if data.len() > config.max_packet {
+            return Err(DohError::BadRequest("dns message too large".to_string()));
+        }
+        return DnsMessage::decode(&data).map_err(|err| DohError::BadRequest(err.to_string()));
+    }
+    if method.eq_ignore_ascii_case("POST") {
+        if body.is_empty() {
+            return Err(DohError::BadRequest("empty body".to_string()));
+        }
+        if body.len() > config.max_packet {
+            return Err(DohError::BadRequest("dns message too large".to_string()));
+        }
+        if let Some(ct) = header_value(headers, "content-type") {
+            if !ct.to_ascii_lowercase().starts_with("application/dns-message") {
+                return Err(DohError::BadRequest("invalid content-type".to_string()));
+            }
+        }
+        return DnsMessage::decode(body).map_err(|err| DohError::BadRequest(err.to_string()));
+    }
+    Err(DohError::BadRequest("unsupported method".to_string()))
+}
+
+fn doh_success_http<F>(
+    config: &DohServerConfig,
+    handler: &Arc<F>,
+    request: DnsMessage,
+) -> HttpResponse
+where
+    F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+{
+    let response = (handler)(request);
+    match response.encode() {
+        Ok(body) => {
+            if body.len() > config.max_packet {
+                return doh_error_http(DohError::Internal("response too large".to_string()));
+            }
+            let mut resp = HttpResponse::new(200);
+            resp.set_header("Content-Type", "application/dns-message");
+            resp.body = body;
+            resp
+        }
+        Err(err) => doh_error_http(DohError::Internal(err.to_string())),
+    }
+}
+
+fn doh_success_http2<F>(
+    config: &DohServerConfig,
+    handler: &Arc<F>,
+    request: DnsMessage,
+) -> Http2Response
+where
+    F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+{
+    let response = (handler)(request);
+    match response.encode() {
+        Ok(body) => {
+            if body.len() > config.max_packet {
+                return doh_error_http2(DohError::Internal("response too large".to_string()));
+            }
+            let mut resp = Http2Response::new(200);
+            resp.set_header("content-type", "application/dns-message");
+            resp.body = body;
+            resp
+        }
+        Err(err) => doh_error_http2(DohError::Internal(err.to_string())),
+    }
+}
+
+fn doh_success_http3<F>(
+    config: &DohServerConfig,
+    handler: &Arc<F>,
+    request: DnsMessage,
+) -> Http3Response
+where
+    F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+{
+    let response = (handler)(request);
+    match response.encode() {
+        Ok(body) => {
+            if body.len() > config.max_packet {
+                return doh_error_http3(DohError::Internal("response too large".to_string()));
+            }
+            let mut resp = Http3Response::new(200);
+            resp.set_header("content-type", "application/dns-message");
+            resp.body = body;
+            resp
+        }
+        Err(err) => doh_error_http3(DohError::Internal(err.to_string())),
+    }
+}
+
+fn doh_error_http(err: DohError) -> HttpResponse {
+    let (status, reason) = doh_error_status(err);
+    let mut resp = HttpResponse::new(status);
+    resp.reason = reason;
+    resp
+}
+
+fn doh_error_http2(err: DohError) -> Http2Response {
+    let (status, _) = doh_error_status(err);
+    Http2Response::new(status)
+}
+
+fn doh_error_http3(err: DohError) -> Http3Response {
+    let (status, _) = doh_error_status(err);
+    Http3Response::new(status)
+}
+
+fn doh_error_status(err: DohError) -> (u16, String) {
+    match err {
+        DohError::NotFound => (404, "Not Found".to_string()),
+        DohError::BadRequest(reason) => (400, reason),
+        DohError::Internal(reason) => (500, reason),
+    }
+}
+
+fn http_method_str(method: &HttpMethod) -> &str {
+    match method {
+        HttpMethod::Get => "GET",
+        HttpMethod::Post => "POST",
+        HttpMethod::Put => "PUT",
+        HttpMethod::Delete => "DELETE",
+        HttpMethod::Head => "HEAD",
+        HttpMethod::Options => "OPTIONS",
+        HttpMethod::Patch => "PATCH",
+        HttpMethod::Trace => "TRACE",
+        HttpMethod::Connect => "CONNECT",
+        HttpMethod::Other(value) => value.as_str(),
+    }
+}
+
+fn split_path_query(path: &str) -> (&str, Option<&str>) {
+    if let Some((base, query)) = path.split_once('?') {
+        (base, Some(query))
+    } else {
+        (path, None)
+    }
+}
+
+fn query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        let name = parts.next()?.trim();
+        let value = parts.next().unwrap_or("").trim();
+        if name == key {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn percent_decode(value: &str) -> Result<String, DohError> {
+    let mut out = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                if i + 2 >= bytes.len() {
+                    return Err(DohError::BadRequest("invalid percent encoding".to_string()));
+                }
+                let hi = from_hex(bytes[i + 1])?;
+                let lo = from_hex(bytes[i + 2])?;
+                out.push((hi << 4) | lo);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b'+');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|_| DohError::BadRequest("invalid utf8".to_string()))
+}
+
+fn from_hex(value: u8) -> Result<u8, DohError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(DohError::BadRequest("invalid percent encoding".to_string())),
+    }
+}
+
+fn base64url_decode(value: &str) -> Result<Vec<u8>, DohError> {
+    let mut input = value.replace('-', "+").replace('_', "/");
+    match input.len() % 4 {
+        0 => {}
+        2 => input.push_str("=="),
+        3 => input.push('='),
+        _ => return Err(DohError::BadRequest("invalid base64".to_string())),
+    }
+    base64_decode(&input).map_err(|_| DohError::BadRequest("invalid base64".to_string()))
+}
+
+fn base64_decode(value: &str) -> Result<Vec<u8>, ()> {
+    let mut out = Vec::new();
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    for &b in value.as_bytes() {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                break;
+            }
+            _ => return Err(()),
+        } as u32;
+        buffer = (buffer << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+    Ok(out)
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
 pub struct DnsServer {
     udp_addr: SocketAddr,
     tcp_addr: SocketAddr,
@@ -1836,6 +2496,10 @@ fn handle_framed_stream<T: StreamTransport>(
 mod tests {
     use super::*;
     use ring::signature::KeyPair;
+    use ring::signature::{
+        EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING, ECDSA_P384_SHA384_FIXED_SIGNING,
+    };
+    use ring::rand::SystemRandom;
 
     #[test]
     fn dns_roundtrip_query() {
@@ -1916,6 +2580,136 @@ mod tests {
     fn nsec3_hash_vector() {
         let hash = nsec3_hash_base32("example.com", 0, b"");
         assert_eq!(hash, "ONIB9MGUB9H0RML3CDF5BGRJ59DKJHVK");
+    }
+
+    #[test]
+    fn nsec_type_bitmap_roundtrip() {
+        let types = vec![1u16, 2u16, 15u16, 28u16, 46u16, 257u16];
+        let bitmap = nsec_type_bitmap_build(&types);
+        for t in &types {
+            assert!(nsec_type_bitmap_contains(&bitmap, *t).unwrap());
+        }
+        let mut listed = nsec_type_bitmap_list(&bitmap).unwrap();
+        listed.sort_unstable();
+        let mut expected = types.clone();
+        expected.sort_unstable();
+        assert_eq!(listed, expected);
+    }
+
+    #[test]
+    fn dnssec_rrsig_rsa_sha1() {
+        const RSA_PKCS8_BASE64: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCdfdZkSLmP7jc8fb/4XVr+zqOUTO4SrWPfmscY0yPK9C/GHAh4Opw0kJaPHVeyQeLwSjtCt5BYm/fTKS36E6rrc9dhiRU7J8hf1bEqOYzVVsZS6pm1yT9cy4tIQ+yiIH6q6kP294cvBJ22bA0G1JrVB0AgOCQ4HfGJ0/BnVQzaGC4W0psBO6k0pdRZ/lKdFItETeZetFMCw16b/HCwfPJQSWw1HgqPPgAVUIyrFSfXuOWtoK8y95wpSFZS22zFjnBNyechDyJaJVFuJRpv85D3zlgqpeYP8zU1NTAje21qlIjc0FlqaS+K3JCmgH8pADxM6zq90AGueaB8EZ6pq5MvAgMBAAECggEANGZC57jerIm4rRK1xX/iH7dG67ew2lwAR8xqg9L0LLmUD5kSJFZz1HVq8pDztaaASCyajPcgOqsiCIrB9luG2bIALj565uS0oVYrDP564hxt/fZ6T+Z2g3xhihi3abXgDyPEmy3+N2GUy7Ylm2kvXsN7zXyAaH9l9tKiQO8mSIWPQBZRa1dCn2EhtacbIA1Nc02ublO1kKDFC1JkSzsCsuWDBDERjbp+UFuHb0fNbdNeyjHqy8wfYnThlMlmoe1GsV1lL7hRG2YQdFAeQeq5j3D4A1FUofi7gIu7ZIW4uoNPDAbZfEbQxSXWBOetCQAcTxGNPwk/fGOiYcsqDpt3WQKBgQDTEiSyIp8BTPoZrwBZXy0frJECtAe72SoPyr5Xo/FYWkuzTt/gcribIvlyk21RnuUhP6FuBWET49kZ5vI6s08y7ABn16g3/OIKQf/9Cq9/dxLD68TRlSVEgBy2AOxKuotfuDAbgxQ0R5zTFM4GWYCGjXOgLYEHrNWxsoHFdy48ywKBgQC/BADikag+fe18ez71n7he2OVKj0g5DBpczJOVm41H94PPidU7Rz5ySReTsLN2lr3CLjz/Y1kvutjvRHCXz1nlHyW8OtyIedlGgrNO5I5JJolcJYEOPfMU11b12kWgMKbW/coyMmuRzILMw6gACmMbTO3iho7ipbAcOsG2NqO6rQKBgE+OYSJ7hi85UnNn0Nve0eVEaAv6y4d0XTRCmOfztT42Gp5lNmElHIvs7NTQ2L2RBJA5qaEMigCzOttWfyq89zccWTLKyG8B9Dklk1VPN8L1oK8UKMVOUBO3rhqz0lyAX5QempNkHrNt4qB1EQq3pYgRvOk8/YtlC87El8FUIKttAoGALCjRx49i9OeJ8sBPYtuE9TBxedY8HSwmIBQPfoPSmrOnHmDAEg87aZJqR/OO2bipr+2ennAqWzV4F4CcAwylvKmBwM1e1JJO39UxfOir2E93a/0jo9ZAjy3lZbsLY6g7ufI8P3SWl8NO7eXBvhioptQXHsp61/z0BOK0i9p/6ZUCgYEAmnfDjzW4pZnGj9W2fmQHTVqxa1M1rSuhKaynL/6i/3Fk3kp0u0tzkglAfiEThEufk+TfrNhR6RtBj5viAeI1kJoGxDS8AEnJscRmlEunRgmcHbDNZeaO7X3BrVXOtWMZmaDAUFxoFQHtu8iGRUoPyGj2fVvwyMfxyRmUSm2NrPk=";
+        const RSA_DNSKEY_BASE64: &str = "AwEAAZ191mRIuY/uNzx9v/hdWv7Oo5RM7hKtY9+axxjTI8r0L8YcCHg6nDSQlo8dV7JB4vBKO0K3kFib99MpLfoTqutz12GJFTsnyF/VsSo5jNVWxlLqmbXJP1zLi0hD7KIgfqrqQ/b3hy8EnbZsDQbUmtUHQCA4JDgd8YnT8GdVDNoYLhbSmwE7qTSl1Fn+Up0Ui0RN5l60UwLDXpv8cLB88lBJbDUeCo8+ABVQjKsVJ9e45a2grzL3nClIVlLbbMWOcE3J5yEPIlolUW4lGm/zkPfOWCql5g/zNTU1MCN7bWqUiNzQWWppL4rckKaAfykAPEzrOr3QAa55oHwRnqmrky8=";
+        let pkcs8 = base64_decode(RSA_PKCS8_BASE64).unwrap();
+        let dnskey = DnsDnskey {
+            flags: 256,
+            protocol: 3,
+            algorithm: 5,
+            public_key: base64_decode(RSA_DNSKEY_BASE64).unwrap(),
+        };
+        let rrset = vec![DnsRecord {
+            name: "example.com".to_string(),
+            rtype: 1,
+            class: 1,
+            ttl: 3600,
+            data: DnsRecordData::A(Ipv4Addr::new(1, 2, 3, 4)),
+        }];
+        let mut rrsig = DnsRrsig {
+            type_covered: 1,
+            algorithm: 5,
+            labels: 2,
+            original_ttl: 3600,
+            signature_expiration: 2_000_000_000,
+            signature_inception: 1_600_000_000,
+            key_tag: dnskey_tag(&dnskey),
+            signer_name: "example.com".to_string(),
+            signature: Vec::new(),
+        };
+        let signed = build_rrsig_signed_data("example.com", &rrset, &rrsig).unwrap();
+        let dir = std::env::temp_dir();
+        let key_path = dir.join("moonlight_dnssec_rsa_sha1.pk8");
+        let data_path = dir.join("moonlight_dnssec_rsa_sha1.data");
+        let sig_path = dir.join("moonlight_dnssec_rsa_sha1.sig");
+        std::fs::write(&key_path, &pkcs8).unwrap();
+        std::fs::write(&data_path, &signed).unwrap();
+        let status = std::process::Command::new("openssl")
+            .args([
+                "dgst",
+                "-sha1",
+                "-sign",
+                key_path.to_str().unwrap(),
+                "-keyform",
+                "DER",
+                "-out",
+                sig_path.to_str().unwrap(),
+                data_path.to_str().unwrap(),
+            ])
+            .status();
+        if status.is_err() || !status.unwrap().success() {
+            return;
+        }
+        rrsig.signature = std::fs::read(sig_path).unwrap();
+        verify_rrsig_at("example.com", &rrset, &rrsig, &dnskey, 1_700_000_000).unwrap();
+    }
+
+    #[test]
+    fn dnssec_rrsig_ecdsa() {
+        const P256_PKCS8_BASE64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgmWhrQkXmTWwGp209xylPQFAsad8VJ1ljqfPKMrVPjt2hRANCAATUgufRF1DUnWRp+T02iNwrTvZ4QrCjh4hKE3y2M/NgqYDLJFNAMX6BTnAPAn1mfF28fTtZvTqqhtnhXHwAkOZm";
+        const P384_PKCS8_BASE64: &str = "MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDC9yr5vPfIiqHkO8matLqZUbKLNkEuPQfMWRdkqeKaX4KoPuJ3otHrtKjZ13rchBxShZANiAAS3x/ceuzNMq2xf4HQFQEg0+aq+yvUt6wciIfsusu6OoY2wR456wWdTC6pDX/vi2ifZRb+TzfjOv0jOi5jHDSEMc2WGGDIxRaJ1e7ATN1INJqLTZYeXSUXbs5O5Qu9Ln7g=";
+        let rng = SystemRandom::new();
+
+        let key_p256 = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &base64_decode(P256_PKCS8_BASE64).unwrap(), &rng).unwrap();
+        let pub_p256 = key_p256.public_key().as_ref();
+        let dnskey_p256 = DnsDnskey {
+            flags: 256,
+            protocol: 3,
+            algorithm: 13,
+            public_key: pub_p256[1..].to_vec(),
+        };
+        let rrset = vec![DnsRecord {
+            name: "example.com".to_string(),
+            rtype: 1,
+            class: 1,
+            ttl: 3600,
+            data: DnsRecordData::A(Ipv4Addr::new(5, 6, 7, 8)),
+        }];
+        let mut rrsig = DnsRrsig {
+            type_covered: 1,
+            algorithm: 13,
+            labels: 2,
+            original_ttl: 3600,
+            signature_expiration: 2_000_000_000,
+            signature_inception: 1_600_000_000,
+            key_tag: dnskey_tag(&dnskey_p256),
+            signer_name: "example.com".to_string(),
+            signature: Vec::new(),
+        };
+        let signed = build_rrsig_signed_data("example.com", &rrset, &rrsig).unwrap();
+        rrsig.signature = key_p256.sign(&rng, &signed).unwrap().as_ref().to_vec();
+        verify_rrsig_at("example.com", &rrset, &rrsig, &dnskey_p256, 1_700_000_000).unwrap();
+
+        let key_p384 = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &base64_decode(P384_PKCS8_BASE64).unwrap(), &rng).unwrap();
+        let pub_p384 = key_p384.public_key().as_ref();
+        let dnskey_p384 = DnsDnskey {
+            flags: 256,
+            protocol: 3,
+            algorithm: 14,
+            public_key: pub_p384[1..].to_vec(),
+        };
+        let mut rrsig384 = DnsRrsig {
+            type_covered: 1,
+            algorithm: 14,
+            labels: 2,
+            original_ttl: 3600,
+            signature_expiration: 2_000_000_000,
+            signature_inception: 1_600_000_000,
+            key_tag: dnskey_tag(&dnskey_p384),
+            signer_name: "example.com".to_string(),
+            signature: Vec::new(),
+        };
+        let signed = build_rrsig_signed_data("example.com", &rrset, &rrsig384).unwrap();
+        rrsig384.signature = key_p384.sign(&rng, &signed).unwrap().as_ref().to_vec();
+        verify_rrsig_at("example.com", &rrset, &rrsig384, &dnskey_p384, 1_700_000_000).unwrap();
     }
 
     #[test]

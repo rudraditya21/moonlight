@@ -363,6 +363,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::generate_simple_self_signed;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     #[tokio::test]
     async fn http2_roundtrip() {
@@ -382,6 +384,39 @@ mod tests {
         });
 
         let mut client = Http2Client::connect(&NetAddr::from_socket(addr), Timeouts::default())
+            .await
+            .expect("connect");
+        let req = Http2Request::new("GET", "/");
+        let resp = client.send(&req).await.expect("send");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"ok".to_vec());
+    }
+
+    #[tokio::test]
+    async fn http2_tls_roundtrip() {
+        let rcgen::CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der: CertificateDer<'static> = cert.der().clone();
+        let key_der = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
+        let server_tls = TlsServerConfig::from_der(vec![cert_der.clone()], PrivateKeyDer::Pkcs8(key_der)).unwrap();
+
+        let server = Http2TlsServer::bind("127.0.0.1:0".parse().unwrap(), &server_tls)
+            .await
+            .expect("bind");
+        let addr = server.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = server
+                .serve(|req| {
+                    assert_eq!(req.method, "GET");
+                    let mut resp = Http2Response::new(200);
+                    resp.body = b"ok".to_vec();
+                    resp
+                })
+                .await;
+        });
+
+        let client_tls = TlsClientConfig::with_root_certificates(vec![cert_der]).unwrap().with_alpn(&[b"h2"]);
+        let mut client = Http2Client::connect_tls(&NetAddr::from_socket(addr), "localhost", &client_tls, Timeouts::default())
             .await
             .expect("connect");
         let req = Http2Request::new("GET", "/");
