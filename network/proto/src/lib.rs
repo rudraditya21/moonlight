@@ -1,6 +1,7 @@
 pub mod codec;
 pub mod acpp;
 pub mod ssh;
+pub mod ntlm;
 pub mod dns;
 pub mod framing;
 pub mod http;
@@ -15,6 +16,22 @@ pub use acpp::{AsyncClient as AcppAsyncClient, AsyncServer as AcppAsyncServer, C
 pub use ssh::{
     AsyncSshClient, AsyncSshServer, AuthConfig, AuthHandler, Channel, HostKey, SshClient, SshConfig,
     SshServer,
+};
+pub use ntlm::{
+    encode_http_token as ntlm_http_token,
+    decode_http_token as ntlm_http_decode,
+    AuthenticateMessage as NtlmAuthenticate,
+    ChallengeMessage as NtlmChallenge,
+    NegotiateMessage as NtlmNegotiate,
+    NtlmClient,
+    NtlmClientConfig,
+    NtlmMessage,
+    NtlmSealer,
+    NtlmSecret,
+    NtlmServer,
+    NtlmServerConfig,
+    NtlmSession,
+    NtlmSigner,
 };
 pub use dns::{
     AsyncDnsClient, AsyncDnsServer, AsyncDoh2Client, AsyncDoh3Client, AsyncDohClient,
