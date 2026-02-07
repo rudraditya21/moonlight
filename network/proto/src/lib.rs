@@ -2,6 +2,7 @@ pub mod codec;
 pub mod acpp;
 pub mod ssh;
 pub mod ntlm;
+pub mod redis;
 pub mod dns;
 pub mod framing;
 pub mod http;
@@ -32,6 +33,11 @@ pub use ntlm::{
     NtlmServerConfig,
     NtlmSession,
     NtlmSigner,
+};
+pub use redis::{
+    AsyncRedisClient, AsyncRedisConnection, AsyncRedisServer, DefaultRedisHandler, RedisClient,
+    RedisCommand, RedisConnection, RedisContext, RedisHandler, RedisServer, RedisServerConfig,
+    RedisStore, RespFrame, RespVersion,
 };
 pub use dns::{
     AsyncDnsClient, AsyncDnsServer, AsyncDoh2Client, AsyncDoh3Client, AsyncDohClient,
