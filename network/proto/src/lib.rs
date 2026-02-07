@@ -3,6 +3,7 @@ pub mod acpp;
 pub mod ssh;
 pub mod ntlm;
 pub mod redis;
+pub mod ldap;
 pub mod dns;
 pub mod framing;
 pub mod http;
@@ -38,6 +39,13 @@ pub use redis::{
     AsyncRedisClient, AsyncRedisConnection, AsyncRedisServer, DefaultRedisHandler, RedisClient,
     RedisCommand, RedisConnection, RedisContext, RedisHandler, RedisServer, RedisServerConfig,
     RedisStore, RespFrame, RespVersion,
+};
+pub use ldap::{
+    AsyncLdapClient, AsyncLdapServer, Attribute, AttributeValueAssertion, BindAuth, BindRequest,
+    BindResponse, Change, CompareRequest, Control, DerefAliases, ExtendedRequest, ExtendedResponse,
+    Filter, InMemoryBackend, LdapClient, LdapMessage, LdapResult, LdapServer,
+    ModifyDnRequest, ModifyOp, ModifyRequest, ProtocolOp, SearchRequest, SearchResultEntry,
+    SearchScope, Substring,
 };
 pub use dns::{
     AsyncDnsClient, AsyncDnsServer, AsyncDoh2Client, AsyncDoh3Client, AsyncDohClient,
