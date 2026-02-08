@@ -6,6 +6,7 @@ pub mod redis;
 pub mod ldap;
 pub mod ftp;
 pub mod dhcp;
+pub mod smb;
 pub mod dns;
 pub mod framing;
 pub mod http;
@@ -56,6 +57,10 @@ pub use ftp::{
 pub use dhcp::{
     AsyncDhcpClient, AsyncDhcpServer, DhcpClient, DhcpClientConfig, DhcpLease, DhcpMessageType,
     DhcpOption, DhcpPacket, DhcpServer, DhcpServerConfig,
+};
+pub use smb::{
+    AsyncSmbClient, AsyncSmbServer, SmbClient, SmbClientConfig, SmbServer, SmbServerConfig,
+    SmbShare,
 };
 pub use dns::{
     AsyncDnsClient, AsyncDnsServer, AsyncDoh2Client, AsyncDoh3Client, AsyncDohClient,
