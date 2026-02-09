@@ -100,6 +100,13 @@ pub struct UdpTransport {
     socket: UdpSocket,
 }
 
+impl Clone for UdpTransport {
+    fn clone(&self) -> Self {
+        let socket = self.socket.try_clone().expect("clone udp");
+        Self { socket }
+    }
+}
+
 impl UdpTransport {
     pub fn bind(addr: SocketAddr) -> CoreResult<Self> {
         let socket = UdpSocket::bind(addr).map_err(CoreError::Io)?;

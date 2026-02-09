@@ -3,6 +3,8 @@ pub mod acpp;
 pub mod amqp;
 pub mod apache_j_p;
 pub mod bcrypt_public_key;
+pub mod steam;
+pub mod sunrpc;
 pub mod thrift;
 pub mod x11;
 pub mod x509;
@@ -37,6 +39,15 @@ pub use bcrypt_public_key::{
     AsyncBcryptPublicKeyClient, AsyncBcryptPublicKeyServer, BcryptPublicKey, BcryptPublicKeyClient,
     BcryptPublicKeyClientConfig, BcryptPublicKeyServer, BcryptPublicKeyServerConfig,
     BcryptPublicKeyHandler, InMemoryBcryptKeyStore, BCRYPT_PUBLIC_KEY_MAGIC,
+};
+pub use steam::{
+    AsyncSteamClient, AsyncSteamServer, SteamClient, SteamClientConfig, SteamPlayer, SteamServer,
+    SteamServerConfig, SteamServerInfo,
+};
+pub use sunrpc::{
+    AsyncRpcClient, AsyncRpcServer, AsyncRpcUdpServer, PortmapRegistry, PortmapService, RpcAuth,
+    RpcCall, RpcClient, RpcClientConfig, RpcReply, RpcServer, RpcServerConfig, RpcService,
+    RpcServiceResult, RpcUdpServer,
 };
 pub use thrift::{
     AsyncThriftClient, AsyncThriftServer, ThriftApplicationException, ThriftClient, ThriftClientConfig,
