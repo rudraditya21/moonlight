@@ -3,6 +3,9 @@ pub mod acpp;
 pub mod amqp;
 pub mod apache_j_p;
 pub mod bcrypt_public_key;
+pub mod iax2;
+pub mod ipmi;
+pub mod kademlia;
 pub mod steam;
 pub mod sunrpc;
 pub mod thrift;
@@ -39,6 +42,18 @@ pub use bcrypt_public_key::{
     AsyncBcryptPublicKeyClient, AsyncBcryptPublicKeyServer, BcryptPublicKey, BcryptPublicKeyClient,
     BcryptPublicKeyClientConfig, BcryptPublicKeyServer, BcryptPublicKeyServerConfig,
     BcryptPublicKeyHandler, InMemoryBcryptKeyStore, BCRYPT_PUBLIC_KEY_MAGIC,
+};
+pub use iax2::{
+    AsyncIaxClient, AsyncIaxServer, AuthMethod, IaxClient, IaxClientConfig, IaxFrame, IaxFrameType,
+    IaxServer, IaxServerConfig, IaxSubclass, IAX2_DEFAULT_PORT,
+};
+pub use ipmi::{
+    AsyncIpmiClient, AsyncIpmiServer, DefaultIpmiHandler, IpmiClient, IpmiClientConfig,
+    IpmiHandler, IpmiRequest, IpmiResponse, IpmiServer, IpmiServerConfig, IPMI_DEFAULT_PORT,
+};
+pub use kademlia::{
+    AsyncKademliaClient, AsyncKademliaServer, InMemoryStore, KademliaClient, KademliaConfig,
+    KademliaServer, KademliaStore, NodeId, NodeInfo, KADEMLIA_DEFAULT_PORT,
 };
 pub use steam::{
     AsyncSteamClient, AsyncSteamServer, SteamClient, SteamClientConfig, SteamPlayer, SteamServer,
