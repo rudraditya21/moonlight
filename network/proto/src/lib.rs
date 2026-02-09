@@ -1,5 +1,8 @@
 pub mod codec;
 pub mod acpp;
+pub mod amqp;
+pub mod apache_j_p;
+pub mod bcrypt_public_key;
 pub mod ssh;
 pub mod ntlm;
 pub mod redis;
@@ -19,6 +22,19 @@ pub mod util;
 
 pub use codec::Codec;
 pub use acpp::{AsyncClient as AcppAsyncClient, AsyncServer as AcppAsyncServer, Client as AcppClient, Message as AcppMessage, Server as AcppServer, DEFAULT_PORT as ACPP_DEFAULT_PORT};
+pub use amqp::{
+    AmqpClient, AmqpClientConfig, AmqpDeliveredMessage, AmqpServer, AmqpServerConfig, AsyncAmqpClient,
+    AsyncAmqpServer, InMemoryAmqpBroker, AmqpBroker,
+};
+pub use apache_j_p::{
+    AjpClient, AjpClientConfig, AjpHandler, AjpMethod, AjpRequest, AjpResponse, AjpServer,
+    AjpServerConfig, AsyncAjpClient, AsyncAjpServer, StaticAjpHandler,
+};
+pub use bcrypt_public_key::{
+    AsyncBcryptPublicKeyClient, AsyncBcryptPublicKeyServer, BcryptPublicKey, BcryptPublicKeyClient,
+    BcryptPublicKeyClientConfig, BcryptPublicKeyServer, BcryptPublicKeyServerConfig,
+    BcryptPublicKeyHandler, InMemoryBcryptKeyStore, BCRYPT_PUBLIC_KEY_MAGIC,
+};
 pub use ssh::{
     AsyncSshClient, AsyncSshServer, AuthConfig, AuthHandler, Channel, HostKey, SshClient, SshConfig,
     SshServer,
