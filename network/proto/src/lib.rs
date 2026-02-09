@@ -3,6 +3,9 @@ pub mod acpp;
 pub mod amqp;
 pub mod apache_j_p;
 pub mod bcrypt_public_key;
+pub mod thrift;
+pub mod x11;
+pub mod x509;
 pub mod ssh;
 pub mod ntlm;
 pub mod redis;
@@ -34,6 +37,18 @@ pub use bcrypt_public_key::{
     AsyncBcryptPublicKeyClient, AsyncBcryptPublicKeyServer, BcryptPublicKey, BcryptPublicKeyClient,
     BcryptPublicKeyClientConfig, BcryptPublicKeyServer, BcryptPublicKeyServerConfig,
     BcryptPublicKeyHandler, InMemoryBcryptKeyStore, BCRYPT_PUBLIC_KEY_MAGIC,
+};
+pub use thrift::{
+    AsyncThriftClient, AsyncThriftServer, ThriftApplicationException, ThriftClient, ThriftClientConfig,
+    ThriftField, ThriftMessage, ThriftMessageType, ThriftResponse, ThriftServer, ThriftServerConfig,
+    ThriftService, ThriftStruct, ThriftType, ThriftValue,
+};
+pub use x11::{
+    AsyncX11Client, AsyncX11Server, X11Client, X11ClientConfig, X11Server, X11ServerConfig,
+};
+pub use x509::{
+    parse_certificate, AsyncX509Client, AsyncX509Server, X509Certificate, X509Client, X509ClientConfig,
+    X509Name, X509Server, X509ServerConfig, X509Validity,
 };
 pub use ssh::{
     AsyncSshClient, AsyncSshServer, AuthConfig, AuthHandler, Channel, HostKey, SshClient, SshConfig,
