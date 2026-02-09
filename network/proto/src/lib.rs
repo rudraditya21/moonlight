@@ -6,6 +6,7 @@ pub mod redis;
 pub mod ldap;
 pub mod ftp;
 pub mod dhcp;
+pub mod tftp;
 pub mod smb;
 pub mod dns;
 pub mod framing;
@@ -57,6 +58,10 @@ pub use ftp::{
 pub use dhcp::{
     AsyncDhcpClient, AsyncDhcpServer, DhcpClient, DhcpClientConfig, DhcpLease, DhcpMessageType,
     DhcpOption, DhcpPacket, DhcpServer, DhcpServerConfig,
+};
+pub use tftp::{
+    AsyncTftpClient, AsyncTftpServer, InMemoryTftpBackend, TftpBackend, TftpClient, TftpClientConfig,
+    TftpErrorCode, TftpMode, TftpOptions, TftpPacket, TftpServer, TftpServerConfig, TFTP_DEFAULT_PORT,
 };
 pub use smb::{
     AsyncSmbClient, AsyncSmbServer, SmbClient, SmbClientConfig, SmbServer, SmbServerConfig,
