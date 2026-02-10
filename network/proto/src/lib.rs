@@ -37,6 +37,11 @@ pub mod ms_tds;
 pub mod mssql;
 pub mod mysql;
 pub mod natpmp;
+pub mod ntp;
+pub mod nuuo;
+pub mod pjl;
+pub mod proxy;
+pub mod quake;
 pub mod dns;
 pub mod framing;
 pub mod http;
@@ -210,6 +215,23 @@ pub use mysql::{
 pub use natpmp::{
     AsyncNatPmpServer, NatPmpClient, NatPmpClientConfig, NatPmpOpcode, NatPmpRequest, NatPmpResponse,
     NatPmpResultCode, NatPmpServer, NatPmpServerConfig, NATPMP_DEFAULT_PORT,
+};
+pub use ntp::{
+    AsyncNtpClient, AsyncNtpServer, NtpClient, NtpClientConfig, NtpPacket, NtpServer, NtpServerConfig,
+    NtpTimestamp, NTP_DEFAULT_PORT,
+};
+pub use nuuo::{
+    AsyncNuuoClient, AsyncNuuoServer, NuuoCamera, NuuoClient, NuuoClientConfig, NuuoFrame,
+    NuuoMessageType, NuuoServer, NuuoServerConfig,
+};
+pub use pjl::{AsyncPjlClient, AsyncPjlServer, PjlClient, PjlClientConfig, PjlCommand, PjlResponse, PjlServer, PjlServerConfig};
+pub use proxy::{
+    AsyncSocks5Client, AsyncSocks5Server, Socks5Address, Socks5AuthMethod, Socks5Client,
+    Socks5ClientConfig, Socks5Command, Socks5Server, Socks5ServerConfig, SOCKS5_DEFAULT_PORT,
+};
+pub use quake::{
+    AsyncQuakeClient, AsyncQuakeServer, QuakeClient, QuakeClientConfig, QuakeInfo, QuakePlayer,
+    QuakeQuery, QuakeServer, QuakeServerConfig, QuakeStatus, QUAKE_DEFAULT_PORT,
 };
 pub use dns::{
     AsyncDnsClient, AsyncDnsServer, AsyncDoh2Client, AsyncDoh3Client, AsyncDohClient,
