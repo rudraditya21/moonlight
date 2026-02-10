@@ -34,6 +34,9 @@ pub mod ms_dnsp;
 pub mod ms_dtyp;
 pub mod ms_nrtp;
 pub mod ms_tds;
+pub mod mssql;
+pub mod mysql;
+pub mod natpmp;
 pub mod dns;
 pub mod framing;
 pub mod http;
@@ -195,6 +198,18 @@ pub use ms_nrtp::{
 pub use ms_tds::{
     AsyncTdsClient, AsyncTdsServer, Login7, PreloginInfo, TdsClient, TdsClientConfig, TdsHeader,
     TdsMessageType, TdsPacket, TdsResponse, TdsServer, TdsServerConfig, TdsToken, MSTDS_DEFAULT_PORT,
+};
+pub use mssql::{
+    AsyncMssqlClient, AsyncMssqlServer, MssqlClient, MssqlClientConfig, MssqlQueryResult,
+    MssqlServer, MssqlServerConfig, MSSQL_DEFAULT_PORT,
+};
+pub use mysql::{
+    AsyncMysqlClient, AsyncMysqlServer, MysqlClient, MysqlClientConfig, MysqlQueryResult,
+    MysqlServer, MysqlServerConfig,
+};
+pub use natpmp::{
+    AsyncNatPmpServer, NatPmpClient, NatPmpClientConfig, NatPmpOpcode, NatPmpRequest, NatPmpResponse,
+    NatPmpResultCode, NatPmpServer, NatPmpServerConfig, NATPMP_DEFAULT_PORT,
 };
 pub use dns::{
     AsyncDnsClient, AsyncDnsServer, AsyncDoh2Client, AsyncDoh3Client, AsyncDohClient,
