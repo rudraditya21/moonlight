@@ -19,6 +19,10 @@ pub mod ftp;
 pub mod dhcp;
 pub mod tftp;
 pub mod smb;
+pub mod mdns;
+pub mod mms;
+pub mod mqtt;
+pub mod ms_adts;
 pub mod dns;
 pub mod framing;
 pub mod http;
@@ -124,6 +128,20 @@ pub use smb::{
     AsyncSmbClient, AsyncSmbServer, SmbClient, SmbClientConfig, SmbServer, SmbServerConfig,
     SmbShare,
 };
+pub use mdns::{
+    build_query as mdns_query, build_response as mdns_response, decode_message as mdns_decode,
+    MdnsAsyncClient, MdnsAsyncServer, MdnsService, MdnsSyncClient, MdnsSyncServer, MDNS_IPV4,
+    MDNS_IPV6, MDNS_PORT,
+};
+pub use mms::{
+    AsyncMmsClient, AsyncMmsServer, InMemoryMmsHandler, MmsClient, MmsClientConfig, MmsCommand,
+    MmsDescription, MmsFrame, MmsServer, MmsServerConfig, MmsHandler,
+};
+pub use mqtt::{
+    AsyncMqttClient, AsyncMqttServer, MqttClient, MqttClientConfig, MqttPacket, MqttPacketType,
+    MqttServer, MqttServerConfig,
+};
+pub use ms_adts::{KeyCredentialEntry, KeyCredentialStruct};
 pub use dns::{
     AsyncDnsClient, AsyncDnsServer, AsyncDoh2Client, AsyncDoh3Client, AsyncDohClient,
     AsyncMdnsClient, AsyncMdnsServer, DohClient, DohServer, DnsClient, DnsDnskey, DnsDs, DnsMessage,
