@@ -23,6 +23,12 @@ pub mod mdns;
 pub mod mms;
 pub mod mqtt;
 pub mod ms_adts;
+pub mod adb;
+pub mod addp;
+pub mod crypto_asn1;
+pub mod dcerpc;
+pub mod drda;
+pub mod gss;
 pub mod ms_crtd;
 pub mod ms_dnsp;
 pub mod ms_dtyp;
@@ -132,6 +138,28 @@ pub use tftp::{
 pub use smb::{
     AsyncSmbClient, AsyncSmbServer, SmbClient, SmbClientConfig, SmbServer, SmbServerConfig,
     SmbShare,
+};
+pub use adb::{
+    AdbClient, AdbClientConfig, AdbCommand, AdbPacket, AdbServer, AdbServerConfig, AsyncAdbClient,
+    AsyncAdbServer, EchoAdbService, AdbServiceHandler,
+};
+pub use addp::{
+    AddpClient, AddpClientConfig, AddpMessage, AddpMessageType, AddpServer, AddpServerConfig,
+    AsyncAddpClient, AsyncAddpServer,
+};
+pub use crypto_asn1::{Asn1Value};
+pub use dcerpc::{
+    AsyncDceRpcClient, AsyncDceRpcServer, BindContext, DceRpcClient, DceRpcClientConfig,
+    DceRpcHandler, DceRpcPdu, DceRpcServer, DceRpcServerConfig, DceRpcHeader, EchoDceRpcHandler,
+    PduType, Uuid,
+};
+pub use drda::{
+    AsyncDrdaClient, AsyncDrdaServer, DrdaClient, DrdaClientConfig, DrdaMessage, DrdaMessageType,
+    DrdaServer, DrdaServerConfig,
+};
+pub use gss::{
+    AsyncGssClient, AsyncGssServer, GssClient, GssClientConfig, GssMessage, GssMessageType,
+    GssServer, GssServerConfig,
 };
 pub use mdns::{
     build_query as mdns_query, build_response as mdns_response, decode_message as mdns_decode,
