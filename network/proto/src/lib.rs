@@ -23,6 +23,11 @@ pub mod mdns;
 pub mod mms;
 pub mod mqtt;
 pub mod ms_adts;
+pub mod ms_crtd;
+pub mod ms_dnsp;
+pub mod ms_dtyp;
+pub mod ms_nrtp;
+pub mod ms_tds;
 pub mod dns;
 pub mod framing;
 pub mod http;
@@ -142,6 +147,27 @@ pub use mqtt::{
     MqttServer, MqttServerConfig,
 };
 pub use ms_adts::{KeyCredentialEntry, KeyCredentialStruct};
+pub use ms_crtd::{
+    AsyncCrtdClient, AsyncCrtdServer, CertificateRequest, CertificateResponse, CertificateTemplate,
+    CrtdClient, CrtdClientConfig, CrtdMessage, CrtdMessageType, CrtdServer, CrtdServerConfig,
+};
+pub use ms_dnsp::{
+    AsyncMsDnspClient, AsyncMsDnspServer, MsDnspClient, MsDnspClientConfig, MsDnspEntry,
+    MsDnspMessage, MsDnspOpcode, MsDnspRecord, MsDnspRecordType, MsDnspServer, MsDnspServerConfig,
+    MsDnspRData, MSDNSP_DEFAULT_PORT,
+};
+pub use ms_dtyp::{
+    AsyncDtypClient, AsyncDtypServer, DtypClient, DtypMessage, DtypServer, DtypServerConfig,
+    DtypValue, FileTime, Guid, Sid, UnicodeString,
+};
+pub use ms_nrtp::{
+    AsyncNrtpClient, AsyncNrtpServer, NrtpClient, NrtpClientConfig, NrtpMessage, NrtpMessageType,
+    NrtpServer, NrtpServerConfig, MSNRTP_DEFAULT_PORT,
+};
+pub use ms_tds::{
+    AsyncTdsClient, AsyncTdsServer, Login7, PreloginInfo, TdsClient, TdsClientConfig, TdsHeader,
+    TdsMessageType, TdsPacket, TdsResponse, TdsServer, TdsServerConfig, TdsToken, MSTDS_DEFAULT_PORT,
+};
 pub use dns::{
     AsyncDnsClient, AsyncDnsServer, AsyncDoh2Client, AsyncDoh3Client, AsyncDohClient,
     AsyncMdnsClient, AsyncMdnsServer, DohClient, DohServer, DnsClient, DnsDnskey, DnsDs, DnsMessage,
