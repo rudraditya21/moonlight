@@ -205,19 +205,19 @@ impl AsyncMssqlServer {
 mod tests {
     use super::*;
     use std::thread;
+    use crate::test_util::fuzz_bytes;
 
     #[test]
     fn mssql_query_roundtrip() {
         let mut users = std::collections::HashMap::new();
         users.insert("sa".to_string(), "moonlight".to_string());
-        let server = MssqlServer::bind(
+        let server = crate::skip_if_perm!(MssqlServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             MssqlServerConfig {
                 users,
                 ..MssqlServerConfig::default()
             },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
@@ -231,5 +231,23 @@ mod tests {
         let result = client.query("SELECT 1").unwrap();
         assert_eq!(result.columns.len(), 1);
         assert!(!result.rows.is_empty());
+    }
+
+    #[test]
+    fn mssql_query_result_error() {
+        let resp = TdsResponse {
+            tokens: vec![TdsToken::Error("failure".to_string())],
+        };
+        let result = MssqlQueryResult::from_response(&resp).into_result();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mssql_query_result_fuzz() {
+        fuzz_bytes(128, 512, 0x4D53, |data| {
+            if let Ok(resp) = TdsResponse::decode(data) {
+                let _ = MssqlQueryResult::from_response(&resp).into_result();
+            }
+        });
     }
 }

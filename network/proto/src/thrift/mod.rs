@@ -833,6 +833,7 @@ fn read_value_stream(reader: &mut ThriftStreamReader<'_>, field_type: ThriftType
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::fuzz_bytes;
 
     struct EchoService;
 
@@ -850,12 +851,11 @@ mod tests {
 
     #[test]
     fn thrift_roundtrip() {
-        let server = ThriftServer::bind(
+        let server = crate::skip_if_perm!(ThriftServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             ThriftServerConfig::default(),
             Arc::new(EchoService),
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
@@ -870,5 +870,17 @@ mod tests {
         }];
         let reply = client.call("echo", args.clone()).unwrap();
         assert_eq!(reply, args);
+    }
+
+    #[test]
+    fn thrift_decode_negative() {
+        assert!(decode_message(&[]).is_err());
+    }
+
+    #[test]
+    fn thrift_decode_fuzz() {
+        fuzz_bytes(128, 512, 0x7468, |data| {
+            let _ = decode_message(data);
+        });
     }
 }

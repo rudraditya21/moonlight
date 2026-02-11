@@ -388,7 +388,10 @@ mod tests {
 
     #[test]
     fn dtyp_roundtrip() {
-        let server = DtypServer::bind("127.0.0.1:0".parse().unwrap(), DtypServerConfig::default()).unwrap();
+        let server = crate::skip_if_perm!(DtypServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            DtypServerConfig::default(),
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 

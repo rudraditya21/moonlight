@@ -1138,7 +1138,7 @@ mod tests {
         config.server_ip = Ipv4Addr::new(10, 0, 0, 1);
         config.pool_start = Ipv4Addr::new(10, 0, 0, 100);
         config.pool_end = Ipv4Addr::new(10, 0, 0, 110);
-        let server = DhcpServer::bind("127.0.0.1:0".parse().unwrap(), config).unwrap();
+        let server = crate::skip_if_perm!(DhcpServer::bind("127.0.0.1:0".parse().unwrap(), config));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

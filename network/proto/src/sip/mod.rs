@@ -896,11 +896,10 @@ mod tests {
 
     #[test]
     fn sip_options_udp() {
-        let server = SipUdpServer::bind(
+        let server = crate::skip_if_perm!(SipUdpServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             SipServerConfig::default(),
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
@@ -915,15 +914,14 @@ mod tests {
     fn sip_register_digest() {
         let mut users = HashMap::new();
         users.insert("alice".to_string(), "secret".to_string());
-        let server = SipUdpServer::bind(
+        let server = crate::skip_if_perm!(SipUdpServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             SipServerConfig {
                 allow_unauthenticated: false,
                 users,
                 ..SipServerConfig::default()
             },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

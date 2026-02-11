@@ -302,11 +302,10 @@ mod tests {
 
     #[test]
     fn ntp_roundtrip() {
-        let server = NtpServer::bind(
+        let server = crate::skip_if_perm!(NtpServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             NtpServerConfig::default(),
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

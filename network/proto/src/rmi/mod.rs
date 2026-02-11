@@ -476,14 +476,13 @@ mod tests {
 
     #[test]
     fn rmi_call_roundtrip() {
-        let server = RmiServer::bind(
+        let server = crate::skip_if_perm!(RmiServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             RmiServerConfig {
                 handler: Arc::new(TestHandler),
                 ..RmiServerConfig::default()
             },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

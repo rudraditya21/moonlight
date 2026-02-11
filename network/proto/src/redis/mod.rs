@@ -1423,6 +1423,7 @@ fn parse_arg_i64(cmd: &RedisCommand, idx: usize) -> CoreResult<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::fuzz_bytes;
 
     #[test]
     fn resp_roundtrip_bulk() {
@@ -1493,6 +1494,22 @@ mod tests {
         }
         let resp = client.auth("secret").unwrap();
         assert_eq!(resp, RespFrame::SimpleString("OK".to_string()));
+    }
+
+    #[test]
+    fn resp_decode_negative() {
+        let mut transport = TestTransport::new(Vec::new());
+        let mut buffer = ReadBuffer::new();
+        assert!(read_frame(&mut transport, &mut buffer, 0).is_err());
+    }
+
+    #[test]
+    fn resp_decode_fuzz() {
+        fuzz_bytes(128, 512, 0x5253, |data| {
+            let mut transport = TestTransport::new(data.to_vec());
+            let mut buffer = ReadBuffer::new();
+            let _ = read_frame(&mut transport, &mut buffer, 0);
+        });
     }
 
     struct TestTransport {

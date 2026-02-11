@@ -765,11 +765,16 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::fuzz_bytes;
 
     #[test]
     fn ajp_roundtrip() {
         let handler = Arc::new(StaticAjpHandler::new(AjpResponse::new(200, "OK", b"hello".to_vec())));
-        let server = AjpServer::bind("127.0.0.1:0".parse().unwrap(), AjpServerConfig::default(), handler).unwrap();
+        let server = crate::skip_if_perm!(AjpServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            AjpServerConfig::default(),
+            handler,
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
@@ -780,5 +785,21 @@ mod tests {
         let response = client.request(&request, None).unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"hello".to_vec());
+    }
+
+    #[test]
+    fn ajp_decode_negative() {
+        assert!(decode_forward_request(&[]).is_err());
+        assert!(decode_send_headers(&[]).is_err());
+        assert!(decode_send_body_chunk(&[]).is_err());
+    }
+
+    #[test]
+    fn ajp_decode_fuzz() {
+        fuzz_bytes(128, 512, 0xA1A2, |data| {
+            let _ = decode_forward_request(data);
+            let _ = decode_send_headers(data);
+            let _ = decode_send_body_chunk(data);
+        });
     }
 }

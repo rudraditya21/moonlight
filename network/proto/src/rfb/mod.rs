@@ -851,11 +851,10 @@ mod tests {
 
     #[test]
     fn rfb_handshake_update() {
-        let server = RfbServer::bind(
+        let server = crate::skip_if_perm!(RfbServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             RfbServerConfig::default(),
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

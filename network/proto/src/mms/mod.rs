@@ -599,7 +599,11 @@ mod tests {
         let mut files = HashMap::new();
         files.insert("/stream".to_string(), b"hello world".to_vec());
         let handler = Arc::new(InMemoryMmsHandler::new("application/octet-stream", files));
-        let server = MmsServer::bind("127.0.0.1:0".parse().unwrap(), handler, MmsServerConfig::default()).unwrap();
+        let server = crate::skip_if_perm!(MmsServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            handler,
+            MmsServerConfig::default(),
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 

@@ -635,6 +635,7 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::fuzz_bytes;
 
     #[test]
     fn steam_roundtrip() {
@@ -646,7 +647,10 @@ mod tests {
             duration: 12.5,
         }];
         config.rules.insert("rule".to_string(), "value".to_string());
-        let server = SteamServer::bind("127.0.0.1:0".parse().unwrap(), config).unwrap();
+        let server = crate::skip_if_perm!(SteamServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            config,
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
@@ -659,5 +663,22 @@ mod tests {
         assert_eq!(players.len(), 1);
         let rules = client.rules(addr).unwrap();
         assert_eq!(rules.get("rule").unwrap(), "value");
+    }
+
+    #[test]
+    fn steam_parse_negative() {
+        assert!(parse_info_response(&[]).is_err());
+        assert!(parse_player_response(&[]).is_err());
+        assert!(parse_rules_response(&[]).is_err());
+    }
+
+    #[test]
+    fn steam_parse_fuzz() {
+        fuzz_bytes(128, 512, 0x57EA, |data| {
+            let _ = parse_challenge(data);
+            let _ = parse_info_response(data);
+            let _ = parse_player_response(data);
+            let _ = parse_rules_response(data);
+        });
     }
 }

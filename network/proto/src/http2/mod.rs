@@ -363,6 +363,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{fuzz_bytes, fuzz_strings};
     use rcgen::generate_simple_self_signed;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
@@ -427,5 +428,34 @@ mod tests {
         let resp = client.send(&req).await.expect("send");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"ok".to_vec());
+    }
+
+    #[test]
+    fn http2_to_request_negative() {
+        let req = Http2Request::new("\0", "not a uri");
+        assert!(to_request(&req).is_err());
+    }
+
+    #[test]
+    fn http2_to_request_fuzz() {
+        fuzz_strings(128, 64, 0x4852, |text| {
+            let mut req = Http2Request::new(text, text);
+            req.set_header("x", text);
+            let _ = to_request(&req);
+        });
+    }
+
+    #[test]
+    fn http2_to_response_fuzz() {
+        fuzz_bytes(128, 8, 0x4853, |data| {
+            let status = if data.len() >= 2 {
+                u16::from_be_bytes([data[0], data[1]])
+            } else {
+                0
+            };
+            let mut resp = Http2Response::new(status);
+            resp.set_header("x", "y");
+            let _ = to_response(&resp);
+        });
     }
 }

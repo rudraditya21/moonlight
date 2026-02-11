@@ -1157,12 +1157,11 @@ mod tests {
     #[test]
     fn amqp_handshake_publish_consume() {
         let broker = Arc::new(InMemoryAmqpBroker::default());
-        let server = AmqpServer::bind(
+        let server = crate::skip_if_perm!(AmqpServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             AmqpServerConfig::default(),
             broker.clone(),
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

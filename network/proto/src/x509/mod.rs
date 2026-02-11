@@ -550,14 +550,13 @@ mod tests {
     #[test]
     fn x509_server_client() {
         let cert = build_test_cert();
-        let server = X509Server::bind(
+        let server = crate::skip_if_perm!(X509Server::bind(
             "127.0.0.1:0".parse().unwrap(),
             X509ServerConfig {
                 timeouts: Timeouts::default(),
                 certificate: cert.clone(),
             },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

@@ -701,12 +701,17 @@ fn handle_krpc_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::fuzz_bytes;
 
     #[test]
     fn krpc_store_and_find() {
         let config = KademliaConfig::default();
         let store = Arc::new(InMemoryStore::new());
-        let server = KademliaServer::bind("127.0.0.1:0".parse().unwrap(), config.clone(), store).unwrap();
+        let server = crate::skip_if_perm!(KademliaServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            config.clone(),
+            store,
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 
@@ -717,5 +722,17 @@ mod tests {
         assert_eq!(value, Some(b"value".to_vec()));
 
         drop(handle);
+    }
+
+    #[test]
+    fn krpc_decode_negative() {
+        assert!(decode_krpc(&[]).is_err());
+    }
+
+    #[test]
+    fn krpc_decode_fuzz() {
+        fuzz_bytes(128, 512, 0x4BDE, |data| {
+            let _ = decode_krpc(data);
+        });
     }
 }

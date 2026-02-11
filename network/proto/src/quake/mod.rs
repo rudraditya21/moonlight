@@ -291,21 +291,21 @@ fn parse_kv_pairs(text: &str) -> HashMap<String, String> {
 mod tests {
     use super::*;
     use std::thread;
+    use crate::test_util::fuzz_bytes;
 
     #[test]
     fn quake_info_status() {
         let mut info = HashMap::new();
         info.insert("sv_hostname".to_string(), "Moonlight".to_string());
         info.insert("mapname".to_string(), "q3dm17".to_string());
-        let server = QuakeServer::bind(
+        let server = crate::skip_if_perm!(QuakeServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             QuakeServerConfig {
                 info,
                 players: vec![QuakePlayer { score: 1, ping: 33, name: "bot".to_string() }],
                 ..QuakeServerConfig::default()
             },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
@@ -316,5 +316,20 @@ mod tests {
         assert_eq!(info.values.get("mapname").unwrap(), "q3dm17");
         let status = client.get_status().unwrap();
         assert_eq!(status.players.len(), 1);
+    }
+
+    #[test]
+    fn quake_decode_negative() {
+        assert!(parse_info_response(&[]).is_err());
+        assert!(parse_status_response(&[]).is_err());
+    }
+
+    #[test]
+    fn quake_decode_fuzz() {
+        fuzz_bytes(128, 512, 0x5155, |data| {
+            let _ = parse_query(data);
+            let _ = parse_info_response(data);
+            let _ = parse_status_response(data);
+        });
     }
 }

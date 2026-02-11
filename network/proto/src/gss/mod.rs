@@ -496,7 +496,10 @@ mod tests {
 
     #[test]
     fn gss_wrap_roundtrip() {
-        let server = GssServer::bind("127.0.0.1:0".parse().unwrap(), GssServerConfig::default()).unwrap();
+        let server = crate::skip_if_perm!(GssServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            GssServerConfig::default(),
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 

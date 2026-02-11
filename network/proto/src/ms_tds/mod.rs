@@ -697,14 +697,13 @@ mod tests {
     fn tds_query_select() {
         let mut users = HashMap::new();
         users.insert("sa".to_string(), "moonlight".to_string());
-        let server = TdsServer::bind(
+        let server = crate::skip_if_perm!(TdsServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             TdsServerConfig {
                 users,
                 ..TdsServerConfig::default()
             },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 

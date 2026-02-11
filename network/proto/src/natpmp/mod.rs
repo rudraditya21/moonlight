@@ -650,14 +650,13 @@ mod tests {
 
     #[test]
     fn natpmp_public_address() {
-        let server = NatPmpServer::bind(
+        let server = crate::skip_if_perm!(NatPmpServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             NatPmpServerConfig {
                 public_address: Ipv4Addr::new(10, 0, 0, 1),
                 ..NatPmpServerConfig::default()
             },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
@@ -670,15 +669,14 @@ mod tests {
 
     #[test]
     fn natpmp_map_udp() {
-        let server = NatPmpServer::bind(
+        let server = crate::skip_if_perm!(NatPmpServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             NatPmpServerConfig {
                 public_address: Ipv4Addr::new(198, 51, 100, 10),
                 port_range: 45000..=45010,
                 ..NatPmpServerConfig::default()
             },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

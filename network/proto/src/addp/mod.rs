@@ -246,7 +246,10 @@ mod tests {
 
     #[test]
     fn addp_discover() {
-        let server = AddpServer::bind("127.0.0.1:0".parse().unwrap(), AddpServerConfig::default()).unwrap();
+        let server = crate::skip_if_perm!(AddpServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            AddpServerConfig::default(),
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 

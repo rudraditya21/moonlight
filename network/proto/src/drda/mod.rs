@@ -429,11 +429,10 @@ mod tests {
     fn drda_query() {
         let mut users = HashMap::new();
         users.insert("db2".to_string(), "moonlight".to_string());
-        let server = DrdaServer::bind(
+        let server = crate::skip_if_perm!(DrdaServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             DrdaServerConfig { users, ..DrdaServerConfig::default() },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 

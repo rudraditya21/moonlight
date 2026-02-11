@@ -482,12 +482,11 @@ mod tests {
 
     #[test]
     fn dcerpc_bind_request() {
-        let server = DceRpcServer::bind(
+        let server = crate::skip_if_perm!(DceRpcServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             DceRpcServerConfig::default(),
             Arc::new(EchoDceRpcHandler),
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 

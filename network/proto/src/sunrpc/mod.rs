@@ -710,6 +710,7 @@ fn encode_u32(value: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::fuzz_bytes;
 
     struct EchoService;
 
@@ -727,12 +728,11 @@ mod tests {
     fn rpc_tcp_roundtrip() {
         let mut services = HashMap::new();
         services.insert((0x20000001, 1), Arc::new(EchoService) as Arc<dyn RpcService>);
-        let server = RpcServer::bind(
+        let server = crate::skip_if_perm!(RpcServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             RpcServerConfig::default(),
             services,
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
@@ -747,12 +747,11 @@ mod tests {
     fn rpc_udp_roundtrip() {
         let mut services = HashMap::new();
         services.insert((0x20000002, 1), Arc::new(EchoService) as Arc<dyn RpcService>);
-        let server = RpcUdpServer::bind(
+        let server = crate::skip_if_perm!(RpcUdpServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             RpcServerConfig::default(),
             services,
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
@@ -769,12 +768,11 @@ mod tests {
         let service = Arc::new(PortmapService::new(registry.clone())) as Arc<dyn RpcService>;
         let mut services = HashMap::new();
         services.insert((100000, 2), service);
-        let server = RpcServer::bind(
+        let server = crate::skip_if_perm!(RpcServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             RpcServerConfig::default(),
             services,
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
@@ -794,6 +792,20 @@ mod tests {
         let response = client.call(100000, 2, 3, &get).unwrap();
         let mut cursor = XdrCursor::new(&response);
         assert_eq!(cursor.read_u32().unwrap(), 9999);
+    }
+
+    #[test]
+    fn rpc_decode_negative() {
+        assert!(decode_call(&[]).is_err());
+        assert!(decode_reply(&[]).is_err());
+    }
+
+    #[test]
+    fn rpc_decode_fuzz() {
+        fuzz_bytes(128, 512, 0x5270, |data| {
+            let _ = decode_call(data);
+            let _ = decode_reply(data);
+        });
     }
 }
 

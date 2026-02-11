@@ -58,6 +58,9 @@ pub mod state;
 pub mod transport;
 pub mod util;
 
+#[cfg(test)]
+pub(crate) mod test_util;
+
 pub use codec::Codec;
 pub use acpp::{AsyncClient as AcppAsyncClient, AsyncServer as AcppAsyncServer, Client as AcppClient, Message as AcppMessage, Server as AcppServer, DEFAULT_PORT as ACPP_DEFAULT_PORT};
 pub use amqp::{

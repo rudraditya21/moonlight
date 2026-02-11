@@ -526,11 +526,10 @@ mod tests {
 
     #[test]
     fn ms_dnsp_query_update() {
-        let server = MsDnspServer::bind(
+        let server = crate::skip_if_perm!(MsDnspServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             MsDnspServerConfig::default(),
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 

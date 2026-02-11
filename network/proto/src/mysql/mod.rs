@@ -1285,19 +1285,19 @@ fn read_null_terminated(data: &[u8], idx: &mut usize) -> CoreResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::fuzz_bytes;
 
     #[test]
     fn mysql_query_roundtrip() {
         let mut users = HashMap::new();
         users.insert("root".to_string(), "moonlight".to_string());
-        let server = MysqlServer::bind(
+        let server = crate::skip_if_perm!(MysqlServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             MysqlServerConfig {
                 users,
                 ..MysqlServerConfig::default()
             },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
@@ -1311,5 +1311,23 @@ mod tests {
         let result = client.query("SELECT 1").unwrap();
         assert_eq!(result.columns.len(), 1);
         assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn mysql_decode_negative() {
+        assert!(MysqlHandshake::decode(&[]).is_err());
+        assert!(MysqlHandshakeResponse::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn mysql_decode_fuzz() {
+        fuzz_bytes(128, 512, 0x4D59, |data| {
+            let _ = MysqlHandshake::decode(data);
+            let _ = MysqlHandshakeResponse::decode(data);
+            let mut idx = 0usize;
+            let _ = decode_lenenc_int(data, &mut idx);
+            idx = 0;
+            let _ = decode_lenenc_string(data, &mut idx);
+        });
     }
 }

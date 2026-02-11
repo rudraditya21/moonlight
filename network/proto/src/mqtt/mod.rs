@@ -995,7 +995,10 @@ mod tests {
 
     #[test]
     fn mqtt_publish_subscribe() {
-        let server = MqttServer::bind("127.0.0.1:0".parse().unwrap(), MqttServerConfig::default()).unwrap();
+        let server = crate::skip_if_perm!(MqttServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            MqttServerConfig::default(),
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 

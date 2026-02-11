@@ -507,14 +507,13 @@ mod tests {
             resource: "vault".to_string(),
             decision: SecAuthzDecision::Permit,
         };
-        let server = SecAuthzServer::bind(
+        let server = crate::skip_if_perm!(SecAuthzServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             SecAuthzServerConfig {
                 policies: vec![policy],
                 ..SecAuthzServerConfig::default()
             },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

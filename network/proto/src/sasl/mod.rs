@@ -401,14 +401,13 @@ mod tests {
     fn sasl_plain_auth() {
         let mut users = HashMap::new();
         users.insert("user".to_string(), "pass".to_string());
-        let server = SaslServer::bind(
+        let server = crate::skip_if_perm!(SaslServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             SaslServerConfig {
                 users,
                 ..SaslServerConfig::default()
             },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

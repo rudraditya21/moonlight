@@ -819,10 +819,15 @@ fn pad_to_4(buf: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::fuzz_bytes;
+    use std::io::Write;
 
     #[test]
     fn x11_roundtrip() {
-        let server = X11Server::bind("127.0.0.1:0".parse().unwrap(), X11ServerConfig::default()).unwrap();
+        let server = crate::skip_if_perm!(X11Server::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            X11ServerConfig::default(),
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
@@ -837,5 +842,50 @@ mod tests {
         assert_eq!(data, b"hello".to_vec());
         let present = client.query_extension("RANDR").unwrap();
         assert!(!present);
+    }
+
+    #[test]
+    fn x11_decode_negative() {
+        with_payload(Vec::new(), |transport| {
+            assert!(read_setup_reply(transport, ByteOrder::Little).is_err());
+        });
+        with_payload(Vec::new(), |transport| {
+            assert!(read_request(transport, ByteOrder::Little).is_err());
+        });
+        with_payload(Vec::new(), |transport| {
+            assert!(read_reply(transport, ByteOrder::Little).is_err());
+        });
+    }
+
+    #[test]
+    fn x11_decode_fuzz() {
+        fuzz_bytes(64, 256, 0x1131, |data| {
+            with_payload(data.to_vec(), |transport| {
+                let _ = read_setup_reply(transport, ByteOrder::Little);
+            });
+            with_payload(data.to_vec(), |transport| {
+                let _ = read_request(transport, ByteOrder::Little);
+            });
+            with_payload(data.to_vec(), |transport| {
+                let _ = read_reply(transport, ByteOrder::Little);
+            });
+        });
+    }
+
+    fn with_payload<F: FnOnce(&mut TcpTransport)>(data: Vec<u8>, f: F) {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind: {:?}", err),
+        };
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(&data);
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut transport = TcpTransport::from_stream(stream, Timeouts::default()).unwrap();
+        f(&mut transport);
+        let _ = handle.join();
     }
 }

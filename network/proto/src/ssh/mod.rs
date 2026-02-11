@@ -1642,6 +1642,7 @@ fn read_string(data: &[u8], cursor: &mut usize) -> CoreResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::fuzz_bytes;
 
     struct TestAuth;
 
@@ -1662,6 +1663,18 @@ mod tests {
         let decoded = KexInit::decode(&encoded).unwrap();
         assert_eq!(decoded.kex_algs[0], KEX_ALG);
         assert_eq!(decoded.host_key_algs[0], HOSTKEY_ALG);
+    }
+
+    #[test]
+    fn kex_init_negative() {
+        assert!(KexInit::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn kex_init_fuzz() {
+        fuzz_bytes(128, 512, 0x5353, |data| {
+            let _ = KexInit::decode(data);
+        });
     }
 
     #[test]

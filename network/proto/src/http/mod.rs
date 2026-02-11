@@ -1311,6 +1311,7 @@ async fn handle_connection_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::fuzz_bytes;
 
     #[test]
     fn parse_request_roundtrip() {
@@ -1427,5 +1428,19 @@ mod tests {
             }
             s
         }
+    }
+
+    #[test]
+    fn http_parse_negative() {
+        assert!(parse_request(&[]).is_err());
+        assert!(parse_response(&[]).is_err());
+    }
+
+    #[test]
+    fn http_parse_fuzz() {
+        fuzz_bytes(128, 512, 0x4854, |data| {
+            let _ = parse_request(data);
+            let _ = parse_response(data);
+        });
     }
 }

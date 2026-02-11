@@ -400,12 +400,11 @@ mod tests {
     #[test]
     fn client_server() {
         let handler = Arc::new(InMemoryBcryptKeyStore::default());
-        let server = BcryptPublicKeyServer::bind(
+        let server = crate::skip_if_perm!(BcryptPublicKeyServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             BcryptPublicKeyServerConfig::default(),
             handler.clone(),
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

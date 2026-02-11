@@ -477,6 +477,7 @@ mod tests {
     use super::*;
     use std::fs;
     use net::NetAddr;
+    use crate::test_util::fuzz_bytes;
 
     #[test]
     fn header_roundtrip() {
@@ -545,5 +546,24 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("http3 roundtrip failed: {:?}", last_err);
+    }
+
+    #[test]
+    fn http3_parse_headers_empty() {
+        let _ = parse_headers(&[]);
+    }
+
+    #[test]
+    fn http3_parse_headers_fuzz() {
+        fuzz_bytes(128, 128, 0x4833, |data| {
+            let mut headers = Vec::new();
+            if !data.is_empty() {
+                let mid = data.len() / 2;
+                let name = if mid == 0 { b"x" } else { &data[..mid] };
+                let value = &data[mid..];
+                headers.push(quiche::h3::Header::new(name, value));
+            }
+            let _ = parse_headers(&headers);
+        });
     }
 }

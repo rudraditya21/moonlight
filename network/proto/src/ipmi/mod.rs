@@ -408,12 +408,17 @@ fn checksum(bytes: &[u8]) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::fuzz_bytes;
 
     #[test]
     fn ipmi_get_device_id() {
         let config = IpmiServerConfig::default();
         let handler = Arc::new(DefaultIpmiHandler::new(config.clone()));
-        let server = IpmiServer::bind("127.0.0.1:0".parse().unwrap(), handler, config).unwrap();
+        let server = crate::skip_if_perm!(IpmiServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            handler,
+            config,
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 
@@ -423,5 +428,21 @@ mod tests {
         assert!(resp.data.len() >= 9);
 
         drop(handle);
+    }
+
+    #[test]
+    fn ipmi_decode_negative() {
+        assert!(decode_rmcp_packet(&[]).is_err());
+        assert!(decode_ipmi_request(&[]).is_err());
+        assert!(decode_ipmi_response(&[]).is_err());
+    }
+
+    #[test]
+    fn ipmi_decode_fuzz() {
+        fuzz_bytes(128, 512, 0x1F11, |data| {
+            let _ = decode_rmcp_packet(data);
+            let _ = decode_ipmi_request(data);
+            let _ = decode_ipmi_response(data);
+        });
     }
 }

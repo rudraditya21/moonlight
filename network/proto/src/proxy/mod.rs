@@ -651,14 +651,14 @@ async fn relay_streams_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::fuzz_bytes;
 
     #[test]
     fn socks5_no_auth_handshake() {
-        let server = Socks5Server::bind(
+        let server = crate::skip_if_perm!(Socks5Server::bind(
             "127.0.0.1:0".parse().unwrap(),
             Socks5ServerConfig::default(),
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
@@ -672,5 +672,19 @@ mod tests {
             Socks5ClientConfig::default(),
         );
         assert!(client.is_err());
+    }
+
+    #[test]
+    fn socks5_decode_negative() {
+        let mut idx = 0usize;
+        assert!(Socks5Address::decode(&[], &mut idx).is_err());
+    }
+
+    #[test]
+    fn socks5_decode_fuzz() {
+        fuzz_bytes(128, 256, 0x50A5, |data| {
+            let mut idx = 0usize;
+            let _ = Socks5Address::decode(data, &mut idx);
+        });
     }
 }

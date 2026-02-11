@@ -1187,11 +1187,10 @@ mod tests {
 
     #[test]
     fn kerberos_roundtrip() {
-        let kdc = KerbKdcServer::bind(
+        let kdc = crate::skip_if_perm!(KerbKdcServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             KerbKdcConfig::default(),
-        )
-        .unwrap();
+        ));
         kdc.add_user("user", "password");
         kdc.add_service("http", "servicepass");
         let kdc_addr = kdc.local_addr().unwrap();

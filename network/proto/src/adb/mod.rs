@@ -559,12 +559,11 @@ mod tests {
 
     #[test]
     fn adb_open_write_echo() {
-        let server = AdbServer::bind(
+        let server = crate::skip_if_perm!(AdbServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             AdbServerConfig::default(),
             Arc::new(EchoAdbService),
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 

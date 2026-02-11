@@ -378,7 +378,10 @@ mod tests {
 
     #[test]
     fn nrtp_register_resolve() {
-        let server = NrtpServer::bind("127.0.0.1:0".parse().unwrap(), NrtpServerConfig::default()).unwrap();
+        let server = crate::skip_if_perm!(NrtpServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            NrtpServerConfig::default(),
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 

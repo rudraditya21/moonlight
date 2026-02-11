@@ -866,14 +866,13 @@ mod tests {
     fn iax2_auth_md5_flow() {
         let mut users = HashMap::new();
         users.insert("alice".to_string(), "s3cret".to_string());
-        let server = IaxServer::bind(
+        let server = crate::skip_if_perm!(IaxServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             IaxServerConfig {
                 users,
                 ..IaxServerConfig::default()
             },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 
@@ -894,15 +893,14 @@ mod tests {
     fn iax2_plain_auth_flow() {
         let mut users = HashMap::new();
         users.insert("bob".to_string(), "pw".to_string());
-        let server = IaxServer::bind(
+        let server = crate::skip_if_perm!(IaxServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             IaxServerConfig {
                 users,
                 auth_methods: vec![AuthMethod::Plain],
                 ..IaxServerConfig::default()
             },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 

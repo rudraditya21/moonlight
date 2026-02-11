@@ -525,7 +525,7 @@ mod tests {
     fn nuuo_roundtrip() {
         let mut users = HashMap::new();
         users.insert("admin".to_string(), "moonlight".to_string());
-        let server = NuuoServer::bind(
+        let server = crate::skip_if_perm!(NuuoServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             NuuoServerConfig {
                 users,
@@ -536,8 +536,7 @@ mod tests {
                 }],
                 ..NuuoServerConfig::default()
             },
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

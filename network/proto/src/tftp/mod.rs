@@ -1430,7 +1430,11 @@ mod tests {
         let backend = Arc::new(
             InMemoryTftpBackend::default().with_file("hello.txt", b"hello".to_vec()),
         );
-        let server = TftpServer::bind("127.0.0.1:0".parse().unwrap(), TftpServerConfig::default(), backend.clone()).unwrap();
+        let server = crate::skip_if_perm!(TftpServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            TftpServerConfig::default(),
+            backend.clone(),
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
@@ -1443,7 +1447,11 @@ mod tests {
     #[test]
     fn client_server_wrq() {
         let backend = Arc::new(InMemoryTftpBackend::default());
-        let server = TftpServer::bind("127.0.0.1:0".parse().unwrap(), TftpServerConfig::default(), backend.clone()).unwrap();
+        let server = crate::skip_if_perm!(TftpServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            TftpServerConfig::default(),
+            backend.clone(),
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

@@ -380,11 +380,10 @@ mod tests {
 
     #[test]
     fn pjl_info_id() {
-        let server = PjlServer::bind(
+        let server = crate::skip_if_perm!(PjlServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             PjlServerConfig::default(),
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

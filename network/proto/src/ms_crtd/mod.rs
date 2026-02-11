@@ -605,7 +605,11 @@ mod tests {
             validity_days: 365,
             renewal_days: 30,
         };
-        let server = CrtdServer::bind("127.0.0.1:0".parse().unwrap(), vec![template.clone()], CrtdServerConfig::default()).unwrap();
+        let server = crate::skip_if_perm!(CrtdServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![template.clone()],
+            CrtdServerConfig::default(),
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 

@@ -1171,6 +1171,7 @@ async fn write_frame_async<T: AsyncStreamTransport>(transport: &mut T, frame: &S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::fuzz_bytes;
 
     #[test]
     fn sms_frame_roundtrip() {
@@ -1201,12 +1202,11 @@ mod tests {
             },
         );
 
-        let server = SmsServer::bind(
+        let server = crate::skip_if_perm!(SmsServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             handler,
             SmsServerConfig::default(),
-        )
-        .unwrap();
+        ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 
@@ -1234,5 +1234,76 @@ mod tests {
         client.unbind().unwrap();
 
         drop(handle);
+    }
+
+    #[test]
+    fn sms_decode_negative() {
+        let mut transport = TestTransport::new(Vec::new());
+        assert!(read_frame_with_limit(&mut transport, 1024).is_err());
+    }
+
+    #[test]
+    fn sms_decode_fuzz() {
+        fuzz_bytes(128, 512, 0x5D51, |data| {
+            let mut transport = TestTransport::new(data.to_vec());
+            let _ = read_frame_with_limit(&mut transport, 1024);
+        });
+    }
+
+    struct TestTransport {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl TestTransport {
+        fn new(data: Vec<u8>) -> Self {
+            Self { data, pos: 0 }
+        }
+    }
+
+    impl StreamTransport for TestTransport {
+        fn read(&mut self, buf: &mut [u8]) -> CoreResult<usize> {
+            let remaining = self.data.len().saturating_sub(self.pos);
+            let to_read = remaining.min(buf.len());
+            if to_read == 0 {
+                return Ok(0);
+            }
+            buf[..to_read].copy_from_slice(&self.data[self.pos..self.pos + to_read]);
+            self.pos += to_read;
+            Ok(to_read)
+        }
+
+        fn read_exact(&mut self, buf: &mut [u8]) -> CoreResult<()> {
+            let remaining = self.data.len().saturating_sub(self.pos);
+            if remaining < buf.len() {
+                return Err(CoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "eof",
+                )));
+            }
+            buf.copy_from_slice(&self.data[self.pos..self.pos + buf.len()]);
+            self.pos += buf.len();
+            Ok(())
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> CoreResult<()> {
+            Err(CoreError::Message("write not supported".to_string()))
+        }
+
+        fn shutdown(&mut self) -> CoreResult<()> {
+            Ok(())
+        }
+
+        fn peer_addr(&self) -> CoreResult<SocketAddr> {
+            Ok("127.0.0.1:0".parse().unwrap())
+        }
+
+        fn set_read_timeout(&self, _timeout: Option<std::time::Duration>) -> CoreResult<()> {
+            Ok(())
+        }
+
+        fn set_write_timeout(&self, _timeout: Option<std::time::Duration>) -> CoreResult<()> {
+            Ok(())
+        }
     }
 }
