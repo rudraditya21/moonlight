@@ -453,7 +453,11 @@ impl AsyncDhcpClient {
         Err(CoreError::Message("no DHCP offer".to_string()))
     }
 
-    pub async fn request(&mut self, server: SocketAddr, offer: &DhcpPacket) -> CoreResult<DhcpLease> {
+    pub async fn request(
+        &mut self,
+        server: SocketAddr,
+        offer: &DhcpPacket,
+    ) -> CoreResult<DhcpLease> {
         let requested_ip = offer.yiaddr;
         let server_id = match offer.get_option(54) {
             Some(DhcpOption::ServerIdentifier(ip)) => *ip,
@@ -668,7 +672,9 @@ impl DhcpServer {
             None => return Ok(None),
         };
         let mut offer = base_reply(packet, ip, &self.config);
-        offer.options.push(DhcpOption::MessageType(DhcpMessageType::Offer));
+        offer
+            .options
+            .push(DhcpOption::MessageType(DhcpMessageType::Offer));
         Ok(Some(offer))
     }
 
@@ -680,18 +686,21 @@ impl DhcpServer {
         }
         if !self.is_ip_available(&mac, requested) {
             let mut nak = base_reply(packet, Ipv4Addr::UNSPECIFIED, &self.config);
-            nak.options.push(DhcpOption::MessageType(DhcpMessageType::Nak));
+            nak.options
+                .push(DhcpOption::MessageType(DhcpMessageType::Nak));
             return Ok(Some(nak));
         }
         self.commit_lease(&mac, requested);
         let mut ack = base_reply(packet, requested, &self.config);
-        ack.options.push(DhcpOption::MessageType(DhcpMessageType::Ack));
+        ack.options
+            .push(DhcpOption::MessageType(DhcpMessageType::Ack));
         Ok(Some(ack))
     }
 
     fn build_inform_ack(&self, packet: &DhcpPacket) -> CoreResult<DhcpPacket> {
         let mut ack = base_reply(packet, Ipv4Addr::UNSPECIFIED, &self.config);
-        ack.options.push(DhcpOption::MessageType(DhcpMessageType::Ack));
+        ack.options
+            .push(DhcpOption::MessageType(DhcpMessageType::Ack));
         Ok(ack)
     }
 
@@ -706,7 +715,9 @@ impl DhcpServer {
             *mac,
             DhcpLeaseEntry {
                 ip,
-                expires_at: Some(SystemTime::now() + Duration::from_secs(self.config.lease_time as u64)),
+                expires_at: Some(
+                    SystemTime::now() + Duration::from_secs(self.config.lease_time as u64),
+                ),
             },
         );
         Some(ip)
@@ -733,7 +744,9 @@ impl DhcpServer {
             *mac,
             DhcpLeaseEntry {
                 ip,
-                expires_at: Some(SystemTime::now() + Duration::from_secs(self.config.lease_time as u64)),
+                expires_at: Some(
+                    SystemTime::now() + Duration::from_secs(self.config.lease_time as u64),
+                ),
             },
         );
     }
@@ -826,7 +839,9 @@ impl AsyncDhcpServer {
             None => return Ok(None),
         };
         let mut offer = base_reply(packet, ip, &self.config);
-        offer.options.push(DhcpOption::MessageType(DhcpMessageType::Offer));
+        offer
+            .options
+            .push(DhcpOption::MessageType(DhcpMessageType::Offer));
         Ok(Some(offer))
     }
 
@@ -838,18 +853,21 @@ impl AsyncDhcpServer {
         }
         if !self.is_ip_available(&mac, requested) {
             let mut nak = base_reply(packet, Ipv4Addr::UNSPECIFIED, &self.config);
-            nak.options.push(DhcpOption::MessageType(DhcpMessageType::Nak));
+            nak.options
+                .push(DhcpOption::MessageType(DhcpMessageType::Nak));
             return Ok(Some(nak));
         }
         self.commit_lease(&mac, requested);
         let mut ack = base_reply(packet, requested, &self.config);
-        ack.options.push(DhcpOption::MessageType(DhcpMessageType::Ack));
+        ack.options
+            .push(DhcpOption::MessageType(DhcpMessageType::Ack));
         Ok(Some(ack))
     }
 
     fn build_inform_ack(&self, packet: &DhcpPacket) -> CoreResult<DhcpPacket> {
         let mut ack = base_reply(packet, Ipv4Addr::UNSPECIFIED, &self.config);
-        ack.options.push(DhcpOption::MessageType(DhcpMessageType::Ack));
+        ack.options
+            .push(DhcpOption::MessageType(DhcpMessageType::Ack));
         Ok(ack)
     }
 
@@ -864,7 +882,9 @@ impl AsyncDhcpServer {
             *mac,
             DhcpLeaseEntry {
                 ip,
-                expires_at: Some(SystemTime::now() + Duration::from_secs(self.config.lease_time as u64)),
+                expires_at: Some(
+                    SystemTime::now() + Duration::from_secs(self.config.lease_time as u64),
+                ),
             },
         );
         Some(ip)
@@ -891,7 +911,9 @@ impl AsyncDhcpServer {
             *mac,
             DhcpLeaseEntry {
                 ip,
-                expires_at: Some(SystemTime::now() + Duration::from_secs(self.config.lease_time as u64)),
+                expires_at: Some(
+                    SystemTime::now() + Duration::from_secs(self.config.lease_time as u64),
+                ),
             },
         );
     }
@@ -1144,7 +1166,11 @@ mod tests {
             let _ = server.serve();
         });
 
-        let mut client = DhcpClient::bind(DhcpClientConfig::default(), [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]).unwrap();
+        let mut client = DhcpClient::bind(
+            DhcpClientConfig::default(),
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+        )
+        .unwrap();
         let lease = client.obtain_lease(addr).unwrap();
         assert_eq!(lease.ip, Ipv4Addr::new(10, 0, 0, 100));
     }

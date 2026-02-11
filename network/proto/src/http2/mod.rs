@@ -7,8 +7,8 @@ use h2::client;
 use h2::server;
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use net::NetAddr;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
 use crate::transport::TlsClientConfig;
@@ -401,7 +401,9 @@ mod tests {
             generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der: CertificateDer<'static> = cert.der().clone();
         let key_der = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
-        let server_tls = TlsServerConfig::from_der(vec![cert_der.clone()], PrivateKeyDer::Pkcs8(key_der)).unwrap();
+        let server_tls =
+            TlsServerConfig::from_der(vec![cert_der.clone()], PrivateKeyDer::Pkcs8(key_der))
+                .unwrap();
 
         let server = match Http2TlsServer::bind("127.0.0.1:0".parse().unwrap(), &server_tls).await {
             Ok(server) => server,
@@ -420,10 +422,17 @@ mod tests {
                 .await;
         });
 
-        let client_tls = TlsClientConfig::with_root_certificates(vec![cert_der]).unwrap().with_alpn(&[b"h2"]);
-        let mut client = Http2Client::connect_tls(&NetAddr::from_socket(addr), "localhost", &client_tls, Timeouts::default())
-            .await
-            .expect("connect");
+        let client_tls = TlsClientConfig::with_root_certificates(vec![cert_der])
+            .unwrap()
+            .with_alpn(&[b"h2"]);
+        let mut client = Http2Client::connect_tls(
+            &NetAddr::from_socket(addr),
+            "localhost",
+            &client_tls,
+            Timeouts::default(),
+        )
+        .await
+        .expect("connect");
         let req = Http2Request::new("GET", "/");
         let resp = client.send(&req).await.expect("send");
         assert_eq!(resp.status, 200);

@@ -98,7 +98,12 @@ impl NrtpMessage {
                     if idx + 4 > data.len() {
                         return Err(CoreError::Parse("nrtp addr v4".to_string()));
                     }
-                    let ip = IpAddr::V4(std::net::Ipv4Addr::new(data[idx], data[idx + 1], data[idx + 2], data[idx + 3]));
+                    let ip = IpAddr::V4(std::net::Ipv4Addr::new(
+                        data[idx],
+                        data[idx + 1],
+                        data[idx + 2],
+                        data[idx + 3],
+                    ));
                     idx += 4;
                     addresses.push(SocketAddr::new(ip, port));
                 }
@@ -109,7 +114,10 @@ impl NrtpMessage {
                     let mut octets = [0u8; 16];
                     octets.copy_from_slice(&data[idx..idx + 16]);
                     idx += 16;
-                    addresses.push(SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::from(octets)), port));
+                    addresses.push(SocketAddr::new(
+                        IpAddr::V6(std::net::Ipv6Addr::from(octets)),
+                        port,
+                    ));
                 }
                 _ => return Err(CoreError::Parse("nrtp addr type".to_string())),
             }
@@ -240,7 +248,12 @@ impl NrtpClient {
         Ok(Self { socket })
     }
 
-    pub fn register(&self, addr: SocketAddr, name: &str, addresses: Vec<SocketAddr>) -> CoreResult<()> {
+    pub fn register(
+        &self,
+        addr: SocketAddr,
+        name: &str,
+        addresses: Vec<SocketAddr>,
+    ) -> CoreResult<()> {
         let msg = NrtpMessage {
             msg_type: NrtpMessageType::Register,
             id: rand_id(),
@@ -346,10 +359,17 @@ fn handle_nrtp_message(table: Arc<Mutex<NameTable>>, msg: NrtpMessage) -> NrtpMe
             if let Ok(mut table) = table.lock() {
                 table.register(msg.name.clone(), msg.addresses.clone());
             }
-            NrtpMessage { status: 0, msg_type: NrtpMessageType::Response, ..msg }
+            NrtpMessage {
+                status: 0,
+                msg_type: NrtpMessageType::Response,
+                ..msg
+            }
         }
         NrtpMessageType::Resolve => {
-            let addresses = table.lock().map(|t| t.resolve(&msg.name)).unwrap_or_default();
+            let addresses = table
+                .lock()
+                .map(|t| t.resolve(&msg.name))
+                .unwrap_or_default();
             NrtpMessage {
                 msg_type: NrtpMessageType::Response,
                 status: 0,
@@ -361,14 +381,20 @@ fn handle_nrtp_message(table: Arc<Mutex<NameTable>>, msg: NrtpMessage) -> NrtpMe
             if let Ok(mut table) = table.lock() {
                 table.unregister(&msg.name);
             }
-            NrtpMessage { status: 0, msg_type: NrtpMessageType::Response, ..msg }
+            NrtpMessage {
+                status: 0,
+                msg_type: NrtpMessageType::Response,
+                ..msg
+            }
         }
         NrtpMessageType::Response => msg,
     }
 }
 
 fn rand_id() -> u16 {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     (now.as_nanos() & 0xFFFF) as u16
 }
 

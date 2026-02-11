@@ -63,7 +63,9 @@ impl IaxFrame {
         }
         let src_raw = u16::from_be_bytes([data[0], data[1]]);
         if (src_raw & FULL_FRAME_MARKER) == 0 {
-            return Err(CoreError::Parse("iax2 mini frame not supported".to_string()));
+            return Err(CoreError::Parse(
+                "iax2 mini frame not supported".to_string(),
+            ));
         }
         let src_call = src_raw & !FULL_FRAME_MARKER;
         let dst_call = u16::from_be_bytes([data[2], data[3]]);
@@ -72,7 +74,11 @@ impl IaxFrame {
         let iseq = data[9];
         let frame_type = match data[10] {
             0x06 => IaxFrameType::Iax,
-            value => return Err(CoreError::Parse(format!("iax2 unsupported frame type {value}"))),
+            value => {
+                return Err(CoreError::Parse(format!(
+                    "iax2 unsupported frame type {value}"
+                )))
+            }
         };
         let subclass = match data[11] {
             0x01 => IaxSubclass::New,
@@ -82,7 +88,11 @@ impl IaxFrame {
             0x05 => IaxSubclass::Hangup,
             0x06 => IaxSubclass::Ping,
             0x07 => IaxSubclass::Pong,
-            value => return Err(CoreError::Parse(format!("iax2 unsupported subclass {value}"))),
+            value => {
+                return Err(CoreError::Parse(format!(
+                    "iax2 unsupported subclass {value}"
+                )))
+            }
         };
         let payload = data[FRAME_HEADER_LEN..].to_vec();
         Ok(Self {
@@ -172,7 +182,9 @@ fn decode_ies(payload: &[u8]) -> CoreResult<Vec<IaxIe>> {
         let len = payload[idx + 1] as usize;
         idx += 2;
         if idx + len > payload.len() {
-            return Err(CoreError::Parse("iax2 IE length exceeds payload".to_string()));
+            return Err(CoreError::Parse(
+                "iax2 IE length exceeds payload".to_string(),
+            ));
         }
         let value = payload[idx..idx + len].to_vec();
         idx += len;
@@ -183,7 +195,9 @@ fn decode_ies(payload: &[u8]) -> CoreResult<Vec<IaxIe>> {
             IE_CHALLENGE => IaxIe::Challenge(value),
             IE_AUTHMETHODS => {
                 if value.len() != 2 {
-                    return Err(CoreError::Parse("iax2 authmethods length invalid".to_string()));
+                    return Err(CoreError::Parse(
+                        "iax2 authmethods length invalid".to_string(),
+                    ));
                 }
                 IaxIe::AuthMethods(u16::from_be_bytes([value[0], value[1]]))
             }
@@ -197,7 +211,9 @@ fn decode_ies(payload: &[u8]) -> CoreResult<Vec<IaxIe>> {
 }
 
 fn timestamp_now() -> u32 {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     (now.as_millis() & 0xFFFF_FFFF) as u32
 }
 
@@ -410,7 +426,8 @@ impl IaxClient {
         match chosen {
             AuthMethod::Plain => auth_ies.push(IaxIe::Password(self.config.password.clone())),
             AuthMethod::Md5 => {
-                let challenge = challenge.ok_or_else(|| CoreError::Message("iax2 missing challenge".to_string()))?;
+                let challenge = challenge
+                    .ok_or_else(|| CoreError::Message("iax2 missing challenge".to_string()))?;
                 let mut md5 = md5::Md5::new();
                 md5.update(&challenge);
                 md5.update(self.config.password.as_bytes());
@@ -433,7 +450,9 @@ impl IaxClient {
         match frame.subclass {
             IaxSubclass::Accept => Ok(()),
             IaxSubclass::Hangup => Err(CoreError::Message("iax2 auth failed".to_string())),
-            _ => Err(CoreError::Parse("iax2 unexpected auth response".to_string())),
+            _ => Err(CoreError::Parse(
+                "iax2 unexpected auth response".to_string(),
+            )),
         }
     }
 
@@ -533,7 +552,8 @@ impl AsyncIaxClient {
         match chosen {
             AuthMethod::Plain => auth_ies.push(IaxIe::Password(self.config.password.clone())),
             AuthMethod::Md5 => {
-                let challenge = challenge.ok_or_else(|| CoreError::Message("iax2 missing challenge".to_string()))?;
+                let challenge = challenge
+                    .ok_or_else(|| CoreError::Message("iax2 missing challenge".to_string()))?;
                 let mut md5 = md5::Md5::new();
                 md5.update(&challenge);
                 md5.update(self.config.password.as_bytes());
@@ -556,7 +576,9 @@ impl AsyncIaxClient {
         match frame.subclass {
             IaxSubclass::Accept => Ok(()),
             IaxSubclass::Hangup => Err(CoreError::Message("iax2 auth failed".to_string())),
-            _ => Err(CoreError::Parse("iax2 unexpected auth response".to_string())),
+            _ => Err(CoreError::Parse(
+                "iax2 unexpected auth response".to_string(),
+            )),
         }
     }
 
@@ -593,7 +615,9 @@ fn handle_iax_request(
     if frame.frame_type != IaxFrameType::Iax {
         return Ok(());
     }
-    let mut state = state.lock().map_err(|_| CoreError::Message("iax2 state poisoned".to_string()))?;
+    let mut state = state
+        .lock()
+        .map_err(|_| CoreError::Message("iax2 state poisoned".to_string()))?;
     match frame.subclass {
         IaxSubclass::New => {
             let ies = decode_ies(&frame.payload)?;
@@ -625,7 +649,10 @@ fn handle_iax_request(
                     iseq: 0,
                     frame_type: IaxFrameType::Iax,
                     subclass: IaxSubclass::AuthReq,
-                    payload: encode_ies(&[IaxIe::Challenge(challenge.clone()), IaxIe::AuthMethods(methods_bits)]),
+                    payload: encode_ies(&[
+                        IaxIe::Challenge(challenge.clone()),
+                        IaxIe::AuthMethods(methods_bits),
+                    ]),
                 };
                 if let Some(session) = state.sessions.get_mut(&addr) {
                     session.challenge = Some(challenge);
@@ -647,7 +674,10 @@ fn handle_iax_request(
         }
         IaxSubclass::AuthRep => {
             let ies = decode_ies(&frame.payload)?;
-            let session = state.sessions.get_mut(&addr).ok_or_else(|| CoreError::Message("iax2 no session".to_string()))?;
+            let session = state
+                .sessions
+                .get_mut(&addr)
+                .ok_or_else(|| CoreError::Message("iax2 no session".to_string()))?;
             let username = session.username.clone().unwrap_or_else(|| "".to_string());
             let stored = config.users.get(&username).cloned().unwrap_or_default();
             let mut ok = false;
@@ -734,7 +764,9 @@ async fn handle_iax_request_async(
         return Ok(());
     }
     let response = {
-        let mut state = state.lock().map_err(|_| CoreError::Message("iax2 state poisoned".to_string()))?;
+        let mut state = state
+            .lock()
+            .map_err(|_| CoreError::Message("iax2 state poisoned".to_string()))?;
         match frame.subclass {
             IaxSubclass::New => {
                 let ies = decode_ies(&frame.payload)?;
@@ -769,7 +801,10 @@ async fn handle_iax_request_async(
                         iseq: 0,
                         frame_type: IaxFrameType::Iax,
                         subclass: IaxSubclass::AuthReq,
-                        payload: encode_ies(&[IaxIe::Challenge(challenge), IaxIe::AuthMethods(methods_bits)]),
+                        payload: encode_ies(&[
+                            IaxIe::Challenge(challenge),
+                            IaxIe::AuthMethods(methods_bits),
+                        ]),
                     })
                 } else {
                     Some(IaxFrame {
@@ -786,7 +821,10 @@ async fn handle_iax_request_async(
             }
             IaxSubclass::AuthRep => {
                 let ies = decode_ies(&frame.payload)?;
-                let session = state.sessions.get_mut(&addr).ok_or_else(|| CoreError::Message("iax2 no session".to_string()))?;
+                let session = state
+                    .sessions
+                    .get_mut(&addr)
+                    .ok_or_else(|| CoreError::Message("iax2 no session".to_string()))?;
                 let username = session.username.clone().unwrap_or_else(|| "".to_string());
                 let stored = config.users.get(&username).cloned().unwrap_or_default();
                 let mut ok = false;
@@ -805,7 +843,8 @@ async fn handle_iax_request_async(
                     }
                 }
                 if !ok {
-                    if let (Some(challenge), Some(result)) = (session.challenge.clone(), md5_result) {
+                    if let (Some(challenge), Some(result)) = (session.challenge.clone(), md5_result)
+                    {
                         if config.auth_methods.contains(&AuthMethod::Md5) {
                             let mut md5 = md5::Md5::new();
                             md5.update(&challenge);

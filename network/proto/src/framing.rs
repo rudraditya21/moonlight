@@ -19,7 +19,9 @@ pub struct LengthPrefixedFramer {
 impl LengthPrefixedFramer {
     pub fn new(len_bytes: usize, max_frame: usize) -> CoreResult<Self> {
         if len_bytes != 2 && len_bytes != 4 {
-            return Err(CoreError::Parse("length prefix must be 2 or 4 bytes".to_string()));
+            return Err(CoreError::Parse(
+                "length prefix must be 2 or 4 bytes".to_string(),
+            ));
         }
         Ok(Self {
             len_bytes,

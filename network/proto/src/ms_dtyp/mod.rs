@@ -45,7 +45,9 @@ pub struct FileTime(pub u64);
 
 impl FileTime {
     pub fn now() -> Self {
-        let unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
         let windows_ticks = unix.as_secs() * 10_000_000 + (unix.subsec_nanos() as u64 / 100);
         FileTime(windows_ticks + 11644473600u64 * 10_000_000)
     }
@@ -91,7 +93,12 @@ impl Sid {
             if idx + 4 > data.len() {
                 return Err(CoreError::Parse("sid subauthority".to_string()));
             }
-            subs.push(u32::from_le_bytes([data[idx], data[idx + 1], data[idx + 2], data[idx + 3]]));
+            subs.push(u32::from_le_bytes([
+                data[idx],
+                data[idx + 1],
+                data[idx + 2],
+                data[idx + 3],
+            ]));
             idx += 4;
         }
         Ok(Self {
@@ -102,7 +109,16 @@ impl Sid {
     }
 
     pub fn to_string(&self) -> String {
-        let auth = u64::from_be_bytes([0, 0, self.identifier_authority[0], self.identifier_authority[1], self.identifier_authority[2], self.identifier_authority[3], self.identifier_authority[4], self.identifier_authority[5]]);
+        let auth = u64::from_be_bytes([
+            0,
+            0,
+            self.identifier_authority[0],
+            self.identifier_authority[1],
+            self.identifier_authority[2],
+            self.identifier_authority[3],
+            self.identifier_authority[4],
+            self.identifier_authority[5],
+        ]);
         let mut out = format!("S-{}-{}", self.revision, auth);
         for sub in &self.sub_authorities {
             out.push_str(&format!("-{}", sub));
@@ -144,7 +160,8 @@ impl UnicodeString {
             units.push(u16::from_le_bytes([data[idx], data[idx + 1]]));
             idx += 2;
         }
-        let value = String::from_utf16(&units).map_err(|_| CoreError::Parse("unicode string utf16".to_string()))?;
+        let value = String::from_utf16(&units)
+            .map_err(|_| CoreError::Parse("unicode string utf16".to_string()))?;
         Ok(Self { value })
     }
 }
@@ -285,7 +302,9 @@ pub struct AsyncDtypServer {
 
 impl AsyncDtypServer {
     pub async fn bind(addr: SocketAddr, config: DtypServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { listener, config })
     }
 
@@ -340,7 +359,10 @@ fn handle_dtyp_stream(stream: TcpStream, config: DtypServerConfig) -> CoreResult
     }
 }
 
-async fn handle_dtyp_stream_async(stream: tokio::net::TcpStream, _config: DtypServerConfig) -> CoreResult<()> {
+async fn handle_dtyp_stream_async(
+    stream: tokio::net::TcpStream,
+    _config: DtypServerConfig,
+) -> CoreResult<()> {
     let mut transport = AsyncTcpTransport::from_stream(stream);
     loop {
         let msg = read_message_async(&mut transport).await?;
@@ -376,9 +398,14 @@ fn write_message<T: StreamTransport>(transport: &mut T, message: &DtypMessage) -
     transport.write_all(&payload)
 }
 
-async fn write_message_async<T: AsyncStreamTransport>(transport: &mut T, message: &DtypMessage) -> CoreResult<()> {
+async fn write_message_async<T: AsyncStreamTransport>(
+    transport: &mut T,
+    message: &DtypMessage,
+) -> CoreResult<()> {
     let payload = message.encode();
-    transport.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+    transport
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .await?;
     transport.write_all(&payload).await
 }
 
@@ -395,12 +422,18 @@ mod tests {
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 
-        let mut client = DtypClient::connect(&net::NetAddr::from_socket(addr), DtypServerConfig::default()).unwrap();
+        let mut client = DtypClient::connect(
+            &net::NetAddr::from_socket(addr),
+            DtypServerConfig::default(),
+        )
+        .unwrap();
         let message = DtypMessage {
             values: vec![
                 DtypValue::Guid(Guid::decode(&[0; 16]).unwrap()),
                 DtypValue::FileTime(FileTime::now()),
-                DtypValue::UnicodeString(UnicodeString { value: "moon".to_string() }),
+                DtypValue::UnicodeString(UnicodeString {
+                    value: "moon".to_string(),
+                }),
             ],
         };
         let resp = client.send(&message).unwrap();

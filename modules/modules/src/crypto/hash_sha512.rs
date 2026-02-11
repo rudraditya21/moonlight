@@ -57,8 +57,7 @@ impl Module for HashSha512Module {
         if expected.is_empty() {
             return Ok(ModuleResult::ok(&format!("sha512: {}", hash)));
         }
-        let expected = normalize_expected_hex(&expected, 128)
-            .map_err(ModuleError::Execution)?;
+        let expected = normalize_expected_hex(&expected, 128).map_err(ModuleError::Execution)?;
         let ok = expected == hash;
         Ok(ModuleResult::ok(&format!(
             "sha512 match: {}",
@@ -100,11 +99,10 @@ mod tests {
     #[test]
     fn sha512_module_compute() {
         let mut module = HashSha512Module::new();
-        module
-            .options_mut()
-            .set("INPUT", "abc")
-            .expect("set");
+        module.options_mut().set("INPUT", "abc").expect("set");
         let result = module.run(&ModuleContext { session_id: 1 }).expect("run");
-        assert!(result.message.contains("ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"));
+        assert!(result
+            .message
+            .contains("ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"));
     }
 }

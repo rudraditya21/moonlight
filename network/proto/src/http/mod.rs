@@ -9,8 +9,8 @@ use corelib::error::{CoreError, CoreResult};
 use net::NetAddr;
 
 use crate::transport::{
-    AsyncStreamTransport, AsyncTcpTransport, AsyncTlsClientTransport, StreamTransport, TcpTransport,
-    TlsClientConfig,
+    AsyncStreamTransport, AsyncTcpTransport, AsyncTlsClientTransport, StreamTransport,
+    TcpTransport, TlsClientConfig,
 };
 use crate::util::Timeouts;
 
@@ -173,7 +173,15 @@ impl HttpRequest {
             headers.push(("Host".to_string(), "localhost".to_string()));
         }
         let mut out = Vec::new();
-        out.extend_from_slice(format!("{} {} {}\r\n", self.method.as_str(), self.path, self.version.as_str()).as_bytes());
+        out.extend_from_slice(
+            format!(
+                "{} {} {}\r\n",
+                self.method.as_str(),
+                self.path,
+                self.version.as_str()
+            )
+            .as_bytes(),
+        );
         for (name, value) in headers {
             out.extend_from_slice(format!("{}: {}\r\n", name, value).as_bytes());
         }
@@ -213,7 +221,15 @@ impl HttpResponse {
             headers.push(("Content-Length".to_string(), self.body.len().to_string()));
         }
         let mut out = Vec::new();
-        out.extend_from_slice(format!("{} {} {}\r\n", self.version.as_str(), self.status_code, self.reason).as_bytes());
+        out.extend_from_slice(
+            format!(
+                "{} {} {}\r\n",
+                self.version.as_str(),
+                self.status_code,
+                self.reason
+            )
+            .as_bytes(),
+        );
         for (name, value) in headers {
             out.extend_from_slice(format!("{}: {}\r\n", name, value).as_bytes());
         }
@@ -250,7 +266,10 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
 }
 
 fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
-    if let Some((_, v)) = headers.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+    if let Some((_, v)) = headers
+        .iter_mut()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+    {
         *v = value.to_string();
     } else {
         headers.push((name.to_string(), value.to_string()));
@@ -509,7 +528,9 @@ fn parse_response(header_bytes: &[u8]) -> CoreResult<(HttpResponse, HashMap<Stri
     Ok((
         HttpResponse {
             version: HttpVersion::parse(version)?,
-            status_code: code.parse().map_err(|_| CoreError::Parse("invalid status".to_string()))?,
+            status_code: code
+                .parse()
+                .map_err(|_| CoreError::Parse("invalid status".to_string()))?,
             reason,
             headers,
             body: Vec::new(),
@@ -542,7 +563,8 @@ impl HttpClient<crate::transport::TlsStreamTransport> {
         config: &crate::transport::TlsClientConfig,
         timeouts: Timeouts,
     ) -> CoreResult<Self> {
-        let transport = crate::transport::TlsStreamTransport::connect(addr, server_name, config, timeouts)?;
+        let transport =
+            crate::transport::TlsStreamTransport::connect(addr, server_name, config, timeouts)?;
         Ok(Self::new(transport))
     }
 }
@@ -564,16 +586,24 @@ impl<T: StreamTransport> HttpClient<T> {
     pub fn send(&mut self, request: &HttpRequest) -> CoreResult<HttpResponse> {
         let bytes = request.to_bytes()?;
         self.transport.write_all(&bytes)?;
-        let header_bytes = read_until_delim(&mut self.transport, &mut self.read_buf, b"\r\n\r\n", MAX_HEADER_BYTES)?;
+        let header_bytes = read_until_delim(
+            &mut self.transport,
+            &mut self.read_buf,
+            b"\r\n\r\n",
+            MAX_HEADER_BYTES,
+        )?;
         let (mut response, header_map) = parse_response(&header_bytes)?;
         let mut body = Vec::new();
         if should_have_body(response.status_code) {
             if let Some(len) = header_map.get("content-length") {
-                let len = len.parse::<usize>().map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
+                let len = len
+                    .parse::<usize>()
+                    .map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
                 body = read_exact_body(&mut self.transport, &mut self.read_buf, len)?;
             } else if let Some(te) = header_map.get("transfer-encoding") {
                 if te.to_ascii_lowercase().contains("chunked") {
-                    body = read_chunked_body(&mut self.transport, &mut self.read_buf, self.max_body)?;
+                    body =
+                        read_chunked_body(&mut self.transport, &mut self.read_buf, self.max_body)?;
                 }
             } else if header_map
                 .get("connection")
@@ -614,7 +644,10 @@ impl HttpServer {
         self.listener.local_addr().map_err(CoreError::Io)
     }
 
-    pub fn serve<F>(&self, handler: F) -> CoreResult<()> where F: Fn(HttpRequest) -> HttpResponse + Send + Sync + 'static {
+    pub fn serve<F>(&self, handler: F) -> CoreResult<()>
+    where
+        F: Fn(HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    {
         let handler = Arc::new(handler);
         for stream in self.listener.incoming() {
             let stream = stream.map_err(CoreError::Io)?;
@@ -656,7 +689,9 @@ pub struct AsyncProxyServer {
 
 impl AsyncProxyServer {
     pub async fn bind(addr: SocketAddr) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             max_body: DEFAULT_MAX_BODY,
@@ -685,7 +720,8 @@ impl AsyncProxyServer {
             let connect_handler = Arc::clone(&connect_handler);
             let max_body = self.max_body;
             tokio::spawn(async move {
-                let _ = handle_proxy_connection_async(stream, max_body, handler, connect_handler).await;
+                let _ =
+                    handle_proxy_connection_async(stream, max_body, handler, connect_handler).await;
             });
         }
     }
@@ -724,7 +760,8 @@ impl ProxyServer {
             let timeouts = self.timeouts;
             let max_body = self.max_body;
             thread::spawn(move || {
-                let _ = handle_proxy_connection(stream, timeouts, max_body, handler, connect_handler);
+                let _ =
+                    handle_proxy_connection(stream, timeouts, max_body, handler, connect_handler);
             });
         }
         Ok(())
@@ -761,7 +798,10 @@ pub fn proxy_forward(request: &HttpRequest, timeouts: Timeouts) -> CoreResult<Ht
     }
 }
 
-pub async fn proxy_forward_async(request: &HttpRequest, timeouts: Timeouts) -> CoreResult<HttpResponse> {
+pub async fn proxy_forward_async(
+    request: &HttpRequest,
+    timeouts: Timeouts,
+) -> CoreResult<HttpResponse> {
     let target = resolve_forward_target(request)?;
     let mut outbound = request.clone();
     outbound.path = target.path;
@@ -795,11 +835,12 @@ fn resolve_forward_target(request: &HttpRequest) -> CoreResult<ForwardTarget> {
             port,
             path,
         } => {
-            let host_header = if (scheme == "https" && port == 443) || (scheme == "http" && port == 80) {
-                host.clone()
-            } else {
-                format!("{}:{}", host, port)
-            };
+            let host_header =
+                if (scheme == "https" && port == 443) || (scheme == "http" && port == 80) {
+                    host.clone()
+                } else {
+                    format!("{}:{}", host, port)
+                };
             Ok(ForwardTarget {
                 scheme,
                 host,
@@ -844,13 +885,16 @@ fn handle_connection(
     let mut transport = TcpTransport::from_stream(stream, timeouts)?;
     let mut buffer = Vec::new();
     loop {
-        let header_bytes = match read_until_delim(&mut transport, &mut buffer, b"\r\n\r\n", MAX_HEADER_BYTES) {
-            Ok(bytes) => bytes,
-            Err(err) => return Err(err),
-        };
+        let header_bytes =
+            match read_until_delim(&mut transport, &mut buffer, b"\r\n\r\n", MAX_HEADER_BYTES) {
+                Ok(bytes) => bytes,
+                Err(err) => return Err(err),
+            };
         let (mut request, header_map) = parse_request(&header_bytes)?;
         if let Some(len) = header_map.get("content-length") {
-            let len = len.parse::<usize>().map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
+            let len = len
+                .parse::<usize>()
+                .map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
             request.body = read_exact_body(&mut transport, &mut buffer, len)?;
         } else if let Some(te) = header_map.get("transfer-encoding") {
             if te.to_ascii_lowercase().contains("chunked") {
@@ -887,10 +931,13 @@ fn handle_proxy_connection(
     let mut transport = TcpTransport::from_stream(stream, timeouts)?;
     let mut buffer = Vec::new();
     loop {
-        let header_bytes = read_until_delim(&mut transport, &mut buffer, b"\r\n\r\n", MAX_HEADER_BYTES)?;
+        let header_bytes =
+            read_until_delim(&mut transport, &mut buffer, b"\r\n\r\n", MAX_HEADER_BYTES)?;
         let (mut request, header_map) = parse_request(&header_bytes)?;
         if let Some(len) = header_map.get("content-length") {
-            let len = len.parse::<usize>().map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
+            let len = len
+                .parse::<usize>()
+                .map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
             request.body = read_exact_body(&mut transport, &mut buffer, len)?;
         } else if let Some(te) = header_map.get("transfer-encoding") {
             if te.to_ascii_lowercase().contains("chunked") {
@@ -952,10 +999,13 @@ fn handle_proxy_forward_connection(
     let mut transport = TcpTransport::from_stream(stream, timeouts)?;
     let mut buffer = Vec::new();
     loop {
-        let header_bytes = read_until_delim(&mut transport, &mut buffer, b"\r\n\r\n", MAX_HEADER_BYTES)?;
+        let header_bytes =
+            read_until_delim(&mut transport, &mut buffer, b"\r\n\r\n", MAX_HEADER_BYTES)?;
         let (mut request, header_map) = parse_request(&header_bytes)?;
         if let Some(len) = header_map.get("content-length") {
-            let len = len.parse::<usize>().map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
+            let len = len
+                .parse::<usize>()
+                .map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
             request.body = read_exact_body(&mut transport, &mut buffer, len)?;
         } else if let Some(te) = header_map.get("transfer-encoding") {
             if te.to_ascii_lowercase().contains("chunked") {
@@ -1007,14 +1057,19 @@ async fn handle_proxy_connection_async(
     let mut transport = AsyncTcpTransport::from_stream(stream);
     let mut buffer = Vec::new();
     loop {
-        let header_bytes = read_until_delim_async(&mut transport, &mut buffer, b"\r\n\r\n", MAX_HEADER_BYTES).await?;
+        let header_bytes =
+            read_until_delim_async(&mut transport, &mut buffer, b"\r\n\r\n", MAX_HEADER_BYTES)
+                .await?;
         let (mut request, header_map) = parse_request(&header_bytes)?;
         if let Some(len) = header_map.get("content-length") {
-            let len = len.parse::<usize>().map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
+            let len = len
+                .parse::<usize>()
+                .map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
             request.body = read_exact_body_async(&mut transport, &mut buffer, len).await?;
         } else if let Some(te) = header_map.get("transfer-encoding") {
             if te.to_ascii_lowercase().contains("chunked") {
-                request.body = read_chunked_body_async(&mut transport, &mut buffer, max_body).await?;
+                request.body =
+                    read_chunked_body_async(&mut transport, &mut buffer, max_body).await?;
             }
         }
 
@@ -1082,7 +1137,8 @@ impl AsyncHttpClient<AsyncTlsClientTransport> {
         config: &crate::transport::TlsClientConfig,
         timeouts: Timeouts,
     ) -> CoreResult<Self> {
-        let transport = AsyncTlsClientTransport::connect(addr, server_name, config, timeouts).await?;
+        let transport =
+            AsyncTlsClientTransport::connect(addr, server_name, config, timeouts).await?;
         Ok(Self::new(transport))
     }
 }
@@ -1104,16 +1160,29 @@ impl<T: AsyncStreamTransport> AsyncHttpClient<T> {
     pub async fn send(&mut self, request: &HttpRequest) -> CoreResult<HttpResponse> {
         let bytes = request.to_bytes()?;
         self.transport.write_all(&bytes).await?;
-        let header_bytes = read_until_delim_async(&mut self.transport, &mut self.read_buf, b"\r\n\r\n", MAX_HEADER_BYTES).await?;
+        let header_bytes = read_until_delim_async(
+            &mut self.transport,
+            &mut self.read_buf,
+            b"\r\n\r\n",
+            MAX_HEADER_BYTES,
+        )
+        .await?;
         let (mut response, header_map) = parse_response(&header_bytes)?;
         let mut body = Vec::new();
         if should_have_body(response.status_code) {
             if let Some(len) = header_map.get("content-length") {
-                let len = len.parse::<usize>().map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
+                let len = len
+                    .parse::<usize>()
+                    .map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
                 body = read_exact_body_async(&mut self.transport, &mut self.read_buf, len).await?;
             } else if let Some(te) = header_map.get("transfer-encoding") {
                 if te.to_ascii_lowercase().contains("chunked") {
-                    body = read_chunked_body_async(&mut self.transport, &mut self.read_buf, self.max_body).await?;
+                    body = read_chunked_body_async(
+                        &mut self.transport,
+                        &mut self.read_buf,
+                        self.max_body,
+                    )
+                    .await?;
                 }
             } else if header_map
                 .get("connection")
@@ -1121,7 +1190,8 @@ impl<T: AsyncStreamTransport> AsyncHttpClient<T> {
                 .unwrap_or(false)
                 || matches!(response.version, HttpVersion::Http10)
             {
-                body = read_to_end_async(&mut self.transport, &mut self.read_buf, self.max_body).await?;
+                body = read_to_end_async(&mut self.transport, &mut self.read_buf, self.max_body)
+                    .await?;
             }
         }
         response.body = body;
@@ -1136,7 +1206,9 @@ pub struct AsyncHttpServer {
 
 impl AsyncHttpServer {
     pub async fn bind(addr: SocketAddr) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             max_body: DEFAULT_MAX_BODY,
@@ -1152,7 +1224,10 @@ impl AsyncHttpServer {
         self.listener.local_addr().map_err(CoreError::Io)
     }
 
-    pub async fn serve<F>(&self, handler: F) -> CoreResult<()> where F: Fn(HttpRequest) -> HttpResponse + Send + Sync + 'static {
+    pub async fn serve<F>(&self, handler: F) -> CoreResult<()>
+    where
+        F: Fn(HttpRequest) -> HttpResponse + Send + Sync + 'static,
+    {
         let handler = Arc::new(handler);
         loop {
             let (stream, _) = self.listener.accept().await.map_err(CoreError::Io)?;
@@ -1278,14 +1353,19 @@ async fn handle_connection_async(
     let mut transport = AsyncTcpTransport::from_stream(stream);
     let mut buffer = Vec::new();
     loop {
-        let header_bytes = read_until_delim_async(&mut transport, &mut buffer, b"\r\n\r\n", MAX_HEADER_BYTES).await?;
+        let header_bytes =
+            read_until_delim_async(&mut transport, &mut buffer, b"\r\n\r\n", MAX_HEADER_BYTES)
+                .await?;
         let (mut request, header_map) = parse_request(&header_bytes)?;
         if let Some(len) = header_map.get("content-length") {
-            let len = len.parse::<usize>().map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
+            let len = len
+                .parse::<usize>()
+                .map_err(|_| CoreError::Parse("invalid content-length".to_string()))?;
             request.body = read_exact_body_async(&mut transport, &mut buffer, len).await?;
         } else if let Some(te) = header_map.get("transfer-encoding") {
             if te.to_ascii_lowercase().contains("chunked") {
-                request.body = read_chunked_body_async(&mut transport, &mut buffer, max_body).await?;
+                request.body =
+                    read_chunked_body_async(&mut transport, &mut buffer, max_body).await?;
             }
         }
         let mut response = (handler)(request.clone());
@@ -1334,7 +1414,12 @@ mod tests {
         let mut req = HttpRequest::new(HttpMethod::Get, "http://example.com:8080/test");
         let target = req.target().expect("target");
         match target {
-            HttpTarget::Absolute { scheme, host, port, path } => {
+            HttpTarget::Absolute {
+                scheme,
+                host,
+                port,
+                path,
+            } => {
                 assert_eq!(scheme, "http");
                 assert_eq!(host, "example.com");
                 assert_eq!(port, 8080);

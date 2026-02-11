@@ -253,7 +253,11 @@ pub struct ThriftServer {
 }
 
 impl ThriftServer {
-    pub fn bind(addr: SocketAddr, config: ThriftServerConfig, service: Arc<dyn ThriftService>) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        config: ThriftServerConfig,
+        service: Arc<dyn ThriftService>,
+    ) -> CoreResult<Self> {
         let listener = TcpListener::bind(addr).map_err(CoreError::Io)?;
         Ok(Self {
             listener,
@@ -286,8 +290,14 @@ pub struct AsyncThriftServer {
 }
 
 impl AsyncThriftServer {
-    pub async fn bind(addr: SocketAddr, config: ThriftServerConfig, service: Arc<dyn ThriftService>) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+    pub async fn bind(
+        addr: SocketAddr,
+        config: ThriftServerConfig,
+        service: Arc<dyn ThriftService>,
+    ) -> CoreResult<Self> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             config,
@@ -307,12 +317,18 @@ impl AsyncThriftServer {
     }
 }
 
-fn handle_connection(stream: TcpStream, config: ThriftServerConfig, service: Arc<dyn ThriftService>) -> CoreResult<()> {
+fn handle_connection(
+    stream: TcpStream,
+    config: ThriftServerConfig,
+    service: Arc<dyn ThriftService>,
+) -> CoreResult<()> {
     let mut transport = TcpTransport::from_stream(stream, config.timeouts)?;
     loop {
         let msg = match read_message(&mut transport, config.framed) {
             Ok(msg) => msg,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
             Err(err) => return Err(err),
         };
         let input = decode_struct(&msg.payload)?;
@@ -357,7 +373,9 @@ async fn handle_connection_async(
     loop {
         let msg = match read_message_async(&mut transport, config.framed).await {
             Ok(msg) => msg,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
             Err(err) => return Err(err),
         };
         let input = decode_struct(&msg.payload)?;
@@ -393,7 +411,11 @@ async fn handle_connection_async(
     }
 }
 
-fn write_message(transport: &mut TcpTransport, msg: &ThriftMessage, framed: bool) -> CoreResult<()> {
+fn write_message(
+    transport: &mut TcpTransport,
+    msg: &ThriftMessage,
+    framed: bool,
+) -> CoreResult<()> {
     let payload = encode_message(msg);
     if framed {
         let mut out = Vec::with_capacity(payload.len() + 4);
@@ -405,7 +427,11 @@ fn write_message(transport: &mut TcpTransport, msg: &ThriftMessage, framed: bool
     }
 }
 
-async fn write_message_async(transport: &mut AsyncTcpTransport, msg: &ThriftMessage, framed: bool) -> CoreResult<()> {
+async fn write_message_async(
+    transport: &mut AsyncTcpTransport,
+    msg: &ThriftMessage,
+    framed: bool,
+) -> CoreResult<()> {
     let payload = encode_message(msg);
     if framed {
         let mut out = Vec::with_capacity(payload.len() + 4);
@@ -431,7 +457,10 @@ fn read_message(transport: &mut TcpTransport, framed: bool) -> CoreResult<Thrift
     }
 }
 
-async fn read_message_async(transport: &mut AsyncTcpTransport, framed: bool) -> CoreResult<ThriftMessage> {
+async fn read_message_async(
+    transport: &mut AsyncTcpTransport,
+    framed: bool,
+) -> CoreResult<ThriftMessage> {
     if framed {
         let mut header = [0u8; 4];
         transport.read_exact(&mut header).await?;
@@ -505,7 +534,6 @@ fn decode_message_stream(reader: &mut ThriftStreamReader<'_>) -> CoreResult<Thri
     })
 }
 
-
 fn encode_struct(fields: &[ThriftField]) -> Vec<u8> {
     let mut out = Vec::new();
     for field in fields {
@@ -545,7 +573,9 @@ fn encode_value(out: &mut Vec<u8>, field_type: ThriftType, value: &ThriftValue) 
         (ThriftType::I64, ThriftValue::I64(v)) => out.extend_from_slice(&v.to_be_bytes()),
         (ThriftType::Double, ThriftValue::Double(v)) => out.extend_from_slice(&v.to_be_bytes()),
         (ThriftType::String, ThriftValue::String(v)) => write_string(out, v),
-        (ThriftType::Struct, ThriftValue::Struct(fields)) => out.extend_from_slice(&encode_struct(fields)),
+        (ThriftType::Struct, ThriftValue::Struct(fields)) => {
+            out.extend_from_slice(&encode_struct(fields))
+        }
         (ThriftType::Map, ThriftValue::Map(key_t, val_t, entries)) => {
             out.push(*key_t as u8);
             out.push(*val_t as u8);
@@ -756,7 +786,11 @@ impl<'a> ThriftStreamReader<'a> {
     }
 }
 
-fn read_value_stream(reader: &mut ThriftStreamReader<'_>, field_type: ThriftType, out: &mut Vec<u8>) -> CoreResult<()> {
+fn read_value_stream(
+    reader: &mut ThriftStreamReader<'_>,
+    field_type: ThriftType,
+    out: &mut Vec<u8>,
+) -> CoreResult<()> {
     match field_type {
         ThriftType::Bool | ThriftType::Byte => {
             let v = reader.read_u8()?;
@@ -786,19 +820,17 @@ fn read_value_stream(reader: &mut ThriftStreamReader<'_>, field_type: ThriftType
             reader.read_exact(&mut buf)?;
             out.extend_from_slice(&buf);
         }
-        ThriftType::Struct => {
-            loop {
-                let ty = reader.read_u8()?;
-                out.push(ty);
-                if ty == ThriftType::Stop as u8 {
-                    break;
-                }
-                let mut id_buf = [0u8; 2];
-                reader.read_exact(&mut id_buf)?;
-                out.extend_from_slice(&id_buf);
-                read_value_stream(reader, ThriftType::from_u8(ty)?, out)?;
+        ThriftType::Struct => loop {
+            let ty = reader.read_u8()?;
+            out.push(ty);
+            if ty == ThriftType::Stop as u8 {
+                break;
             }
-        }
+            let mut id_buf = [0u8; 2];
+            reader.read_exact(&mut id_buf)?;
+            out.extend_from_slice(&id_buf);
+            read_value_stream(reader, ThriftType::from_u8(ty)?, out)?;
+        },
         ThriftType::Map => {
             let key = reader.read_u8()?;
             let val = reader.read_u8()?;
@@ -828,7 +860,6 @@ fn read_value_stream(reader: &mut ThriftStreamReader<'_>, field_type: ThriftType
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -862,7 +893,8 @@ mod tests {
         });
 
         let mut client =
-            ThriftClient::connect(&NetAddr::from_socket(addr), ThriftClientConfig::default()).unwrap();
+            ThriftClient::connect(&NetAddr::from_socket(addr), ThriftClientConfig::default())
+                .unwrap();
         let args = vec![ThriftField {
             id: 1,
             field_type: ThriftType::String,

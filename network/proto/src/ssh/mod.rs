@@ -12,9 +12,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature;
 use ring::signature::KeyPair;
 
-use crate::transport::{
-    AsyncStreamTransport, AsyncTcpTransport, StreamTransport, TcpTransport,
-};
+use crate::transport::{AsyncStreamTransport, AsyncTcpTransport, StreamTransport, TcpTransport};
 use crate::util::Timeouts;
 
 const VERSION: &str = "SSH-2.0-moonlight_ssh";
@@ -235,7 +233,13 @@ impl<T> SshTransport<T> {
         }
     }
 
-    fn set_crypto(&mut self, enc: CipherState, dec: CipherState, mac_out: Vec<u8>, mac_in: Vec<u8>) {
+    fn set_crypto(
+        &mut self,
+        enc: CipherState,
+        dec: CipherState,
+        mac_out: Vec<u8>,
+        mac_in: Vec<u8>,
+    ) {
         self.block_size = enc.block_size;
         self.enc = Some(enc);
         self.dec = Some(dec);
@@ -245,7 +249,6 @@ impl<T> SshTransport<T> {
 }
 
 impl<T: StreamTransport> SshTransport<T> {
-
     fn write_packet(&mut self, payload: &[u8]) -> CoreResult<()> {
         if payload.len() > MAX_PACKET {
             return Err(CoreError::Parse("packet too large".to_string()));
@@ -485,7 +488,12 @@ impl AuthHandler for AllowAllAuth {
         true
     }
 
-    fn check_publickey(&self, _username: &str, _key_blob: &[u8], _signature: Option<&[u8]>) -> bool {
+    fn check_publickey(
+        &self,
+        _username: &str,
+        _key_blob: &[u8],
+        _signature: Option<&[u8]>,
+    ) -> bool {
         true
     }
 }
@@ -495,7 +503,11 @@ impl SshClient {
         let transport = TcpTransport::connect(addr, timeouts)?;
         let mut transport = SshTransport::new(transport);
         let server_version = exchange_versions(&mut transport.io, VERSION)?;
-        let (session_id, server_host_key) = client_kex(&mut transport, VERSION.as_bytes(), server_version.as_bytes())?;
+        let (session_id, server_host_key) = client_kex(
+            &mut transport,
+            VERSION.as_bytes(),
+            server_version.as_bytes(),
+        )?;
         Ok(Self {
             transport,
             session_id,
@@ -606,8 +618,12 @@ impl AsyncSshClient {
         let transport = AsyncTcpTransport::connect(addr, timeouts).await?;
         let mut transport = SshTransport::new(transport);
         let server_version = exchange_versions_async(&mut transport.io, VERSION).await?;
-        let (session_id, server_host_key) =
-            client_kex_async(&mut transport, VERSION.as_bytes(), server_version.as_bytes()).await?;
+        let (session_id, server_host_key) = client_kex_async(
+            &mut transport,
+            VERSION.as_bytes(),
+            server_version.as_bytes(),
+        )
+        .await?;
         Ok(Self {
             transport,
             session_id,
@@ -670,7 +686,11 @@ impl AsyncSshClient {
         }
     }
 
-    pub async fn send_channel_data(&mut self, channel: &mut AsyncChannel, data: &[u8]) -> CoreResult<()> {
+    pub async fn send_channel_data(
+        &mut self,
+        channel: &mut AsyncChannel,
+        data: &[u8],
+    ) -> CoreResult<()> {
         if data.len() as u32 > channel.max_packet {
             return Err(CoreError::Parse("channel data too large".to_string()));
         }
@@ -714,7 +734,12 @@ impl AsyncSshClient {
 }
 
 impl SshServer {
-    pub fn bind(addr: SocketAddr, host_key: HostKey, config: SshConfig, timeouts: Timeouts) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        host_key: HostKey,
+        config: SshConfig,
+        timeouts: Timeouts,
+    ) -> CoreResult<Self> {
         let listener = TcpListener::bind(addr).map_err(CoreError::Io)?;
         Ok(Self {
             listener,
@@ -748,8 +773,15 @@ impl SshServer {
 }
 
 impl AsyncSshServer {
-    pub async fn bind(addr: SocketAddr, host_key: HostKey, config: SshConfig, timeouts: Timeouts) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+    pub async fn bind(
+        addr: SocketAddr,
+        host_key: HostKey,
+        config: SshConfig,
+        timeouts: Timeouts,
+    ) -> CoreResult<Self> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             host_key,
@@ -790,7 +822,12 @@ fn handle_server(
     let transport = TcpTransport::from_stream(stream, timeouts)?;
     let mut transport = SshTransport::new(transport);
     let client_version = exchange_versions(&mut transport.io, &config.server_id)?;
-    server_kex(&mut transport, &host_key, client_version.as_bytes(), config.server_id.as_bytes())?;
+    server_kex(
+        &mut transport,
+        &host_key,
+        client_version.as_bytes(),
+        config.server_id.as_bytes(),
+    )?;
     server_auth(&mut transport, handler)?;
     server_session(&mut transport)
 }
@@ -816,7 +853,10 @@ async fn handle_server_async(
     server_session_async(&mut transport).await
 }
 
-fn server_auth(transport: &mut SshTransport<TcpTransport>, handler: Arc<dyn AuthHandler>) -> CoreResult<()> {
+fn server_auth(
+    transport: &mut SshTransport<TcpTransport>,
+    handler: Arc<dyn AuthHandler>,
+) -> CoreResult<()> {
     loop {
         let payload = transport.read_packet()?;
         match payload.get(0).copied() {
@@ -839,7 +879,10 @@ fn server_auth(transport: &mut SshTransport<TcpTransport>, handler: Arc<dyn Auth
                 let success = if method == b"password" {
                     let _ = read_u8(&payload, &mut cursor)?;
                     let password = read_string(&payload, &mut cursor)?;
-                    handler.check_password(&String::from_utf8_lossy(&username), &String::from_utf8_lossy(&password))
+                    handler.check_password(
+                        &String::from_utf8_lossy(&username),
+                        &String::from_utf8_lossy(&password),
+                    )
                 } else if method == b"publickey" {
                     let has_sig = read_u8(&payload, &mut cursor)? != 0;
                     let alg = read_string(&payload, &mut cursor)?;
@@ -849,8 +892,11 @@ fn server_auth(transport: &mut SshTransport<TcpTransport>, handler: Arc<dyn Auth
                     } else {
                         None
                     };
-                    handler.check_publickey(&String::from_utf8_lossy(&username), &key_blob, signature.as_deref())
-                        && alg == HOSTKEY_ALG.as_bytes()
+                    handler.check_publickey(
+                        &String::from_utf8_lossy(&username),
+                        &key_blob,
+                        signature.as_deref(),
+                    ) && alg == HOSTKEY_ALG.as_bytes()
                 } else {
                     false
                 };
@@ -897,7 +943,10 @@ async fn server_auth_async(
                 let success = if method == b"password" {
                     let _ = read_u8(&payload, &mut cursor)?;
                     let password = read_string(&payload, &mut cursor)?;
-                    handler.check_password(&String::from_utf8_lossy(&username), &String::from_utf8_lossy(&password))
+                    handler.check_password(
+                        &String::from_utf8_lossy(&username),
+                        &String::from_utf8_lossy(&password),
+                    )
                 } else if method == b"publickey" {
                     let has_sig = read_u8(&payload, &mut cursor)? != 0;
                     let alg = read_string(&payload, &mut cursor)?;
@@ -907,8 +956,11 @@ async fn server_auth_async(
                     } else {
                         None
                     };
-                    handler.check_publickey(&String::from_utf8_lossy(&username), &key_blob, signature.as_deref())
-                        && alg == HOSTKEY_ALG.as_bytes()
+                    handler.check_publickey(
+                        &String::from_utf8_lossy(&username),
+                        &key_blob,
+                        signature.as_deref(),
+                    ) && alg == HOSTKEY_ALG.as_bytes()
                 } else {
                     false
                 };
@@ -1051,7 +1103,12 @@ async fn server_session_async(transport: &mut SshTransport<AsyncTcpTransport>) -
     }
 }
 
-fn send_channel_open_failure(transport: &mut SshTransport<TcpTransport>, payload: &[u8], reason: u32, msg: &str) -> CoreResult<()> {
+fn send_channel_open_failure(
+    transport: &mut SshTransport<TcpTransport>,
+    payload: &[u8],
+    reason: u32,
+    msg: &str,
+) -> CoreResult<()> {
     let mut cursor = 1usize;
     let _ = read_string(payload, &mut cursor)?;
     let remote_id = read_u32(payload, &mut cursor)?;
@@ -1064,7 +1121,12 @@ fn send_channel_open_failure(transport: &mut SshTransport<TcpTransport>, payload
     transport.write_packet(&resp)
 }
 
-async fn send_channel_open_failure_async(transport: &mut SshTransport<AsyncTcpTransport>, payload: &[u8], reason: u32, msg: &str) -> CoreResult<()> {
+async fn send_channel_open_failure_async(
+    transport: &mut SshTransport<AsyncTcpTransport>,
+    payload: &[u8],
+    reason: u32,
+    msg: &str,
+) -> CoreResult<()> {
     let mut cursor = 1usize;
     let _ = read_string(payload, &mut cursor)?;
     let remote_id = read_u32(payload, &mut cursor)?;
@@ -1141,7 +1203,13 @@ fn client_kex(
 
     let (kex_alg, host_alg, cipher_c2s, cipher_s2c, mac_c2s, mac_s2c) =
         negotiate(&kex_init, &server_kex)?;
-    if kex_alg != KEX_ALG || host_alg != HOSTKEY_ALG || cipher_c2s != CIPHER_ALG || cipher_s2c != CIPHER_ALG || mac_c2s != MAC_ALG || mac_s2c != MAC_ALG {
+    if kex_alg != KEX_ALG
+        || host_alg != HOSTKEY_ALG
+        || cipher_c2s != CIPHER_ALG
+        || cipher_s2c != CIPHER_ALG
+        || mac_c2s != MAC_ALG
+        || mac_s2c != MAC_ALG
+    {
         return Err(CoreError::Parse("unsupported algorithm".to_string()));
     }
 
@@ -1207,7 +1275,13 @@ async fn client_kex_async(
 
     let (kex_alg, host_alg, cipher_c2s, cipher_s2c, mac_c2s, mac_s2c) =
         negotiate(&kex_init, &server_kex)?;
-    if kex_alg != KEX_ALG || host_alg != HOSTKEY_ALG || cipher_c2s != CIPHER_ALG || cipher_s2c != CIPHER_ALG || mac_c2s != MAC_ALG || mac_s2c != MAC_ALG {
+    if kex_alg != KEX_ALG
+        || host_alg != HOSTKEY_ALG
+        || cipher_c2s != CIPHER_ALG
+        || cipher_s2c != CIPHER_ALG
+        || mac_c2s != MAC_ALG
+        || mac_s2c != MAC_ALG
+    {
         return Err(CoreError::Parse("unsupported algorithm".to_string()));
     }
 
@@ -1274,7 +1348,13 @@ fn server_kex(
 
     let (kex_alg, host_alg, cipher_c2s, cipher_s2c, mac_c2s, mac_s2c) =
         negotiate(&client_kex, &server_kex)?;
-    if kex_alg != KEX_ALG || host_alg != HOSTKEY_ALG || cipher_c2s != CIPHER_ALG || cipher_s2c != CIPHER_ALG || mac_c2s != MAC_ALG || mac_s2c != MAC_ALG {
+    if kex_alg != KEX_ALG
+        || host_alg != HOSTKEY_ALG
+        || cipher_c2s != CIPHER_ALG
+        || cipher_s2c != CIPHER_ALG
+        || mac_c2s != MAC_ALG
+        || mac_s2c != MAC_ALG
+    {
         return Err(CoreError::Parse("unsupported algorithm".to_string()));
     }
 
@@ -1340,7 +1420,13 @@ async fn server_kex_async(
 
     let (kex_alg, host_alg, cipher_c2s, cipher_s2c, mac_c2s, mac_s2c) =
         negotiate(&client_kex, &server_kex)?;
-    if kex_alg != KEX_ALG || host_alg != HOSTKEY_ALG || cipher_c2s != CIPHER_ALG || cipher_s2c != CIPHER_ALG || mac_c2s != MAC_ALG || mac_s2c != MAC_ALG {
+    if kex_alg != KEX_ALG
+        || host_alg != HOSTKEY_ALG
+        || cipher_c2s != CIPHER_ALG
+        || cipher_s2c != CIPHER_ALG
+        || mac_c2s != MAC_ALG
+        || mac_s2c != MAC_ALG
+    {
         return Err(CoreError::Parse("unsupported algorithm".to_string()));
     }
 
@@ -1404,7 +1490,10 @@ fn service_request(transport: &mut SshTransport<TcpTransport>, name: &str) -> Co
     Ok(())
 }
 
-async fn service_request_async(transport: &mut SshTransport<AsyncTcpTransport>, name: &str) -> CoreResult<()> {
+async fn service_request_async(
+    transport: &mut SshTransport<AsyncTcpTransport>,
+    name: &str,
+) -> CoreResult<()> {
     let mut payload = Vec::new();
     payload.push(MSG_SERVICE_REQUEST);
     encode_string(&mut payload, name.as_bytes());
@@ -1416,7 +1505,11 @@ async fn service_request_async(transport: &mut SshTransport<AsyncTcpTransport>, 
     Ok(())
 }
 
-fn verify_hostkey_signature(host_key_blob: &[u8], signature_blob: &[u8], data: &[u8]) -> CoreResult<()> {
+fn verify_hostkey_signature(
+    host_key_blob: &[u8],
+    signature_blob: &[u8],
+    data: &[u8],
+) -> CoreResult<()> {
     let mut cursor = 0usize;
     let alg = read_string(host_key_blob, &mut cursor)?;
     let key = read_string(host_key_blob, &mut cursor)?;
@@ -1450,7 +1543,10 @@ fn x25519_agree(key: agreement::EphemeralPrivateKey, peer_pub: &[u8]) -> CoreRes
         .map_err(|_| CoreError::Parse("kex failed".to_string()))
 }
 
-fn negotiate(client: &KexInit, server: &KexInit) -> CoreResult<(String, String, String, String, String, String)> {
+fn negotiate(
+    client: &KexInit,
+    server: &KexInit,
+) -> CoreResult<(String, String, String, String, String, String)> {
     let kex_alg = first_match(&client.kex_algs, &server.kex_algs)?;
     let host_alg = first_match(&client.host_key_algs, &server.host_key_algs)?;
     let cipher_c2s = first_match(&client.ciphers_c2s, &server.ciphers_c2s)?;
@@ -1601,8 +1697,8 @@ fn decode_namelist(data: &[u8], cursor: &mut usize) -> CoreResult<Vec<String>> {
     if raw.is_empty() {
         return Ok(Vec::new());
     }
-    let list = String::from_utf8(raw)
-        .map_err(|_| CoreError::Parse("invalid namelist".to_string()))?;
+    let list =
+        String::from_utf8(raw).map_err(|_| CoreError::Parse("invalid namelist".to_string()))?;
     Ok(list.split(',').map(|s| s.to_string()).collect())
 }
 
@@ -1651,7 +1747,12 @@ mod tests {
             username == "user" && password == "pass"
         }
 
-        fn check_publickey(&self, _username: &str, _key_blob: &[u8], _signature: Option<&[u8]>) -> bool {
+        fn check_publickey(
+            &self,
+            _username: &str,
+            _key_blob: &[u8],
+            _signature: Option<&[u8]>,
+        ) -> bool {
             false
         }
     }
@@ -1687,7 +1788,12 @@ mod tests {
     #[test]
     fn server_client_roundtrip() {
         let host_key = HostKey::from_seed(&[7u8; 32]).unwrap();
-        let server = match SshServer::bind("127.0.0.1:0".parse().unwrap(), host_key, SshConfig::default(), Timeouts::default()) {
+        let server = match SshServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            host_key,
+            SshConfig::default(),
+            Timeouts::default(),
+        ) {
             Ok(server) => server,
             Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
             Err(err) => panic!("bind: {:?}", err),
@@ -1697,7 +1803,8 @@ mod tests {
             let _ = server.serve(TestAuth);
         });
 
-        let mut client = SshClient::connect(&NetAddr::from_socket(addr), Timeouts::default()).unwrap();
+        let mut client =
+            SshClient::connect(&NetAddr::from_socket(addr), Timeouts::default()).unwrap();
         client.userauth_password("user", "pass").unwrap();
         let mut channel = client.open_session().unwrap();
         client.send_channel_data(&mut channel, b"ping").unwrap();

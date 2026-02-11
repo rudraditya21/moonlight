@@ -267,7 +267,9 @@ impl AsyncRfbClient {
             ));
         }
 
-        transport.write_all(&[if config.shared { 1 } else { 0 }]).await?;
+        transport
+            .write_all(&[if config.shared { 1 } else { 0 }])
+            .await?;
         let server_init = read_server_init_async(&mut transport).await?;
         Ok(Self {
             transport,
@@ -332,7 +334,9 @@ pub struct AsyncRfbServer {
 
 impl AsyncRfbServer {
     pub async fn bind(addr: SocketAddr, config: RfbServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { listener, config })
     }
 
@@ -358,8 +362,15 @@ pub enum RfbClientMessage {
         width: u16,
         height: u16,
     },
-    KeyEvent { down: bool, key: u32 },
-    PointerEvent { button_mask: u8, x: u16, y: u16 },
+    KeyEvent {
+        down: bool,
+        key: u32,
+    },
+    PointerEvent {
+        button_mask: u8,
+        x: u16,
+        y: u16,
+    },
     ClientCutText(String),
     Unknown(u8, Vec<u8>),
 }
@@ -463,7 +474,9 @@ async fn handle_rfb_stream_async(
     if selected[0] != RfbSecurityType::None as u8 {
         transport.write_all(&1u32.to_be_bytes()).await?;
         let reason = b"unsupported security";
-        transport.write_all(&(reason.len() as u32).to_be_bytes()).await?;
+        transport
+            .write_all(&(reason.len() as u32).to_be_bytes())
+            .await?;
         transport.write_all(reason).await?;
         return Ok(());
     }
@@ -572,7 +585,9 @@ fn read_client_message<T: StreamTransport>(transport: &mut T) -> CoreResult<RfbC
             transport.read_exact(&mut pad)?;
             let mut fmt = [0u8; 16];
             transport.read_exact(&mut fmt)?;
-            Ok(RfbClientMessage::SetPixelFormat(RfbPixelFormat::decode(&fmt)?))
+            Ok(RfbClientMessage::SetPixelFormat(RfbPixelFormat::decode(
+                &fmt,
+            )?))
         }
         2 => {
             let mut pad = [0u8; 1];
@@ -631,9 +646,7 @@ fn read_client_message<T: StreamTransport>(transport: &mut T) -> CoreResult<RfbC
                 String::from_utf8_lossy(&text).to_string(),
             ))
         }
-        other => {
-            Ok(RfbClientMessage::Unknown(other, Vec::new()))
-        }
+        other => Ok(RfbClientMessage::Unknown(other, Vec::new())),
     }
 }
 
@@ -648,7 +661,9 @@ async fn read_client_message_async<T: AsyncStreamTransport>(
             transport.read_exact(&mut pad).await?;
             let mut fmt = [0u8; 16];
             transport.read_exact(&mut fmt).await?;
-            Ok(RfbClientMessage::SetPixelFormat(RfbPixelFormat::decode(&fmt)?))
+            Ok(RfbClientMessage::SetPixelFormat(RfbPixelFormat::decode(
+                &fmt,
+            )?))
         }
         2 => {
             let mut pad = [0u8; 1];
@@ -860,7 +875,9 @@ mod tests {
             let _ = server.serve();
         });
 
-        let mut client = RfbClient::connect(&net::NetAddr::from_socket(addr), RfbClientConfig::default()).unwrap();
+        let mut client =
+            RfbClient::connect(&net::NetAddr::from_socket(addr), RfbClientConfig::default())
+                .unwrap();
         client
             .framebuffer_update_request(true, 0, 0, 10, 10)
             .unwrap();

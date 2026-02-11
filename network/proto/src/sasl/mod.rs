@@ -132,7 +132,9 @@ pub struct AsyncSaslServer {
 
 impl AsyncSaslServer {
     pub async fn bind(addr: SocketAddr, config: SaslServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { listener, config })
     }
 
@@ -154,7 +156,11 @@ pub struct SaslClient {
 impl SaslClient {
     pub fn connect(addr: &net::NetAddr, config: SaslClientConfig) -> CoreResult<Self> {
         let mut transport = TcpTransport::connect(addr, config.timeouts)?;
-        let auth = build_plain_message(&config.username, &config.password, config.authzid.as_deref());
+        let auth = build_plain_message(
+            &config.username,
+            &config.password,
+            config.authzid.as_deref(),
+        );
         let first = build_client_first(&config.mechanism, &auth);
         write_frame(&mut transport, &first)?;
         let response = read_frame(&mut transport)?;
@@ -185,7 +191,11 @@ pub struct AsyncSaslClient {
 impl AsyncSaslClient {
     pub async fn connect(addr: &net::NetAddr, config: SaslClientConfig) -> CoreResult<Self> {
         let mut transport = AsyncTcpTransport::connect(addr, config.timeouts).await?;
-        let auth = build_plain_message(&config.username, &config.password, config.authzid.as_deref());
+        let auth = build_plain_message(
+            &config.username,
+            &config.password,
+            config.authzid.as_deref(),
+        );
         let first = build_client_first(&config.mechanism, &auth);
         write_frame_async(&mut transport, &first).await?;
         let response = read_frame_async(&mut transport).await?;
@@ -298,7 +308,10 @@ fn parse_client_first(data: &[u8]) -> CoreResult<(String, Vec<u8>)> {
     if mechanism.is_empty() {
         return Err(CoreError::Parse("sasl mechanism".to_string()));
     }
-    Ok((String::from_utf8_lossy(mechanism).to_string(), initial.to_vec()))
+    Ok((
+        String::from_utf8_lossy(mechanism).to_string(),
+        initial.to_vec(),
+    ))
 }
 
 fn build_plain_message(username: &str, password: &str, authzid: Option<&str>) -> Vec<u8> {

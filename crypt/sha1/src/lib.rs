@@ -1,10 +1,4 @@
-const INIT_STATE: [u32; 5] = [
-    0x67452301,
-    0xEFCDAB89,
-    0x98BADCFE,
-    0x10325476,
-    0xC3D2E1F0,
-];
+const INIT_STATE: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
 
 #[derive(Debug, Clone)]
 pub struct Sha1 {
@@ -43,8 +37,7 @@ impl Sha1 {
                 self.buffer_len = 0;
                 offset = needed;
             } else {
-                self.buffer[self.buffer_len..self.buffer_len + data.len()]
-                    .copy_from_slice(data);
+                self.buffer[self.buffer_len..self.buffer_len + data.len()].copy_from_slice(data);
                 self.buffer_len += data.len();
                 return;
             }
@@ -174,7 +167,10 @@ mod tests {
             ("", "da39a3ee5e6b4b0d3255bfef95601890afd80709"),
             ("abc", "a9993e364706816aba3e25717850c26c9cd0d89d"),
             ("message digest", "c12252ceda8be8994d5fa0290a47231c1d16aae3"),
-            ("abcdefghijklmnopqrstuvwxyz", "32d10c7b8cf96570ca04ce37f2a19d84240d3a89"),
+            (
+                "abcdefghijklmnopqrstuvwxyz",
+                "32d10c7b8cf96570ca04ce37f2a19d84240d3a89",
+            ),
         ];
         for (input, expected) in cases {
             assert_eq!(digest_hex(input.as_bytes()), expected);

@@ -134,9 +134,19 @@ impl AmqpContentHeader {
         }
         let class_id = u16::from_be_bytes([payload[0], payload[1]]);
         let body_size = u64::from_be_bytes([
-            payload[4], payload[5], payload[6], payload[7], payload[8], payload[9], payload[10], payload[11],
+            payload[4],
+            payload[5],
+            payload[6],
+            payload[7],
+            payload[8],
+            payload[9],
+            payload[10],
+            payload[11],
         ]);
-        Ok(Self { class_id, body_size })
+        Ok(Self {
+            class_id,
+            body_size,
+        })
     }
 }
 
@@ -190,9 +200,21 @@ impl AmqpClient {
         }
         let (channel_max, frame_max, heartbeat) = decode_tune(&tune.args)?;
         let tune_ok = method_tune_ok(
-            if self.config.channel_max == 0 { channel_max } else { self.config.channel_max },
-            if self.config.frame_max == 0 { frame_max } else { self.config.frame_max },
-            if self.config.heartbeat == 0 { heartbeat } else { self.config.heartbeat },
+            if self.config.channel_max == 0 {
+                channel_max
+            } else {
+                self.config.channel_max
+            },
+            if self.config.frame_max == 0 {
+                frame_max
+            } else {
+                self.config.frame_max
+            },
+            if self.config.heartbeat == 0 {
+                heartbeat
+            } else {
+                self.config.heartbeat
+            },
         );
         write_method_frame(&mut self.transport, 0, &tune_ok)?;
         let open = method_open(&self.config.vhost);
@@ -228,14 +250,25 @@ impl AmqpClient {
         Ok(())
     }
 
-    pub fn basic_publish(&mut self, channel: u16, exchange: &str, routing_key: &str, body: &[u8]) -> CoreResult<()> {
+    pub fn basic_publish(
+        &mut self,
+        channel: u16,
+        exchange: &str,
+        routing_key: &str,
+        body: &[u8],
+    ) -> CoreResult<()> {
         let method = method_basic_publish(exchange, routing_key);
         write_method_frame(&mut self.transport, channel, &method)?;
         write_content(&mut self.transport, channel, body)?;
         Ok(())
     }
 
-    pub fn basic_consume(&mut self, channel: u16, queue: &str, consumer_tag: &str) -> CoreResult<()> {
+    pub fn basic_consume(
+        &mut self,
+        channel: u16,
+        queue: &str,
+        consumer_tag: &str,
+    ) -> CoreResult<()> {
         let method = method_basic_consume(queue, consumer_tag);
         write_method_frame(&mut self.transport, channel, &method)?;
         let resp = read_method_frame(&mut self.transport)?;
@@ -291,9 +324,21 @@ impl AsyncAmqpClient {
         }
         let (channel_max, frame_max, heartbeat) = decode_tune(&tune.args)?;
         let tune_ok = method_tune_ok(
-            if self.config.channel_max == 0 { channel_max } else { self.config.channel_max },
-            if self.config.frame_max == 0 { frame_max } else { self.config.frame_max },
-            if self.config.heartbeat == 0 { heartbeat } else { self.config.heartbeat },
+            if self.config.channel_max == 0 {
+                channel_max
+            } else {
+                self.config.channel_max
+            },
+            if self.config.frame_max == 0 {
+                frame_max
+            } else {
+                self.config.frame_max
+            },
+            if self.config.heartbeat == 0 {
+                heartbeat
+            } else {
+                self.config.heartbeat
+            },
         );
         write_method_frame_async(&mut self.transport, 0, &tune_ok).await?;
         let open = method_open(&self.config.vhost);
@@ -342,7 +387,12 @@ impl AsyncAmqpClient {
         Ok(())
     }
 
-    pub async fn basic_consume(&mut self, channel: u16, queue: &str, consumer_tag: &str) -> CoreResult<()> {
+    pub async fn basic_consume(
+        &mut self,
+        channel: u16,
+        queue: &str,
+        consumer_tag: &str,
+    ) -> CoreResult<()> {
         let method = method_basic_consume(queue, consumer_tag);
         write_method_frame_async(&mut self.transport, channel, &method).await?;
         let resp = read_method_frame_async(&mut self.transport).await?;
@@ -450,7 +500,11 @@ pub struct AmqpServer {
 }
 
 impl AmqpServer {
-    pub fn bind(addr: SocketAddr, config: AmqpServerConfig, broker: Arc<dyn AmqpBroker>) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        config: AmqpServerConfig,
+        broker: Arc<dyn AmqpBroker>,
+    ) -> CoreResult<Self> {
         let listener = TcpListener::bind(addr).map_err(CoreError::Io)?;
         Ok(Self {
             listener,
@@ -483,8 +537,14 @@ pub struct AsyncAmqpServer {
 }
 
 impl AsyncAmqpServer {
-    pub async fn bind(addr: SocketAddr, config: AmqpServerConfig, broker: Arc<dyn AmqpBroker>) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+    pub async fn bind(
+        addr: SocketAddr,
+        config: AmqpServerConfig,
+        broker: Arc<dyn AmqpBroker>,
+    ) -> CoreResult<Self> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             config,
@@ -504,7 +564,11 @@ impl AsyncAmqpServer {
     }
 }
 
-fn handle_connection(stream: TcpStream, config: AmqpServerConfig, broker: Arc<dyn AmqpBroker>) -> CoreResult<()> {
+fn handle_connection(
+    stream: TcpStream,
+    config: AmqpServerConfig,
+    broker: Arc<dyn AmqpBroker>,
+) -> CoreResult<()> {
     let mut transport = TcpTransport::from_stream(stream, config.timeouts)?;
     let mut header = [0u8; 8];
     transport.read_exact(&mut header)?;
@@ -556,7 +620,11 @@ fn handle_connection(stream: TcpStream, config: AmqpServerConfig, broker: Arc<dy
             } else if method.class_id == CLASS_BASIC && method.method_id == METHOD_BASIC_PUBLISH {
                 let (exchange, routing_key) = decode_basic_publish(&method.args)?;
                 let body = read_content_after_deliver(&mut transport)?;
-                let target = if routing_key.is_empty() { exchange } else { routing_key };
+                let target = if routing_key.is_empty() {
+                    exchange
+                } else {
+                    routing_key
+                };
                 broker.publish(&target, body);
             } else if method.class_id == CLASS_BASIC && method.method_id == METHOD_BASIC_CONSUME {
                 let (queue, consumer_tag) = decode_basic_consume(&method.args)?;
@@ -566,7 +634,9 @@ fn handle_connection(stream: TcpStream, config: AmqpServerConfig, broker: Arc<dy
                 if let Some(payload) = broker.consume(&queue) {
                     send_basic_deliver(&mut transport, frame.channel, &queue, &payload)?;
                 }
-            } else if method.class_id == CLASS_CONNECTION && method.method_id == METHOD_CONNECTION_CLOSE {
+            } else if method.class_id == CLASS_CONNECTION
+                && method.method_id == METHOD_CONNECTION_CLOSE
+            {
                 let resp = AmqpMethod {
                     class_id: CLASS_CONNECTION,
                     method_id: METHOD_CONNECTION_CLOSE_OK,
@@ -643,7 +713,11 @@ async fn handle_connection_async(
             } else if method.class_id == CLASS_BASIC && method.method_id == METHOD_BASIC_PUBLISH {
                 let (exchange, routing_key) = decode_basic_publish(&method.args)?;
                 let body = read_content_after_deliver_async(&mut transport).await?;
-                let target = if routing_key.is_empty() { exchange } else { routing_key };
+                let target = if routing_key.is_empty() {
+                    exchange
+                } else {
+                    routing_key
+                };
                 broker.publish(&target, body);
             } else if method.class_id == CLASS_BASIC && method.method_id == METHOD_BASIC_CONSUME {
                 let (queue, consumer_tag) = decode_basic_consume(&method.args)?;
@@ -651,9 +725,12 @@ async fn handle_connection_async(
                 let resp = method_basic_consume_ok(&consumer_tag);
                 write_method_frame_async(&mut transport, frame.channel, &resp).await?;
                 if let Some(payload) = broker.consume(&queue) {
-                    send_basic_deliver_async(&mut transport, frame.channel, &queue, &payload).await?;
+                    send_basic_deliver_async(&mut transport, frame.channel, &queue, &payload)
+                        .await?;
                 }
-            } else if method.class_id == CLASS_CONNECTION && method.method_id == METHOD_CONNECTION_CLOSE {
+            } else if method.class_id == CLASS_CONNECTION
+                && method.method_id == METHOD_CONNECTION_CLOSE
+            {
                 let resp = AmqpMethod {
                     class_id: CLASS_CONNECTION,
                     method_id: METHOD_CONNECTION_CLOSE_OK,
@@ -664,7 +741,8 @@ async fn handle_connection_async(
             } else {
                 if let Some(queue) = consumers.get(&frame.channel).cloned() {
                     if let Some(payload) = broker.consume(&queue) {
-                        send_basic_deliver_async(&mut transport, frame.channel, &queue, &payload).await?;
+                        send_basic_deliver_async(&mut transport, frame.channel, &queue, &payload)
+                            .await?;
                     }
                 }
             }
@@ -672,7 +750,11 @@ async fn handle_connection_async(
     }
 }
 
-fn write_method_frame(transport: &mut TcpTransport, channel: u16, method: &AmqpMethod) -> CoreResult<()> {
+fn write_method_frame(
+    transport: &mut TcpTransport,
+    channel: u16,
+    method: &AmqpMethod,
+) -> CoreResult<()> {
     let frame = AmqpFrame {
         frame_type: FRAME_METHOD,
         channel,
@@ -793,7 +875,9 @@ fn read_content_after_deliver(transport: &mut TcpTransport) -> CoreResult<Vec<u8
     Ok(body)
 }
 
-async fn read_content_after_deliver_async(transport: &mut AsyncTcpTransport) -> CoreResult<Vec<u8>> {
+async fn read_content_after_deliver_async(
+    transport: &mut AsyncTcpTransport,
+) -> CoreResult<Vec<u8>> {
     let header_frame = read_frame_async(transport).await?;
     if header_frame.frame_type != FRAME_HEADER {
         return Err(CoreError::Parse("expected content header".to_string()));
@@ -1001,7 +1085,12 @@ fn method_basic_consume_ok(consumer_tag: &str) -> AmqpMethod {
     }
 }
 
-fn send_basic_deliver(transport: &mut TcpTransport, channel: u16, routing_key: &str, body: &[u8]) -> CoreResult<()> {
+fn send_basic_deliver(
+    transport: &mut TcpTransport,
+    channel: u16,
+    routing_key: &str,
+    body: &[u8],
+) -> CoreResult<()> {
     let mut args = Vec::new();
     write_shortstr(&mut args, "ctag");
     args.extend_from_slice(&1u64.to_be_bytes());
@@ -1167,7 +1256,8 @@ mod tests {
             let _ = server.serve();
         });
 
-        let mut client = AmqpClient::connect(&NetAddr::from_socket(addr), AmqpClientConfig::default()).unwrap();
+        let mut client =
+            AmqpClient::connect(&NetAddr::from_socket(addr), AmqpClientConfig::default()).unwrap();
         client.handshake().unwrap();
         client.channel_open(1).unwrap();
         client.queue_declare(1, "queue").unwrap();

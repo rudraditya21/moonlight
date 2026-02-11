@@ -6,9 +6,7 @@ use std::thread;
 use corelib::error::{CoreError, CoreResult};
 use net::NetAddr;
 
-use crate::ntlm::{
-    NtlmClient, NtlmClientConfig, NtlmMessage, NtlmServer, NtlmServerConfig,
-};
+use crate::ntlm::{NtlmClient, NtlmClientConfig, NtlmMessage, NtlmServer, NtlmServerConfig};
 use crate::transport::{AsyncStreamTransport, AsyncTcpTransport, StreamTransport, TcpTransport};
 use crate::util::Timeouts;
 
@@ -450,7 +448,12 @@ impl AsyncSmbClient {
         decode_create_response(&resp.body)
     }
 
-    pub async fn read(&mut self, file_id: [u8; 16], offset: u64, length: u32) -> CoreResult<Vec<u8>> {
+    pub async fn read(
+        &mut self,
+        file_id: [u8; 16],
+        offset: u64,
+        length: u32,
+    ) -> CoreResult<Vec<u8>> {
         let msg_id = self.next_id();
         let body = encode_read_request(file_id, offset, length);
         let mut header = Smb2Header::new(SMB2_READ, msg_id);
@@ -655,9 +658,10 @@ impl SmbServer {
         let share = SmbShare::new(&config.share_name);
         let mut ntlm_cfg = NtlmServerConfig::default();
         for (user, pass) in &config.users {
-            ntlm_cfg
-                .credentials
-                .insert(user.to_ascii_uppercase(), crate::ntlm::NtlmSecret::Plaintext(pass.clone()));
+            ntlm_cfg.credentials.insert(
+                user.to_ascii_uppercase(),
+                crate::ntlm::NtlmSecret::Plaintext(pass.clone()),
+            );
         }
         let ntlm = NtlmServer::new(ntlm_cfg);
         Ok(Self {
@@ -695,13 +699,16 @@ pub struct AsyncSmbServer {
 
 impl AsyncSmbServer {
     pub async fn bind(addr: SocketAddr, config: SmbServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         let share = SmbShare::new(&config.share_name);
         let mut ntlm_cfg = NtlmServerConfig::default();
         for (user, pass) in &config.users {
-            ntlm_cfg
-                .credentials
-                .insert(user.to_ascii_uppercase(), crate::ntlm::NtlmSecret::Plaintext(pass.clone()));
+            ntlm_cfg.credentials.insert(
+                user.to_ascii_uppercase(),
+                crate::ntlm::NtlmSecret::Plaintext(pass.clone()),
+            );
         }
         let ntlm = NtlmServer::new(ntlm_cfg);
         Ok(Self {
@@ -735,8 +742,12 @@ fn handle_client(
     loop {
         let data = match read_nbss(&mut transport) {
             Ok(data) => data,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Ok(())
+            }
             Err(err) => return Err(err),
         };
         let packet = Smb2Packet::decode(&data)?;
@@ -757,8 +768,12 @@ async fn handle_client_async(
     loop {
         let data = match read_nbss_async(&mut transport).await {
             Ok(data) => data,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Ok(())
+            }
             Err(err) => return Err(err),
         };
         let packet = Smb2Packet::decode(&data)?;
@@ -868,16 +883,18 @@ fn handle_session_setup(
         NtlmMessage::Negotiate(negotiate) => {
             let challenge = ntlm.challenge(&negotiate);
             let challenge_blob = NtlmMessage::Challenge(challenge.clone()).encode();
-            let mut guard =
-                state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+            let mut guard = state
+                .lock()
+                .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
             let session_id = guard.allocate_session_id();
             guard.pending.insert(session_id, challenge);
             let resp = encode_session_setup_response(&challenge_blob);
             Ok((session_id, resp, STATUS_MORE_PROCESSING_REQUIRED))
         }
         NtlmMessage::Authenticate(auth) => {
-            let mut guard =
-                state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+            let mut guard = state
+                .lock()
+                .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
             let challenge = guard
                 .pending
                 .remove(&session_id)
@@ -894,7 +911,9 @@ fn handle_session_setup(
 fn handle_tree_connect(body: &[u8], state: &Arc<Mutex<SmbState>>) -> CoreResult<u32> {
     let path = decode_tree_connect_request(body)?;
     let share = path.split('\\').last().unwrap_or("");
-    let mut guard = state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+    let mut guard = state
+        .lock()
+        .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
     if share.eq_ignore_ascii_case(&guard.share.name) {
         let tree_id = guard.next_tree;
         guard.next_tree = guard.next_tree.wrapping_add(1);
@@ -906,7 +925,9 @@ fn handle_tree_connect(body: &[u8], state: &Arc<Mutex<SmbState>>) -> CoreResult<
 
 fn handle_create(body: &[u8], state: &Arc<Mutex<SmbState>>) -> CoreResult<([u8; 16], u32)> {
     let path = decode_create_request(body)?;
-    let mut guard = state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+    let mut guard = state
+        .lock()
+        .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
     let file = guard.allocate_file(path.clone());
     guard.share.files.entry(path).or_insert_with(Vec::new);
     Ok((file.id, STATUS_SUCCESS))
@@ -914,9 +935,18 @@ fn handle_create(body: &[u8], state: &Arc<Mutex<SmbState>>) -> CoreResult<([u8; 
 
 fn handle_read(body: &[u8], state: &Arc<Mutex<SmbState>>) -> CoreResult<(Vec<u8>, u32)> {
     let (file_id, offset, length) = decode_read_request(body)?;
-    let guard = state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
-    let file = guard.files.get(&file_id).ok_or_else(|| CoreError::Message("file not found".to_string()))?;
-    let data = guard.share.files.get(&file.path).ok_or_else(|| CoreError::Message("file not found".to_string()))?;
+    let guard = state
+        .lock()
+        .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+    let file = guard
+        .files
+        .get(&file_id)
+        .ok_or_else(|| CoreError::Message("file not found".to_string()))?;
+    let data = guard
+        .share
+        .files
+        .get(&file.path)
+        .ok_or_else(|| CoreError::Message("file not found".to_string()))?;
     let start = offset as usize;
     if start >= data.len() {
         return Ok((Vec::new(), STATUS_SUCCESS));
@@ -927,7 +957,9 @@ fn handle_read(body: &[u8], state: &Arc<Mutex<SmbState>>) -> CoreResult<(Vec<u8>
 
 fn handle_write(body: &[u8], state: &Arc<Mutex<SmbState>>) -> CoreResult<(u32, u32)> {
     let (file_id, offset, data) = decode_write_request(body)?;
-    let mut guard = state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+    let mut guard = state
+        .lock()
+        .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
     let file_path = guard
         .files
         .get(&file_id)
@@ -948,7 +980,9 @@ fn handle_write(body: &[u8], state: &Arc<Mutex<SmbState>>) -> CoreResult<(u32, u
 
 fn handle_close(body: &[u8], state: &Arc<Mutex<SmbState>>) -> CoreResult<u32> {
     let file_id = decode_close_request(body)?;
-    let mut guard = state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+    let mut guard = state
+        .lock()
+        .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
     guard.files.remove(&file_id);
     Ok(STATUS_SUCCESS)
 }
@@ -1008,7 +1042,9 @@ fn encode_session_setup_request(security_blob: &[u8]) -> Vec<u8> {
 
 fn decode_session_setup_request(body: &[u8]) -> CoreResult<(Vec<u8>, u64)> {
     if body.len() < 24 {
-        return Err(CoreError::Parse("session setup request too short".to_string()));
+        return Err(CoreError::Parse(
+            "session setup request too short".to_string(),
+        ));
     }
     let security_offset = u16::from_le_bytes([body[12], body[13]]) as usize;
     let security_len = u16::from_le_bytes([body[14], body[15]]) as usize;
@@ -1038,7 +1074,9 @@ fn encode_session_setup_response(blob: &[u8]) -> Vec<u8> {
 
 fn decode_session_setup_response(body: &[u8]) -> CoreResult<Vec<u8>> {
     if body.len() < 8 {
-        return Err(CoreError::Parse("session setup response too short".to_string()));
+        return Err(CoreError::Parse(
+            "session setup response too short".to_string(),
+        ));
     }
     let offset = u16::from_le_bytes([body[4], body[5]]) as usize;
     let len = u16::from_le_bytes([body[6], body[7]]) as usize;
@@ -1066,7 +1104,9 @@ fn encode_tree_connect_request(path: &str) -> Vec<u8> {
 
 fn decode_tree_connect_request(body: &[u8]) -> CoreResult<String> {
     if body.len() < 8 {
-        return Err(CoreError::Parse("tree connect request too short".to_string()));
+        return Err(CoreError::Parse(
+            "tree connect request too short".to_string(),
+        ));
     }
     let offset = u16::from_le_bytes([body[4], body[5]]) as usize;
     let len = u16::from_le_bytes([body[6], body[7]]) as usize;
@@ -1418,7 +1458,8 @@ mod tests {
             let _ = server.serve();
         });
 
-        let mut client = SmbClient::connect(&NetAddr::from_socket(addr), SmbClientConfig::default()).unwrap();
+        let mut client =
+            SmbClient::connect(&NetAddr::from_socket(addr), SmbClientConfig::default()).unwrap();
         client.negotiate().unwrap();
         let mut ntlm_cfg = NtlmClientConfig::default();
         ntlm_cfg.username = "user".to_string();

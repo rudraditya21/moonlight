@@ -57,8 +57,7 @@ impl Module for HashMd5Module {
         if expected.is_empty() {
             return Ok(ModuleResult::ok(&format!("md5: {}", hash)));
         }
-        let expected = normalize_expected_hex(&expected, 32)
-            .map_err(ModuleError::Execution)?;
+        let expected = normalize_expected_hex(&expected, 32).map_err(ModuleError::Execution)?;
         let ok = expected == hash;
         Ok(ModuleResult::ok(&format!(
             "md5 match: {}",
@@ -100,10 +99,7 @@ mod tests {
     #[test]
     fn md5_module_compute() {
         let mut module = HashMd5Module::new();
-        module
-            .options_mut()
-            .set("INPUT", "abc")
-            .expect("set");
+        module.options_mut().set("INPUT", "abc").expect("set");
         let result = module.run(&ModuleContext { session_id: 1 }).expect("run");
         assert!(result.message.contains("900150983cd24fb0d6963f7d28e17f72"));
     }
@@ -111,10 +107,7 @@ mod tests {
     #[test]
     fn md5_module_verify() {
         let mut module = HashMd5Module::new();
-        module
-            .options_mut()
-            .set("INPUT", "abc")
-            .expect("set");
+        module.options_mut().set("INPUT", "abc").expect("set");
         module
             .options_mut()
             .set("HASH", "900150983cd24fb0d6963f7d28e17f72")

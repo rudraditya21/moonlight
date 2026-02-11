@@ -6,7 +6,10 @@ use std::thread;
 use corelib::error::{CoreError, CoreResult};
 use net::NetAddr;
 
-use crate::transport::{AsyncStreamTransport, AsyncTcpTransport, AsyncUdpTransport, StreamTransport, TcpTransport, UdpTransport};
+use crate::transport::{
+    AsyncStreamTransport, AsyncTcpTransport, AsyncUdpTransport, StreamTransport, TcpTransport,
+    UdpTransport,
+};
 use crate::util::Timeouts;
 
 const RPC_VERSION: u32 = 2;
@@ -105,7 +108,11 @@ impl RpcClient {
         } else {
             let socket = UdpTransport::bind_any()?;
             socket.set_read_timeout(Some(config.timeouts.read))?;
-            let addr = addr.resolve()?.first().copied().ok_or_else(|| CoreError::Parse("no address".to_string()))?;
+            let addr = addr
+                .resolve()?
+                .first()
+                .copied()
+                .ok_or_else(|| CoreError::Parse("no address".to_string()))?;
             Ok(Self {
                 transport: RpcTransport::Udp(socket, addr),
                 xid: 1,
@@ -177,7 +184,11 @@ impl AsyncRpcClient {
             })
         } else {
             let socket = AsyncUdpTransport::bind_any().await?;
-            let addr = addr.resolve()?.first().copied().ok_or_else(|| CoreError::Parse("no address".to_string()))?;
+            let addr = addr
+                .resolve()?
+                .first()
+                .copied()
+                .ok_or_else(|| CoreError::Parse("no address".to_string()))?;
             Ok(Self {
                 transport: AsyncRpcTransport::Udp(socket, addr),
                 xid: 1,
@@ -249,7 +260,11 @@ pub struct RpcServer {
 }
 
 impl RpcServer {
-    pub fn bind(addr: SocketAddr, config: RpcServerConfig, services: HashMap<(u32, u32), Arc<dyn RpcService>>) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        config: RpcServerConfig,
+        services: HashMap<(u32, u32), Arc<dyn RpcService>>,
+    ) -> CoreResult<Self> {
         let listener = TcpListener::bind(addr).map_err(CoreError::Io)?;
         Ok(Self {
             listener,
@@ -282,8 +297,14 @@ pub struct AsyncRpcServer {
 }
 
 impl AsyncRpcServer {
-    pub async fn bind(addr: SocketAddr, config: RpcServerConfig, services: HashMap<(u32, u32), Arc<dyn RpcService>>) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+    pub async fn bind(
+        addr: SocketAddr,
+        config: RpcServerConfig,
+        services: HashMap<(u32, u32), Arc<dyn RpcService>>,
+    ) -> CoreResult<Self> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             services: Arc::new(services),
@@ -309,7 +330,11 @@ pub struct RpcUdpServer {
 }
 
 impl RpcUdpServer {
-    pub fn bind(addr: SocketAddr, config: RpcServerConfig, services: HashMap<(u32, u32), Arc<dyn RpcService>>) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        config: RpcServerConfig,
+        services: HashMap<(u32, u32), Arc<dyn RpcService>>,
+    ) -> CoreResult<Self> {
         let socket = UdpTransport::bind(addr)?;
         socket.set_read_timeout(Some(config.timeouts.read))?;
         Ok(Self {
@@ -340,7 +365,11 @@ pub struct AsyncRpcUdpServer {
 }
 
 impl AsyncRpcUdpServer {
-    pub async fn bind(addr: SocketAddr, _config: RpcServerConfig, services: HashMap<(u32, u32), Arc<dyn RpcService>>) -> CoreResult<Self> {
+    pub async fn bind(
+        addr: SocketAddr,
+        _config: RpcServerConfig,
+        services: HashMap<(u32, u32), Arc<dyn RpcService>>,
+    ) -> CoreResult<Self> {
         let socket = AsyncUdpTransport::bind(addr).await?;
         Ok(Self {
             socket,
@@ -363,12 +392,18 @@ impl AsyncRpcUdpServer {
     }
 }
 
-fn handle_tcp(stream: TcpStream, config: RpcServerConfig, services: Arc<HashMap<(u32, u32), Arc<dyn RpcService>>>) -> CoreResult<()> {
+fn handle_tcp(
+    stream: TcpStream,
+    config: RpcServerConfig,
+    services: Arc<HashMap<(u32, u32), Arc<dyn RpcService>>>,
+) -> CoreResult<()> {
     let mut transport = TcpTransport::from_stream(stream, config.timeouts)?;
     loop {
         let data = match read_record(&mut transport) {
             Ok(data) => data,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
             Err(err) => return Err(err),
         };
         let call = decode_call(&data)?;
@@ -387,7 +422,9 @@ async fn handle_tcp_async(
     loop {
         let data = match read_record_async(&mut transport).await {
             Ok(data) => data,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
             Err(err) => return Err(err),
         };
         let call = decode_call(&data)?;
@@ -657,7 +694,10 @@ impl PortmapRegistry {
     }
 
     pub fn get(&self, program: u32, version: u32, protocol: u32) -> u32 {
-        *self.entries.get(&(program, version, protocol)).unwrap_or(&0)
+        *self
+            .entries
+            .get(&(program, version, protocol))
+            .unwrap_or(&0)
     }
 }
 
@@ -727,7 +767,10 @@ mod tests {
     #[test]
     fn rpc_tcp_roundtrip() {
         let mut services = HashMap::new();
-        services.insert((0x20000001, 1), Arc::new(EchoService) as Arc<dyn RpcService>);
+        services.insert(
+            (0x20000001, 1),
+            Arc::new(EchoService) as Arc<dyn RpcService>,
+        );
         let server = crate::skip_if_perm!(RpcServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             RpcServerConfig::default(),
@@ -737,7 +780,8 @@ mod tests {
         thread::spawn(move || {
             let _ = server.serve();
         });
-        let mut client = RpcClient::connect(&NetAddr::from_socket(addr), RpcClientConfig::default()).unwrap();
+        let mut client =
+            RpcClient::connect(&NetAddr::from_socket(addr), RpcClientConfig::default()).unwrap();
         let payload = xdr_string("hello");
         let response = client.call(0x20000001, 1, 1, &payload).unwrap();
         assert_eq!(response, payload);
@@ -746,7 +790,10 @@ mod tests {
     #[test]
     fn rpc_udp_roundtrip() {
         let mut services = HashMap::new();
-        services.insert((0x20000002, 1), Arc::new(EchoService) as Arc<dyn RpcService>);
+        services.insert(
+            (0x20000002, 1),
+            Arc::new(EchoService) as Arc<dyn RpcService>,
+        );
         let server = crate::skip_if_perm!(RpcUdpServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             RpcServerConfig::default(),
@@ -756,7 +803,14 @@ mod tests {
         thread::spawn(move || {
             let _ = server.serve();
         });
-        let mut client = RpcClient::connect(&NetAddr::from_socket(addr), RpcClientConfig { use_tcp: false, ..Default::default() }).unwrap();
+        let mut client = RpcClient::connect(
+            &NetAddr::from_socket(addr),
+            RpcClientConfig {
+                use_tcp: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let payload = xdr_string("hello");
         let response = client.call(0x20000002, 1, 1, &payload).unwrap();
         assert_eq!(response, payload);
@@ -777,7 +831,8 @@ mod tests {
         thread::spawn(move || {
             let _ = server.serve();
         });
-        let mut client = RpcClient::connect(&NetAddr::from_socket(addr), RpcClientConfig::default()).unwrap();
+        let mut client =
+            RpcClient::connect(&NetAddr::from_socket(addr), RpcClientConfig::default()).unwrap();
         let mut payload = Vec::new();
         xdr_u32(&mut payload, 200);
         xdr_u32(&mut payload, 1);

@@ -119,7 +119,9 @@ pub struct AsyncPjlServer {
 
 impl AsyncPjlServer {
     pub async fn bind(addr: SocketAddr, config: PjlServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { listener, config })
     }
 
@@ -267,7 +269,10 @@ fn handle_pjl_stream(stream: TcpStream, mut config: PjlServerConfig) -> CoreResu
     }
 }
 
-async fn handle_pjl_stream_async(stream: tokio::net::TcpStream, mut config: PjlServerConfig) -> CoreResult<()> {
+async fn handle_pjl_stream_async(
+    stream: tokio::net::TcpStream,
+    mut config: PjlServerConfig,
+) -> CoreResult<()> {
     let mut transport = AsyncTcpTransport::from_stream(stream);
     let mut buffer = Vec::new();
     loop {
@@ -330,7 +335,10 @@ fn handle_command(config: &mut PjlServerConfig, command: &PjlCommand) -> PjlResp
     }
 }
 
-fn read_line<T: StreamTransport>(transport: &mut T, buffer: &mut Vec<u8>) -> CoreResult<Option<String>> {
+fn read_line<T: StreamTransport>(
+    transport: &mut T,
+    buffer: &mut Vec<u8>,
+) -> CoreResult<Option<String>> {
     loop {
         if let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
             let line = buffer.drain(..=pos).collect::<Vec<_>>();
@@ -389,7 +397,9 @@ mod tests {
             let _ = server.serve();
         });
 
-        let mut client = PjlClient::connect(&net::NetAddr::from_socket(addr), PjlClientConfig::default()).unwrap();
+        let mut client =
+            PjlClient::connect(&net::NetAddr::from_socket(addr), PjlClientConfig::default())
+                .unwrap();
         let device = client.info_id().unwrap();
         assert_eq!(device, "Moonlight Printer");
     }

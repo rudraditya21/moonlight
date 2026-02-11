@@ -104,9 +104,11 @@ fn decode_template(data: &[u8], idx: &mut usize) -> CoreResult<CertificateTempla
     }
     let flags = u32::from_be_bytes([data[*idx], data[*idx + 1], data[*idx + 2], data[*idx + 3]]);
     *idx += 4;
-    let validity_days = u32::from_be_bytes([data[*idx], data[*idx + 1], data[*idx + 2], data[*idx + 3]]);
+    let validity_days =
+        u32::from_be_bytes([data[*idx], data[*idx + 1], data[*idx + 2], data[*idx + 3]]);
     *idx += 4;
-    let renewal_days = u32::from_be_bytes([data[*idx], data[*idx + 1], data[*idx + 2], data[*idx + 3]]);
+    let renewal_days =
+        u32::from_be_bytes([data[*idx], data[*idx + 1], data[*idx + 2], data[*idx + 3]]);
     *idx += 4;
     if *idx + 2 > data.len() {
         return Err(CoreError::Parse("ms_crtd template eku count".to_string()));
@@ -207,7 +209,11 @@ pub struct CrtdServer {
 }
 
 impl CrtdServer {
-    pub fn bind(addr: SocketAddr, templates: Vec<CertificateTemplate>, config: CrtdServerConfig) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        templates: Vec<CertificateTemplate>,
+        config: CrtdServerConfig,
+    ) -> CoreResult<Self> {
         let listener = TcpListener::bind(addr).map_err(CoreError::Io)?;
         let mut map = HashMap::new();
         for template in templates {
@@ -244,8 +250,14 @@ pub struct AsyncCrtdServer {
 }
 
 impl AsyncCrtdServer {
-    pub async fn bind(addr: SocketAddr, templates: Vec<CertificateTemplate>, config: CrtdServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+    pub async fn bind(
+        addr: SocketAddr,
+        templates: Vec<CertificateTemplate>,
+        config: CrtdServerConfig,
+    ) -> CoreResult<Self> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         let mut map = HashMap::new();
         for template in templates {
             map.insert(template.name.clone(), template);
@@ -380,7 +392,11 @@ fn send_auth(transport: &mut TcpTransport, user: &str, pass: &str) -> CoreResult
     Ok(())
 }
 
-async fn send_auth_async(transport: &mut AsyncTcpTransport, user: &str, pass: &str) -> CoreResult<()> {
+async fn send_auth_async(
+    transport: &mut AsyncTcpTransport,
+    user: &str,
+    pass: &str,
+) -> CoreResult<()> {
     let mut payload = Vec::new();
     encode_string(&mut payload, user);
     encode_string(&mut payload, pass);
@@ -467,7 +483,9 @@ fn handle_crtd_message(
         CrtdMessageType::GetTemplate => {
             let mut idx = 0;
             let name = decode_string(&msg.payload, &mut idx)?;
-            let template = templates.get(&name).ok_or_else(|| CoreError::Message("template not found".to_string()))?;
+            let template = templates
+                .get(&name)
+                .ok_or_else(|| CoreError::Message("template not found".to_string()))?;
             Ok(CrtdMessage {
                 msg_type: CrtdMessageType::Response,
                 payload: encode_template(template),
@@ -479,7 +497,8 @@ fn handle_crtd_message(
             if idx + 4 > msg.payload.len() {
                 return Err(CoreError::Parse("ms_crtd csr len".to_string()));
             }
-            let csr_len = u32::from_be_bytes(msg.payload[idx..idx + 4].try_into().unwrap()) as usize;
+            let csr_len =
+                u32::from_be_bytes(msg.payload[idx..idx + 4].try_into().unwrap()) as usize;
             idx += 4;
             if idx + csr_len > msg.payload.len() {
                 return Err(CoreError::Parse("ms_crtd csr bounds".to_string()));
@@ -488,7 +507,9 @@ fn handle_crtd_message(
             if csr.is_empty() {
                 return Err(CoreError::Message("empty csr".to_string()));
             }
-            let template = templates.get(&template_name).ok_or_else(|| CoreError::Message("template not found".to_string()))?;
+            let template = templates
+                .get(&template_name)
+                .ok_or_else(|| CoreError::Message("template not found".to_string()))?;
             let cert = issue_certificate(template, &csr);
             Ok(CrtdMessage {
                 msg_type: CrtdMessageType::Response,
@@ -582,12 +603,17 @@ fn write_message<T: StreamTransport>(transport: &mut T, msg: &CrtdMessage) -> Co
     transport.write_all(&msg.encode())
 }
 
-async fn write_message_async<T: AsyncStreamTransport>(transport: &mut T, msg: &CrtdMessage) -> CoreResult<()> {
+async fn write_message_async<T: AsyncStreamTransport>(
+    transport: &mut T,
+    msg: &CrtdMessage,
+) -> CoreResult<()> {
     transport.write_all(&msg.encode()).await
 }
 
 fn current_timestamp() -> u64 {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     now.as_secs()
 }
 
@@ -613,7 +639,11 @@ mod tests {
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 
-        let mut client = CrtdClient::connect(&net::NetAddr::from_socket(addr), CrtdClientConfig::default()).unwrap();
+        let mut client = CrtdClient::connect(
+            &net::NetAddr::from_socket(addr),
+            CrtdClientConfig::default(),
+        )
+        .unwrap();
         let templates = client.list_templates().unwrap();
         assert_eq!(templates.len(), 1);
 

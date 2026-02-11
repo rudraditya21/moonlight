@@ -57,8 +57,7 @@ impl Module for HashSha256Module {
         if expected.is_empty() {
             return Ok(ModuleResult::ok(&format!("sha256: {}", hash)));
         }
-        let expected = normalize_expected_hex(&expected, 64)
-            .map_err(ModuleError::Execution)?;
+        let expected = normalize_expected_hex(&expected, 64).map_err(ModuleError::Execution)?;
         let ok = expected == hash;
         Ok(ModuleResult::ok(&format!(
             "sha256 match: {}",
@@ -100,11 +99,10 @@ mod tests {
     #[test]
     fn sha256_module_compute() {
         let mut module = HashSha256Module::new();
-        module
-            .options_mut()
-            .set("INPUT", "abc")
-            .expect("set");
+        module.options_mut().set("INPUT", "abc").expect("set");
         let result = module.run(&ModuleContext { session_id: 1 }).expect("run");
-        assert!(result.message.contains("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+        assert!(result
+            .message
+            .contains("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
     }
 }

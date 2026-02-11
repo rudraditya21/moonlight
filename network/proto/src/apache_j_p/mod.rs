@@ -122,7 +122,11 @@ impl AjpClient {
         Ok(Self { transport })
     }
 
-    pub fn request(&mut self, request: &AjpRequest, body: Option<&[u8]>) -> CoreResult<AjpResponse> {
+    pub fn request(
+        &mut self,
+        request: &AjpRequest,
+        body: Option<&[u8]>,
+    ) -> CoreResult<AjpResponse> {
         let packet = encode_forward_request(request)?;
         write_packet(&mut self.transport, &packet)?;
         if let Some(payload) = body {
@@ -142,7 +146,11 @@ impl AsyncAjpClient {
         Ok(Self { transport })
     }
 
-    pub async fn request(&mut self, request: &AjpRequest, body: Option<&[u8]>) -> CoreResult<AjpResponse> {
+    pub async fn request(
+        &mut self,
+        request: &AjpRequest,
+        body: Option<&[u8]>,
+    ) -> CoreResult<AjpResponse> {
         let packet = encode_forward_request(request)?;
         write_packet_async(&mut self.transport, &packet).await?;
         if let Some(payload) = body {
@@ -195,7 +203,11 @@ pub struct AjpServer {
 }
 
 impl AjpServer {
-    pub fn bind(addr: SocketAddr, config: AjpServerConfig, handler: Arc<dyn AjpHandler>) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        config: AjpServerConfig,
+        handler: Arc<dyn AjpHandler>,
+    ) -> CoreResult<Self> {
         let listener = TcpListener::bind(addr).map_err(CoreError::Io)?;
         Ok(Self {
             listener,
@@ -228,8 +240,14 @@ pub struct AsyncAjpServer {
 }
 
 impl AsyncAjpServer {
-    pub async fn bind(addr: SocketAddr, config: AjpServerConfig, handler: Arc<dyn AjpHandler>) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+    pub async fn bind(
+        addr: SocketAddr,
+        config: AjpServerConfig,
+        handler: Arc<dyn AjpHandler>,
+    ) -> CoreResult<Self> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             config,
@@ -249,16 +267,25 @@ impl AsyncAjpServer {
     }
 }
 
-fn handle_connection(stream: TcpStream, config: AjpServerConfig, handler: Arc<dyn AjpHandler>) -> CoreResult<()> {
+fn handle_connection(
+    stream: TcpStream,
+    config: AjpServerConfig,
+    handler: Arc<dyn AjpHandler>,
+) -> CoreResult<()> {
     let mut transport = TcpTransport::from_stream(stream, config.timeouts)?;
     loop {
         let payload = match read_packet(&mut transport) {
             Ok(payload) => payload,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
             Err(err) => return Err(err),
         };
         let (request, mut body) = decode_forward_request(&payload)?;
-        if let Some(length) = request.header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+        if let Some(length) = request
+            .header("content-length")
+            .and_then(|v| v.parse::<usize>().ok())
+        {
             body = read_body(&mut transport, length, config.max_body_size)?;
         }
         let response = handler.handle(request, body)?;
@@ -275,11 +302,16 @@ async fn handle_connection_async(
     loop {
         let payload = match read_packet_async(&mut transport).await {
             Ok(payload) => payload,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
             Err(err) => return Err(err),
         };
         let (request, mut body) = decode_forward_request(&payload)?;
-        if let Some(length) = request.header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+        if let Some(length) = request
+            .header("content-length")
+            .and_then(|v| v.parse::<usize>().ok())
+        {
             body = read_body_async(&mut transport, length, config.max_body_size).await?;
         }
         let response = handler.handle(request, body)?;
@@ -385,7 +417,10 @@ fn write_response(transport: &mut TcpTransport, response: AjpResponse) -> CoreRe
     Ok(())
 }
 
-async fn write_response_async(transport: &mut AsyncTcpTransport, response: AjpResponse) -> CoreResult<()> {
+async fn write_response_async(
+    transport: &mut AsyncTcpTransport,
+    response: AjpResponse,
+) -> CoreResult<()> {
     let headers_packet = encode_send_headers(&response)?;
     write_packet_async(transport, &headers_packet).await?;
     if !response.body.is_empty() {
@@ -541,7 +576,11 @@ async fn read_body_async(
     let mut remaining = length;
     while remaining > 0 {
         let request_len = remaining.min(8186) as u16;
-        let request = vec![GET_BODY_CHUNK, request_len.to_be_bytes()[0], request_len.to_be_bytes()[1]];
+        let request = vec![
+            GET_BODY_CHUNK,
+            request_len.to_be_bytes()[0],
+            request_len.to_be_bytes()[1],
+        ];
         write_packet_async(transport, &request).await?;
         let payload = read_packet_async(transport).await?;
         if payload.first().copied().unwrap_or(0) != CLIENT_TO_SERVER_BODY {
@@ -758,7 +797,10 @@ impl<'a> Cursor<'a> {
         if self.pos + 2 > self.buf.len() {
             return Err(CoreError::Parse("cursor eof".to_string()));
         }
-        Ok(u16::from_be_bytes([self.buf[self.pos], self.buf[self.pos + 1]]))
+        Ok(u16::from_be_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+        ]))
     }
 }
 
@@ -769,7 +811,11 @@ mod tests {
 
     #[test]
     fn ajp_roundtrip() {
-        let handler = Arc::new(StaticAjpHandler::new(AjpResponse::new(200, "OK", b"hello".to_vec())));
+        let handler = Arc::new(StaticAjpHandler::new(AjpResponse::new(
+            200,
+            "OK",
+            b"hello".to_vec(),
+        )));
         let server = crate::skip_if_perm!(AjpServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             AjpServerConfig::default(),
@@ -780,7 +826,8 @@ mod tests {
             let _ = server.serve();
         });
 
-        let mut client = AjpClient::connect(&NetAddr::from_socket(addr), AjpClientConfig::default()).unwrap();
+        let mut client =
+            AjpClient::connect(&NetAddr::from_socket(addr), AjpClientConfig::default()).unwrap();
         let request = AjpRequest::new(AjpMethod::Get, "/");
         let response = client.request(&request, None).unwrap();
         assert_eq!(response.status, 200);

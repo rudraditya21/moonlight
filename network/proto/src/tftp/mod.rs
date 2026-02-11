@@ -353,7 +353,8 @@ impl TftpClient {
         let mut expected_block = 1u16;
         let mut resend = request_bytes.clone();
         loop {
-            let (packet, source) = recv_with_retry(&socket, &resend, server_addr, self.config.retries)?;
+            let (packet, source) =
+                recv_with_retry(&socket, &resend, server_addr, self.config.retries)?;
             server_addr = source;
             match packet {
                 TftpPacket::OptionAck { options: oack } => {
@@ -455,7 +456,12 @@ impl TftpClient {
                 match recv_with_timeout(&socket) {
                     Ok((packet, addr)) => {
                         if addr != server_addr {
-                            send_error(&socket, addr, TftpErrorCode::UnknownTransferId, "unknown transfer")?;
+                            send_error(
+                                &socket,
+                                addr,
+                                TftpErrorCode::UnknownTransferId,
+                                "unknown transfer",
+                            )?;
                             continue;
                         }
                         match packet {
@@ -529,9 +535,14 @@ impl AsyncTftpClient {
         let mut expected_block = 1u16;
         let mut resend = request_bytes.clone();
         loop {
-            let (packet, source) =
-                recv_with_retry_async(&socket, &resend, server_addr, self.config.retries, self.config.timeouts.read)
-                    .await?;
+            let (packet, source) = recv_with_retry_async(
+                &socket,
+                &resend,
+                server_addr,
+                self.config.retries,
+                self.config.timeouts.read,
+            )
+            .await?;
             server_addr = source;
             match packet {
                 TftpPacket::OptionAck { options: oack } => {
@@ -586,8 +597,14 @@ impl AsyncTftpClient {
         let socket = AsyncUdpTransport::bind_any().await?;
         let request_bytes = request.encode()?;
         socket.send_to(&request_bytes, addr).await?;
-        let (packet, server_addr) =
-            recv_with_retry_async(&socket, &request_bytes, addr, self.config.retries, self.config.timeouts.read).await?;
+        let (packet, server_addr) = recv_with_retry_async(
+            &socket,
+            &request_bytes,
+            addr,
+            self.config.retries,
+            self.config.timeouts.read,
+        )
+        .await?;
         let mut blksize = self.config.blksize;
         match packet {
             TftpPacket::OptionAck { options: oack } => {
@@ -620,7 +637,13 @@ impl AsyncTftpClient {
                 match recv_with_timeout_async(&socket, self.config.timeouts.read).await {
                     Ok((packet, addr)) => {
                         if addr != server_addr {
-                            let _ = send_error_async(&socket, addr, TftpErrorCode::UnknownTransferId, "unknown transfer").await;
+                            let _ = send_error_async(
+                                &socket,
+                                addr,
+                                TftpErrorCode::UnknownTransferId,
+                                "unknown transfer",
+                            )
+                            .await;
                             continue;
                         }
                         match packet {
@@ -736,7 +759,11 @@ pub struct TftpServer {
 }
 
 impl TftpServer {
-    pub fn bind(addr: SocketAddr, config: TftpServerConfig, backend: Arc<dyn TftpBackend>) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        config: TftpServerConfig,
+        backend: Arc<dyn TftpBackend>,
+    ) -> CoreResult<Self> {
         let socket = UdpTransport::bind(addr)?;
         socket.set_read_timeout(Some(config.timeouts.read))?;
         Ok(Self {
@@ -756,7 +783,12 @@ impl TftpServer {
             let packet = match TftpPacket::decode(&data) {
                 Ok(packet) => packet,
                 Err(_) => {
-                    let _ = send_error(&self.socket, addr, TftpErrorCode::IllegalOperation, "invalid packet");
+                    let _ = send_error(
+                        &self.socket,
+                        addr,
+                        TftpErrorCode::IllegalOperation,
+                        "invalid packet",
+                    );
                     continue;
                 }
             };
@@ -776,7 +808,11 @@ pub struct AsyncTftpServer {
 }
 
 impl AsyncTftpServer {
-    pub async fn bind(addr: SocketAddr, config: TftpServerConfig, backend: Arc<dyn TftpBackend>) -> CoreResult<Self> {
+    pub async fn bind(
+        addr: SocketAddr,
+        config: TftpServerConfig,
+        backend: Arc<dyn TftpBackend>,
+    ) -> CoreResult<Self> {
         let socket = AsyncUdpTransport::bind(addr).await?;
         Ok(Self {
             socket,
@@ -791,7 +827,13 @@ impl AsyncTftpServer {
             let packet = match TftpPacket::decode(&data) {
                 Ok(packet) => packet,
                 Err(_) => {
-                    let _ = send_error_async(&self.socket, addr, TftpErrorCode::IllegalOperation, "invalid packet").await;
+                    let _ = send_error_async(
+                        &self.socket,
+                        addr,
+                        TftpErrorCode::IllegalOperation,
+                        "invalid packet",
+                    )
+                    .await;
                     continue;
                 }
             };
@@ -828,7 +870,12 @@ fn handle_request(
             options,
         } => handle_wrq(socket, addr, backend, config, filename, mode, options),
         _ => {
-            send_error(&socket, addr, TftpErrorCode::IllegalOperation, "unexpected packet")?;
+            send_error(
+                &socket,
+                addr,
+                TftpErrorCode::IllegalOperation,
+                "unexpected packet",
+            )?;
             Ok(())
         }
     }
@@ -853,7 +900,13 @@ async fn handle_request_async(
             options,
         } => handle_wrq_async(socket, addr, backend, config, filename, mode, options).await,
         _ => {
-            send_error_async(&socket, addr, TftpErrorCode::IllegalOperation, "unexpected packet").await?;
+            send_error_async(
+                &socket,
+                addr,
+                TftpErrorCode::IllegalOperation,
+                "unexpected packet",
+            )
+            .await?;
             Ok(())
         }
     }
@@ -874,7 +927,12 @@ fn handle_rrq(
     })?;
     if mode == TftpMode::NetAscii {
         if !config.allow_netascii {
-            send_error(&socket, addr, TftpErrorCode::IllegalOperation, "netascii disabled")?;
+            send_error(
+                &socket,
+                addr,
+                TftpErrorCode::IllegalOperation,
+                "netascii disabled",
+            )?;
             return Ok(());
         }
         data = to_netascii(&data);
@@ -906,7 +964,12 @@ fn handle_rrq(
             match recv_with_timeout(&socket) {
                 Ok((resp, peer)) => {
                     if peer != addr {
-                        let _ = send_error(&socket, peer, TftpErrorCode::UnknownTransferId, "unknown transfer");
+                        let _ = send_error(
+                            &socket,
+                            peer,
+                            TftpErrorCode::UnknownTransferId,
+                            "unknown transfer",
+                        );
                         continue;
                     }
                     match resp {
@@ -948,10 +1011,16 @@ fn handle_wrq(
     options: TftpOptions,
 ) -> CoreResult<()> {
     if mode == TftpMode::NetAscii && !config.allow_netascii {
-        send_error(&socket, addr, TftpErrorCode::IllegalOperation, "netascii disabled")?;
+        send_error(
+            &socket,
+            addr,
+            TftpErrorCode::IllegalOperation,
+            "netascii disabled",
+        )?;
         return Ok(());
     }
-    let (oack, mut blksize, timeout) = negotiate_options(&options, &config, options.tsize.unwrap_or(0));
+    let (oack, mut blksize, timeout) =
+        negotiate_options(&options, &config, options.tsize.unwrap_or(0));
     if let Some(value) = timeout {
         socket.set_read_timeout(Some(Duration::from_secs(value as u64)))?;
     }
@@ -989,7 +1058,12 @@ fn handle_wrq(
             }
         };
         if peer != addr {
-            let _ = send_error(&socket, peer, TftpErrorCode::UnknownTransferId, "unknown transfer");
+            let _ = send_error(
+                &socket,
+                peer,
+                TftpErrorCode::UnknownTransferId,
+                "unknown transfer",
+            );
             continue;
         }
         match packet {
@@ -1030,12 +1104,18 @@ async fn handle_rrq_async(
     mode: TftpMode,
     options: TftpOptions,
 ) -> CoreResult<()> {
-    let mut data = backend.read(&filename).map_err(|_| {
-        CoreError::Message("file not found".to_string())
-    })?;
+    let mut data = backend
+        .read(&filename)
+        .map_err(|_| CoreError::Message("file not found".to_string()))?;
     if mode == TftpMode::NetAscii {
         if !config.allow_netascii {
-            let _ = send_error_async(&socket, addr, TftpErrorCode::IllegalOperation, "netascii disabled").await;
+            let _ = send_error_async(
+                &socket,
+                addr,
+                TftpErrorCode::IllegalOperation,
+                "netascii disabled",
+            )
+            .await;
             return Ok(());
         }
         data = to_netascii(&data);
@@ -1064,7 +1144,13 @@ async fn handle_rrq_async(
             match recv_with_timeout_async(&socket, config.timeouts.read).await {
                 Ok((resp, peer)) => {
                     if peer != addr {
-                        let _ = send_error_async(&socket, peer, TftpErrorCode::UnknownTransferId, "unknown transfer").await;
+                        let _ = send_error_async(
+                            &socket,
+                            peer,
+                            TftpErrorCode::UnknownTransferId,
+                            "unknown transfer",
+                        )
+                        .await;
                         continue;
                     }
                     match resp {
@@ -1106,10 +1192,17 @@ async fn handle_wrq_async(
     options: TftpOptions,
 ) -> CoreResult<()> {
     if mode == TftpMode::NetAscii && !config.allow_netascii {
-        let _ = send_error_async(&socket, addr, TftpErrorCode::IllegalOperation, "netascii disabled").await;
+        let _ = send_error_async(
+            &socket,
+            addr,
+            TftpErrorCode::IllegalOperation,
+            "netascii disabled",
+        )
+        .await;
         return Ok(());
     }
-    let (oack, mut blksize, _timeout) = negotiate_options(&options, &config, options.tsize.unwrap_or(0));
+    let (oack, mut blksize, _timeout) =
+        negotiate_options(&options, &config, options.tsize.unwrap_or(0));
     let mut last_ack = if !oack.is_empty() {
         let packet = TftpPacket::OptionAck { options: oack }.encode()?;
         socket.send_to(&packet, addr).await?;
@@ -1144,7 +1237,13 @@ async fn handle_wrq_async(
             }
         };
         if peer != addr {
-            let _ = send_error_async(&socket, peer, TftpErrorCode::UnknownTransferId, "unknown transfer").await;
+            let _ = send_error_async(
+                &socket,
+                peer,
+                TftpErrorCode::UnknownTransferId,
+                "unknown transfer",
+            )
+            .await;
             continue;
         }
         match packet {
@@ -1279,7 +1378,12 @@ async fn recv_with_timeout_async(
     Ok((packet, addr))
 }
 
-fn send_error(socket: &UdpTransport, addr: SocketAddr, code: TftpErrorCode, message: &str) -> CoreResult<()> {
+fn send_error(
+    socket: &UdpTransport,
+    addr: SocketAddr,
+    code: TftpErrorCode,
+    message: &str,
+) -> CoreResult<()> {
     let packet = TftpPacket::Error {
         code,
         message: message.to_string(),
@@ -1427,9 +1531,8 @@ mod tests {
 
     #[test]
     fn client_server_rrq() {
-        let backend = Arc::new(
-            InMemoryTftpBackend::default().with_file("hello.txt", b"hello".to_vec()),
-        );
+        let backend =
+            Arc::new(InMemoryTftpBackend::default().with_file("hello.txt", b"hello".to_vec()));
         let server = crate::skip_if_perm!(TftpServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             TftpServerConfig::default(),

@@ -100,7 +100,9 @@ impl AdbPacket {
 }
 
 fn adb_checksum(payload: &[u8]) -> u32 {
-    payload.iter().fold(0u32, |acc, &b| acc.wrapping_add(b as u32))
+    payload
+        .iter()
+        .fold(0u32, |acc, &b| acc.wrapping_add(b as u32))
 }
 
 #[derive(Debug, Clone)]
@@ -300,7 +302,11 @@ pub struct AdbServer {
 }
 
 impl AdbServer {
-    pub fn bind(addr: SocketAddr, config: AdbServerConfig, handler: Arc<dyn AdbServiceHandler>) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        config: AdbServerConfig,
+        handler: Arc<dyn AdbServiceHandler>,
+    ) -> CoreResult<Self> {
         let listener = TcpListener::bind(addr).map_err(CoreError::Io)?;
         Ok(Self {
             listener,
@@ -333,8 +339,14 @@ pub struct AsyncAdbServer {
 }
 
 impl AsyncAdbServer {
-    pub async fn bind(addr: SocketAddr, config: AdbServerConfig, handler: Arc<dyn AdbServiceHandler>) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+    pub async fn bind(
+        addr: SocketAddr,
+        config: AdbServerConfig,
+        handler: Arc<dyn AdbServiceHandler>,
+    ) -> CoreResult<Self> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             config,
@@ -361,7 +373,11 @@ struct ChannelState {
     remote_id: u32,
 }
 
-fn handle_adb_stream(stream: TcpStream, config: AdbServerConfig, handler: Arc<dyn AdbServiceHandler>) -> CoreResult<()> {
+fn handle_adb_stream(
+    stream: TcpStream,
+    config: AdbServerConfig,
+    handler: Arc<dyn AdbServiceHandler>,
+) -> CoreResult<()> {
     let mut transport = TcpTransport::from_stream(stream, config.timeouts)?;
     let cnxn = read_packet(&mut transport)?;
     if cnxn.command != AdbCommand::Cnxn {
@@ -549,7 +565,10 @@ fn write_packet<T: StreamTransport>(transport: &mut T, packet: &AdbPacket) -> Co
     transport.write_all(&packet.encode())
 }
 
-async fn write_packet_async<T: AsyncStreamTransport>(transport: &mut T, packet: &AdbPacket) -> CoreResult<()> {
+async fn write_packet_async<T: AsyncStreamTransport>(
+    transport: &mut T,
+    packet: &AdbPacket,
+) -> CoreResult<()> {
     transport.write_all(&packet.encode()).await
 }
 
@@ -567,7 +586,8 @@ mod tests {
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 
-        let mut client = AdbClient::connect(&NetAddr::from_socket(addr), AdbClientConfig::default()).unwrap();
+        let mut client =
+            AdbClient::connect(&NetAddr::from_socket(addr), AdbClientConfig::default()).unwrap();
         client.open("shell:echo").unwrap();
         let response = client.write(b"ping").unwrap();
         assert_eq!(response, b"ping".to_vec());

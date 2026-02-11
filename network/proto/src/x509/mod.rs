@@ -41,7 +41,11 @@ pub fn parse_certificate(der: &[u8]) -> CoreResult<X509Certificate> {
     let tbs = cert_reader.read_tag(0x30)?;
     let sig_alg = cert_reader.read_tag(0x30)?;
     let signature = cert_reader.read_tag(0x03)?;
-    let signature = if signature.is_empty() { Vec::new() } else { signature[1..].to_vec() };
+    let signature = if signature.is_empty() {
+        Vec::new()
+    } else {
+        signature[1..].to_vec()
+    };
     let mut tbs_reader = DerReader::new(&tbs);
     let version = if tbs_reader.peek_tag() == Some(0xA0) {
         let version_bytes = tbs_reader.read_tag(0xA0)?;
@@ -114,7 +118,11 @@ fn parse_spki(bytes: &[u8]) -> CoreResult<(String, Vec<u8>)> {
     let alg = reader.read_tag(0x30)?;
     let alg_oid = parse_algorithm_oid(&alg)?;
     let bitstring = reader.read_tag(0x03)?;
-    let key = if bitstring.is_empty() { Vec::new() } else { bitstring[1..].to_vec() };
+    let key = if bitstring.is_empty() {
+        Vec::new()
+    } else {
+        bitstring[1..].to_vec()
+    };
     Ok((alg_oid, key))
 }
 
@@ -333,7 +341,9 @@ pub struct AsyncX509Server {
 
 impl AsyncX509Server {
     pub async fn bind(addr: SocketAddr, config: X509ServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { listener, config })
     }
 
@@ -376,7 +386,10 @@ fn handle_connection(transport: &mut TcpTransport, cert: Vec<u8>) -> CoreResult<
     }
 }
 
-async fn handle_connection_async(transport: &mut AsyncTcpTransport, cert: Vec<u8>) -> CoreResult<()> {
+async fn handle_connection_async(
+    transport: &mut AsyncTcpTransport,
+    cert: Vec<u8>,
+) -> CoreResult<()> {
     loop {
         let payload = match read_response_async(transport).await {
             Ok(payload) => payload,
@@ -441,7 +454,9 @@ fn decode_response(data: &[u8]) -> CoreResult<Vec<u8>> {
     }
     let len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
     if data.len() < 5 + len {
-        return Err(CoreError::Parse("x509 response length mismatch".to_string()));
+        return Err(CoreError::Parse(
+            "x509 response length mismatch".to_string(),
+        ));
     }
     Ok(data[5..5 + len].to_vec())
 }
@@ -477,7 +492,10 @@ fn format_name(name: &X509Name) -> String {
 }
 
 fn hex(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+    data.iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 #[cfg(test)]
@@ -527,14 +545,46 @@ mod tests {
     fn build_test_cert() -> Vec<u8> {
         let version = der_tag(0xA0, &der_int(&[0x02]));
         let serial = der_int(&[0x01]);
-        let sig_alg = der_seq(&[der_oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B]), der_null()].concat());
-        let name = der_seq(&[der_set(&der_seq(&[der_oid(&[0x55, 0x04, 0x03]), der_utf8("Test")].concat()))].concat());
-        let validity = der_seq(&[der_utctime("240101000000Z"), der_utctime("250101000000Z")].concat());
-        let spki = der_seq(
-            &[der_seq(&[der_oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]), der_null()].concat()),
-              der_tag(0x03, &[0x00, 0x01, 0x02, 0x03])].concat(),
+        let sig_alg = der_seq(
+            &[
+                der_oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B]),
+                der_null(),
+            ]
+            .concat(),
         );
-        let tbs = der_seq(&[version, serial, sig_alg.clone(), name.clone(), validity, name, spki].concat());
+        let name = der_seq(
+            &[der_set(&der_seq(
+                &[der_oid(&[0x55, 0x04, 0x03]), der_utf8("Test")].concat(),
+            ))]
+            .concat(),
+        );
+        let validity =
+            der_seq(&[der_utctime("240101000000Z"), der_utctime("250101000000Z")].concat());
+        let spki = der_seq(
+            &[
+                der_seq(
+                    &[
+                        der_oid(&[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]),
+                        der_null(),
+                    ]
+                    .concat(),
+                ),
+                der_tag(0x03, &[0x00, 0x01, 0x02, 0x03]),
+            ]
+            .concat(),
+        );
+        let tbs = der_seq(
+            &[
+                version,
+                serial,
+                sig_alg.clone(),
+                name.clone(),
+                validity,
+                name,
+                spki,
+            ]
+            .concat(),
+        );
         let sig_val = der_tag(0x03, &[0x00, 0xAA, 0xBB, 0xCC]);
         der_seq(&[tbs, sig_alg, sig_val].concat())
     }
@@ -561,7 +611,8 @@ mod tests {
         thread::spawn(move || {
             let _ = server.serve();
         });
-        let mut client = X509Client::connect(&NetAddr::from_socket(addr), X509ClientConfig::default()).unwrap();
+        let mut client =
+            X509Client::connect(&NetAddr::from_socket(addr), X509ClientConfig::default()).unwrap();
         let received = client.get_certificate().unwrap();
         assert_eq!(received, cert);
         let summary = client.parse_remote(&cert).unwrap();

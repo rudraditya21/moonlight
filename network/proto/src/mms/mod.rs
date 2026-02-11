@@ -95,7 +95,10 @@ impl MmsDescription {
             .ok_or_else(|| CoreError::Parse("mms description missing length".to_string()))?
             .parse::<usize>()
             .map_err(|_| CoreError::Parse("mms description length invalid".to_string()))?;
-        Ok(Self { content_type, length })
+        Ok(Self {
+            content_type,
+            length,
+        })
     }
 }
 
@@ -165,7 +168,11 @@ pub struct MmsServer {
 }
 
 impl MmsServer {
-    pub fn bind(addr: SocketAddr, handler: Arc<dyn MmsHandler>, config: MmsServerConfig) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        handler: Arc<dyn MmsHandler>,
+        config: MmsServerConfig,
+    ) -> CoreResult<Self> {
         let listener = TcpListener::bind(addr).map_err(CoreError::Io)?;
         Ok(Self {
             listener,
@@ -198,8 +205,14 @@ pub struct AsyncMmsServer {
 }
 
 impl AsyncMmsServer {
-    pub async fn bind(addr: SocketAddr, handler: Arc<dyn MmsHandler>, config: MmsServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+    pub async fn bind(
+        addr: SocketAddr,
+        handler: Arc<dyn MmsHandler>,
+        config: MmsServerConfig,
+    ) -> CoreResult<Self> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             handler,
@@ -246,7 +259,11 @@ pub struct MmsClient {
 }
 
 impl MmsClient {
-    pub fn connect(addr: &net::NetAddr, path: impl Into<String>, config: MmsClientConfig) -> CoreResult<Self> {
+    pub fn connect(
+        addr: &net::NetAddr,
+        path: impl Into<String>,
+        config: MmsClientConfig,
+    ) -> CoreResult<Self> {
         let transport = TcpTransport::connect(addr, config.timeouts)?;
         let mut client = Self {
             transport,
@@ -335,7 +352,11 @@ pub struct AsyncMmsClient {
 }
 
 impl AsyncMmsClient {
-    pub async fn connect(addr: &net::NetAddr, path: impl Into<String>, config: MmsClientConfig) -> CoreResult<Self> {
+    pub async fn connect(
+        addr: &net::NetAddr,
+        path: impl Into<String>,
+        config: MmsClientConfig,
+    ) -> CoreResult<Self> {
         let transport = AsyncTcpTransport::connect(addr, config.timeouts).await?;
         let mut client = Self {
             transport,
@@ -416,7 +437,11 @@ impl AsyncMmsClient {
     }
 }
 
-fn handle_mms_stream(stream: TcpStream, handler: Arc<dyn MmsHandler>, config: MmsServerConfig) -> CoreResult<()> {
+fn handle_mms_stream(
+    stream: TcpStream,
+    handler: Arc<dyn MmsHandler>,
+    config: MmsServerConfig,
+) -> CoreResult<()> {
     let mut transport = TcpTransport::from_stream(stream, config.timeouts)?;
     let hello = read_frame(&mut transport)?;
     if hello.command != MmsCommand::Hello {
@@ -538,7 +563,11 @@ fn send_error(transport: &mut TcpTransport, stream_id: u32, message: &str) -> Co
     write_frame(transport, &frame)
 }
 
-async fn send_ok_async(transport: &mut AsyncTcpTransport, stream_id: u32, payload: &[u8]) -> CoreResult<()> {
+async fn send_ok_async(
+    transport: &mut AsyncTcpTransport,
+    stream_id: u32,
+    payload: &[u8],
+) -> CoreResult<()> {
     let frame = MmsFrame {
         command: MmsCommand::Ok,
         stream_id,
@@ -547,7 +576,11 @@ async fn send_ok_async(transport: &mut AsyncTcpTransport, stream_id: u32, payloa
     write_frame_async(transport, &frame).await
 }
 
-async fn send_error_async(transport: &mut AsyncTcpTransport, stream_id: u32, message: &str) -> CoreResult<()> {
+async fn send_error_async(
+    transport: &mut AsyncTcpTransport,
+    stream_id: u32,
+    message: &str,
+) -> CoreResult<()> {
     let frame = MmsFrame {
         command: MmsCommand::Error,
         stream_id,
@@ -586,7 +619,10 @@ async fn read_frame_async<T: AsyncStreamTransport>(transport: &mut T) -> CoreRes
     MmsFrame::decode(&data)
 }
 
-async fn write_frame_async<T: AsyncStreamTransport>(transport: &mut T, frame: &MmsFrame) -> CoreResult<()> {
+async fn write_frame_async<T: AsyncStreamTransport>(
+    transport: &mut T,
+    frame: &MmsFrame,
+) -> CoreResult<()> {
     transport.write_all(&frame.encode()).await
 }
 
@@ -608,7 +644,8 @@ mod tests {
         let handle = thread::spawn(move || server.serve());
 
         let client_addr = net::NetAddr::from_socket(addr);
-        let mut client = MmsClient::connect(&client_addr, "/stream", MmsClientConfig::default()).unwrap();
+        let mut client =
+            MmsClient::connect(&client_addr, "/stream", MmsClientConfig::default()).unwrap();
         let data = client.play().unwrap();
         assert_eq!(data, b"hello world".to_vec());
 

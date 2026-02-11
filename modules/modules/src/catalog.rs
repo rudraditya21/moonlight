@@ -407,13 +407,15 @@ fn process_manifest_tasks(
     for chunk in tasks.chunks(chunk_size) {
         let cache_map = Arc::clone(&cache_map);
         let chunk_vec = chunk.to_vec();
-        handles.push(thread::spawn(move || -> CoreResult<Vec<ManifestProcessed>> {
-            let mut out = Vec::with_capacity(chunk_vec.len());
-            for task in chunk_vec {
-                out.push(process_manifest_task(task, &cache_map)?);
-            }
-            Ok(out)
-        }));
+        handles.push(thread::spawn(
+            move || -> CoreResult<Vec<ManifestProcessed>> {
+                let mut out = Vec::with_capacity(chunk_vec.len());
+                for task in chunk_vec {
+                    out.push(process_manifest_task(task, &cache_map)?);
+                }
+                Ok(out)
+            },
+        ));
     }
 
     let mut results = Vec::with_capacity(tasks.len());
@@ -649,7 +651,11 @@ impl StringTableBuilder {
     }
 }
 
-fn collect_strings(table: &mut StringTableBuilder, entries: &[CachedEntry], catalog: &ModuleCatalog) {
+fn collect_strings(
+    table: &mut StringTableBuilder,
+    entries: &[CachedEntry],
+    catalog: &ModuleCatalog,
+) {
     for entry in entries {
         table.intern(&entry.manifest_path);
         collect_metadata_strings(table, &entry.metadata);
@@ -882,7 +888,11 @@ fn read_string_index_v2(
     for _ in 0..entries_len {
         entries.push(read_u32(data, cursor)? as usize);
     }
-    Ok(Some(StringIndex { map, ranges, entries }))
+    Ok(Some(StringIndex {
+        map,
+        ranges,
+        entries,
+    }))
 }
 
 fn write_phf_map_option_v2(
@@ -914,11 +924,7 @@ fn read_phf_map_option_v2(
     Ok(Some(read_phf_map_v2(data, cursor, table)?))
 }
 
-fn write_phf_map_v2(
-    out: &mut Vec<u8>,
-    map: &PhfMap<usize>,
-    table: &StringTable,
-) -> CoreResult<()> {
+fn write_phf_map_v2(out: &mut Vec<u8>, map: &PhfMap<usize>, table: &StringTable) -> CoreResult<()> {
     write_u32(out, map.len() as u32);
     write_u32(out, map.seeds().len() as u32);
     for &seed in map.seeds() {
@@ -1076,7 +1082,11 @@ fn read_string_index_v1(data: &[u8], cursor: &mut usize) -> CoreResult<Option<St
     for _ in 0..entries_len {
         entries.push(read_u32(data, cursor)? as usize);
     }
-    Ok(Some(StringIndex { map, ranges, entries }))
+    Ok(Some(StringIndex {
+        map,
+        ranges,
+        entries,
+    }))
 }
 
 fn write_index_lists(out: &mut Vec<u8>, lists: &[Vec<usize>]) -> CoreResult<()> {
@@ -1274,8 +1284,8 @@ fn read_i64(data: &[u8], cursor: &mut usize) -> CoreResult<i64> {
 fn read_string(data: &[u8], cursor: &mut usize) -> CoreResult<String> {
     let len = read_u32(data, cursor)? as usize;
     let bytes = read_bytes(data, cursor, len)?;
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| CoreError::Parse("invalid UTF-8".to_string()))?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| CoreError::Parse("invalid UTF-8".to_string()))?;
     Ok(text.to_string())
 }
 

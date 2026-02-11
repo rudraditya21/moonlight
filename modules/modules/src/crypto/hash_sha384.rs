@@ -57,8 +57,7 @@ impl Module for HashSha384Module {
         if expected.is_empty() {
             return Ok(ModuleResult::ok(&format!("sha384: {}", hash)));
         }
-        let expected = normalize_expected_hex(&expected, 96)
-            .map_err(ModuleError::Execution)?;
+        let expected = normalize_expected_hex(&expected, 96).map_err(ModuleError::Execution)?;
         let ok = expected == hash;
         Ok(ModuleResult::ok(&format!(
             "sha384 match: {}",
@@ -100,10 +99,7 @@ mod tests {
     #[test]
     fn sha384_module_compute() {
         let mut module = HashSha384Module::new();
-        module
-            .options_mut()
-            .set("INPUT", "abc")
-            .expect("set");
+        module.options_mut().set("INPUT", "abc").expect("set");
         let result = module.run(&ModuleContext { session_id: 1 }).expect("run");
         assert!(result
             .message

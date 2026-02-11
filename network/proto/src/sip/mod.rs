@@ -7,7 +7,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use corelib::error::{CoreError, CoreResult};
 use md5::digest_hex;
 
-use crate::transport::{AsyncStreamTransport, AsyncTcpTransport, AsyncUdpTransport, StreamTransport, TcpTransport, UdpTransport};
+use crate::transport::{
+    AsyncStreamTransport, AsyncTcpTransport, AsyncUdpTransport, StreamTransport, TcpTransport,
+    UdpTransport,
+};
 use crate::util::Timeouts;
 
 pub const SIP_DEFAULT_PORT: u16 = 5060;
@@ -134,7 +137,9 @@ impl SipRequest {
 
     pub fn to_bytes(&self) -> CoreResult<Vec<u8>> {
         let mut out = Vec::new();
-        out.extend_from_slice(format!("{} {} {}\r\n", self.method.as_str(), self.uri, self.version).as_bytes());
+        out.extend_from_slice(
+            format!("{} {} {}\r\n", self.method.as_str(), self.uri, self.version).as_bytes(),
+        );
         for (k, v) in self.headers.iter() {
             out.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
         }
@@ -157,7 +162,9 @@ impl SipResponse {
 
     pub fn to_bytes(&self) -> CoreResult<Vec<u8>> {
         let mut out = Vec::new();
-        out.extend_from_slice(format!("{} {} {}\r\n", self.version, self.code, self.reason).as_bytes());
+        out.extend_from_slice(
+            format!("{} {} {}\r\n", self.version, self.code, self.reason).as_bytes(),
+        );
         for (k, v) in self.headers.iter() {
             out.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
         }
@@ -302,7 +309,9 @@ pub struct AsyncSipTcpServer {
 
 impl AsyncSipTcpServer {
     pub async fn bind(addr: SocketAddr, config: SipServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { listener, config })
     }
 
@@ -345,7 +354,9 @@ impl SipUdpClient {
     }
 
     fn send_request(&self, mut request: SipRequest) -> CoreResult<SipResponse> {
-        request.headers.set("Content-Length", request.body.len().to_string());
+        request
+            .headers
+            .set("Content-Length", request.body.len().to_string());
         let bytes = request.to_bytes()?;
         self.socket.send_to(&bytes, self.server)?;
         let (resp, _) = self.socket.recv_from(MAX_MESSAGE)?;
@@ -373,7 +384,13 @@ impl SipUdpClient {
         let username = self.config.username.as_ref()?;
         let password = self.config.password.as_ref()?;
         let challenge = response.headers.get("www-authenticate")?;
-        build_digest_authorization(username, password, request.method.as_str(), &request.uri, challenge)
+        build_digest_authorization(
+            username,
+            password,
+            request.method.as_str(),
+            &request.uri,
+            challenge,
+        )
     }
 }
 
@@ -394,7 +411,9 @@ impl SipTcpClient {
     }
 
     fn send_request(&mut self, mut request: SipRequest) -> CoreResult<SipResponse> {
-        request.headers.set("Content-Length", request.body.len().to_string());
+        request
+            .headers
+            .set("Content-Length", request.body.len().to_string());
         let bytes = request.to_bytes()?;
         self.transport.write_all(&bytes)?;
         let message = read_message_stream(&mut self.transport)?;
@@ -421,7 +440,13 @@ impl SipTcpClient {
         let username = self.config.username.as_ref()?;
         let password = self.config.password.as_ref()?;
         let challenge = response.headers.get("www-authenticate")?;
-        build_digest_authorization(username, password, request.method.as_str(), &request.uri, challenge)
+        build_digest_authorization(
+            username,
+            password,
+            request.method.as_str(),
+            &request.uri,
+            challenge,
+        )
     }
 }
 
@@ -447,7 +472,9 @@ impl AsyncSipUdpClient {
     }
 
     async fn send_request(&self, mut request: SipRequest) -> CoreResult<SipResponse> {
-        request.headers.set("Content-Length", request.body.len().to_string());
+        request
+            .headers
+            .set("Content-Length", request.body.len().to_string());
         let bytes = request.to_bytes()?;
         self.socket.send_to(&bytes, self.server).await?;
         let (resp, _) = self.socket.recv_from(MAX_MESSAGE).await?;
@@ -475,7 +502,13 @@ impl AsyncSipUdpClient {
         let username = self.config.username.as_ref()?;
         let password = self.config.password.as_ref()?;
         let challenge = response.headers.get("www-authenticate")?;
-        build_digest_authorization(username, password, request.method.as_str(), &request.uri, challenge)
+        build_digest_authorization(
+            username,
+            password,
+            request.method.as_str(),
+            &request.uri,
+            challenge,
+        )
     }
 }
 
@@ -496,7 +529,9 @@ impl AsyncSipTcpClient {
     }
 
     async fn send_request(&mut self, mut request: SipRequest) -> CoreResult<SipResponse> {
-        request.headers.set("Content-Length", request.body.len().to_string());
+        request
+            .headers
+            .set("Content-Length", request.body.len().to_string());
         let bytes = request.to_bytes()?;
         self.transport.write_all(&bytes).await?;
         let message = read_message_stream_async(&mut self.transport).await?;
@@ -523,7 +558,13 @@ impl AsyncSipTcpClient {
         let username = self.config.username.as_ref()?;
         let password = self.config.password.as_ref()?;
         let challenge = response.headers.get("www-authenticate")?;
-        build_digest_authorization(username, password, request.method.as_str(), &request.uri, challenge)
+        build_digest_authorization(
+            username,
+            password,
+            request.method.as_str(),
+            &request.uri,
+            challenge,
+        )
     }
 }
 
@@ -562,7 +603,11 @@ async fn handle_tcp_session_async(
     Ok(())
 }
 
-fn handle_request(config: &SipServerConfig, request: &SipRequest, source: Option<SocketAddr>) -> SipResponse {
+fn handle_request(
+    config: &SipServerConfig,
+    request: &SipRequest,
+    source: Option<SocketAddr>,
+) -> SipResponse {
     if !config.allow_unauthenticated && !config.users.is_empty() {
         if let Some(auth) = request.headers.get("authorization") {
             if !verify_authorization(auth, request, config) {
@@ -589,15 +634,28 @@ fn handle_request(config: &SipServerConfig, request: &SipRequest, source: Option
 fn build_request(config: &SipClientConfig, method: SipMethod, uri: &str) -> SipRequest {
     let mut request = SipRequest::new(method, uri);
     request.headers.set("User-Agent", config.user_agent.clone());
-    request.headers.set("Via", format!("SIP/2.0/UDP 127.0.0.1;branch=z9hG4bK{}", generate_branch()));
-    request.headers.set("From", format!("<sip:client@moonlight>;tag={}", generate_tag()));
+    request.headers.set(
+        "Via",
+        format!("SIP/2.0/UDP 127.0.0.1;branch=z9hG4bK{}", generate_branch()),
+    );
+    request.headers.set(
+        "From",
+        format!("<sip:client@moonlight>;tag={}", generate_tag()),
+    );
     request.headers.set("To", format!("<{}>", uri));
     request.headers.set("Call-ID", generate_call_id());
-    request.headers.set("CSeq", format!("1 {}", method.as_str()));
+    request
+        .headers
+        .set("CSeq", format!("1 {}", method.as_str()));
     request
 }
 
-fn copy_core_headers(request: &SipRequest, response: &mut SipResponse, source: Option<SocketAddr>, config: &SipServerConfig) {
+fn copy_core_headers(
+    request: &SipRequest,
+    response: &mut SipResponse,
+    source: Option<SocketAddr>,
+    config: &SipServerConfig,
+) {
     if let Some(via) = request.headers.get("via") {
         response.headers.set("Via", via.to_string());
     }
@@ -621,13 +679,18 @@ fn copy_core_headers(request: &SipRequest, response: &mut SipResponse, source: O
         response.headers.set("Received", addr.ip().to_string());
     }
     response.headers.set("Server", config.server_name.clone());
-    response.headers.set("Content-Length", response.body.len().to_string());
+    response
+        .headers
+        .set("Content-Length", response.body.len().to_string());
 }
 
 fn build_challenge_response(config: &SipServerConfig, request: &SipRequest) -> SipResponse {
     let mut response = SipResponse::new(401, "Unauthorized");
     let nonce = generate_nonce();
-    let www = format!("Digest realm=\"{}\", nonce=\"{}\", algorithm=MD5, qop=\"auth\"", config.realm, nonce);
+    let www = format!(
+        "Digest realm=\"{}\", nonce=\"{}\", algorithm=MD5, qop=\"auth\"",
+        config.realm, nonce
+    );
     response.headers.set("WWW-Authenticate", www);
     copy_core_headers(request, &mut response, None, config);
     response
@@ -639,7 +702,10 @@ fn verify_authorization(auth: &str, request: &SipRequest, config: &SipServerConf
         Some(value) => value,
         None => return false,
     };
-    let realm = parsed.get("realm").map(|s| s.as_str()).unwrap_or(&config.realm);
+    let realm = parsed
+        .get("realm")
+        .map(|s| s.as_str())
+        .unwrap_or(&config.realm);
     let nonce = match parsed.get("nonce") {
         Some(value) => value,
         None => return false,
@@ -684,18 +750,18 @@ fn build_digest_authorization(
     let realm = parsed.get("realm")?;
     let nonce = parsed.get("nonce")?;
     let qop = parsed.get("qop").map(|s| s.as_str());
-    let nc = if qop.is_some() { Some("00000001") } else { None };
-    let cnonce = if qop.is_some() { Some("abcdef123456") } else { None };
+    let nc = if qop.is_some() {
+        Some("00000001")
+    } else {
+        None
+    };
+    let cnonce = if qop.is_some() {
+        Some("abcdef123456")
+    } else {
+        None
+    };
     let response = compute_digest_response(
-        username,
-        realm,
-        password,
-        nonce,
-        method,
-        uri,
-        qop,
-        nc,
-        cnonce,
+        username, realm, password, nonce, method, uri, qop, nc, cnonce,
     );
     let mut auth = format!(
         "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\"",
@@ -778,8 +844,8 @@ fn parse_message(data: &[u8]) -> CoreResult<SipMessage> {
         let method = parts.next().unwrap_or("OPTIONS");
         let uri = parts.next().unwrap_or("").to_string();
         let version = parts.next().unwrap_or("SIP/2.0").to_string();
-        let method = SipMethod::parse(method)
-            .ok_or_else(|| CoreError::Parse("sip method".to_string()))?;
+        let method =
+            SipMethod::parse(method).ok_or_else(|| CoreError::Parse("sip method".to_string()))?;
         Ok(SipMessage::Request(SipRequest {
             method,
             uri,
@@ -887,7 +953,10 @@ fn generate_branch() -> String {
 }
 
 fn generate_call_id() -> String {
-    format!("{}@moonlight", NONCE_COUNTER.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "{}@moonlight",
+        NONCE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[cfg(test)]

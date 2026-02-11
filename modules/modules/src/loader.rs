@@ -34,7 +34,9 @@ pub fn load_dyn_module(path: &Path) -> Result<Box<dyn Module>, ModuleError> {
     let api_fn: ModuleApiFn = unsafe { lib.symbol("moonlight_module_v1")? };
     let api_ptr = api_fn();
     if api_ptr.is_null() {
-        return Err(ModuleError::Execution("module API pointer is null".to_string()));
+        return Err(ModuleError::Execution(
+            "module API pointer is null".to_string(),
+        ));
     }
     let api = unsafe { &*api_ptr };
     validate_api(api)?;
@@ -55,7 +57,9 @@ pub fn load_dyn_module(path: &Path) -> Result<Box<dyn Module>, ModuleError> {
         .ok_or_else(|| ModuleError::Execution("missing create()".to_string()))?;
     let handle = create();
     if handle.is_null() {
-        return Err(ModuleError::Execution("module create() returned null".to_string()));
+        return Err(ModuleError::Execution(
+            "module create() returned null".to_string(),
+        ));
     }
 
     Ok(Box::new(DynModule {
@@ -120,9 +124,7 @@ impl Module for DynModule {
     }
 
     fn run(&mut self, ctx: &ModuleContext) -> Result<ModuleResult, ModuleError> {
-        self.options
-            .validate()
-            .map_err(ModuleError::Validation)?;
+        self.options.validate().map_err(ModuleError::Validation)?;
         self.apply_options()?;
         let api = self.api();
         let run = api
@@ -159,10 +161,14 @@ fn validate_api(api: &ModuleApiV1) -> Result<(), ModuleError> {
         )));
     }
     if (api.struct_size as usize) < std::mem::size_of::<ModuleApiV1>() {
-        return Err(ModuleError::Execution("API struct size too small".to_string()));
+        return Err(ModuleError::Execution(
+            "API struct size too small".to_string(),
+        ));
     }
     if api.get_metadata_json.is_none() {
-        return Err(ModuleError::Execution("missing get_metadata_json()".to_string()));
+        return Err(ModuleError::Execution(
+            "missing get_metadata_json()".to_string(),
+        ));
     }
     if api.free_string.is_none() {
         return Err(ModuleError::Execution("missing free_string()".to_string()));
@@ -269,7 +275,10 @@ fn parse_kind(input: &str) -> Result<ModuleOptionKind, ModuleError> {
     }
 }
 
-fn parse_default(value: &JsonValue, kind: &ModuleOptionKind) -> Result<ModuleOptionValue, ModuleError> {
+fn parse_default(
+    value: &JsonValue,
+    kind: &ModuleOptionKind,
+) -> Result<ModuleOptionValue, ModuleError> {
     match kind {
         ModuleOptionKind::String => match value {
             JsonValue::String(v) => Ok(ModuleOptionValue::String(v.clone())),
@@ -411,7 +420,9 @@ unsafe fn platform_close(handle: *mut libc::c_void) -> Result<(), ModuleError> {
 #[link(name = "kernel32")]
 extern "system" {
     fn LoadLibraryA(lpLibFileName: *const libc::c_char) -> *mut libc::c_void;
-    fn GetProcAddress(hModule: *mut libc::c_void, lpProcName: *const libc::c_char)
-        -> *mut libc::c_void;
+    fn GetProcAddress(
+        hModule: *mut libc::c_void,
+        lpProcName: *const libc::c_char,
+    ) -> *mut libc::c_void;
     fn FreeLibrary(hModule: *mut libc::c_void) -> i32;
 }

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use corelib::error::{CoreError, CoreResult};
 use net::NetAddr;
-use tokio::net::UdpSocket as TokioUdpSocket;
 use quiche::h3::NameValue;
+use tokio::net::UdpSocket as TokioUdpSocket;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const DEFAULT_MAX_BODY: usize = 8 * 1024 * 1024;
@@ -120,7 +120,8 @@ fn build_config() -> CoreResult<quiche::Config> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|err| CoreError::Message(err.to_string()))?;
     config.verify_peer(false);
-    config.set_application_protos(&[b"h3-29", b"h3-28", b"h3-27", b"h3"])
+    config
+        .set_application_protos(&[b"h3-29", b"h3-28", b"h3-27", b"h3"])
         .map_err(|err| CoreError::Message(err.to_string()))?;
     config.set_max_idle_timeout(5000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -159,21 +160,17 @@ impl Http3Client {
             .into_iter()
             .next()
             .ok_or_else(|| CoreError::Parse("unable to resolve".to_string()))?;
-        let socket = TokioUdpSocket::bind("0.0.0.0:0").await.map_err(CoreError::Io)?;
+        let socket = TokioUdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(CoreError::Io)?;
         let local_addr = socket.local_addr().map_err(CoreError::Io)?;
         let mut config = build_config()?;
         let scid_bytes = random_cid(16);
         let scid = quiche::ConnectionId::from_vec(scid_bytes);
-        let conn = quiche::connect(
-            Some(server_name),
-            &scid,
-            local_addr,
-            peer,
-            &mut config,
-        )
-        .map_err(|err| CoreError::Message(err.to_string()))?;
-        let h3_config = quiche::h3::Config::new()
+        let conn = quiche::connect(Some(server_name), &scid, local_addr, peer, &mut config)
             .map_err(|err| CoreError::Message(err.to_string()))?;
+        let h3_config =
+            quiche::h3::Config::new().map_err(|err| CoreError::Message(err.to_string()))?;
         let mut client = Self {
             socket,
             conn,
@@ -233,8 +230,7 @@ impl Http3Client {
             .send_request(&mut self.conn, &headers, request.body.is_empty())
             .map_err(|err| CoreError::Message(err.to_string()))?;
         if !request.body.is_empty() {
-            h3
-                .send_body(&mut self.conn, stream_id, &request.body, true)
+            h3.send_body(&mut self.conn, stream_id, &request.body, true)
                 .map_err(|err| CoreError::Message(err.to_string()))?;
         }
         let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
@@ -280,7 +276,9 @@ impl Http3Client {
                                 break;
                             }
                             if response_body.len() + read > self.max_body {
-                                return Err(CoreError::Parse("body exceeds maximum size".to_string()));
+                                return Err(CoreError::Parse(
+                                    "body exceeds maximum size".to_string(),
+                                ));
                             }
                             response_body.extend_from_slice(&data[..read]);
                         }
@@ -357,7 +355,11 @@ impl Http3Server {
         let mut buf = vec![0u8; 65535];
         let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
         loop {
-            let (len, from) = self.socket.recv_from(&mut buf).await.map_err(CoreError::Io)?;
+            let (len, from) = self
+                .socket
+                .recv_from(&mut buf)
+                .await
+                .map_err(CoreError::Io)?;
             let to = self.local_addr;
             let hdr = match quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
                 Ok(hdr) => hdr,
@@ -378,8 +380,8 @@ impl Http3Server {
                     .map_err(|err| CoreError::Message(err.to_string()))?;
                 let mut conn = quiche::accept(&scid, None, to, from, &mut config)
                     .map_err(|err| CoreError::Message(err.to_string()))?;
-                let h3_config = quiche::h3::Config::new()
-                    .map_err(|err| CoreError::Message(err.to_string()))?;
+                let h3_config =
+                    quiche::h3::Config::new().map_err(|err| CoreError::Message(err.to_string()))?;
                 let h3 = quiche::h3::Connection::with_transport(&mut conn, &h3_config)
                     .map_err(|err| CoreError::Message(err.to_string()))?;
                 let index = conns.len();
@@ -475,9 +477,9 @@ fn insert_conn_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use net::NetAddr;
     use crate::test_util::fuzz_bytes;
+    use net::NetAddr;
+    use std::fs;
 
     #[test]
     fn header_roundtrip() {

@@ -111,7 +111,9 @@ pub struct AsyncDrdaServer {
 
 impl AsyncDrdaServer {
     pub async fn bind(addr: SocketAddr, config: DrdaServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { listener, config })
     }
 
@@ -257,9 +259,17 @@ fn handle_drda_stream(stream: TcpStream, config: DrdaServerConfig) -> CoreResult
                 let mut idx = 0;
                 let user = decode_string(&msg.payload, &mut idx)?;
                 let pass = decode_string(&msg.payload, &mut idx)?;
-                let ok = config.users.get(&user).map(|p| p == &pass).unwrap_or(config.users.is_empty());
+                let ok = config
+                    .users
+                    .get(&user)
+                    .map(|p| p == &pass)
+                    .unwrap_or(config.users.is_empty());
                 authenticated = ok;
-                let resp_type = if ok { DrdaMessageType::Response } else { DrdaMessageType::Error };
+                let resp_type = if ok {
+                    DrdaMessageType::Response
+                } else {
+                    DrdaMessageType::Error
+                };
                 write_message(
                     &mut transport,
                     &DrdaMessage {
@@ -294,7 +304,10 @@ fn handle_drda_stream(stream: TcpStream, config: DrdaServerConfig) -> CoreResult
     }
 }
 
-async fn handle_drda_stream_async(stream: tokio::net::TcpStream, config: DrdaServerConfig) -> CoreResult<()> {
+async fn handle_drda_stream_async(
+    stream: tokio::net::TcpStream,
+    config: DrdaServerConfig,
+) -> CoreResult<()> {
     let mut transport = AsyncTcpTransport::from_stream(stream);
     let mut authenticated = false;
     loop {
@@ -314,9 +327,17 @@ async fn handle_drda_stream_async(stream: tokio::net::TcpStream, config: DrdaSer
                 let mut idx = 0;
                 let user = decode_string(&msg.payload, &mut idx)?;
                 let pass = decode_string(&msg.payload, &mut idx)?;
-                let ok = config.users.get(&user).map(|p| p == &pass).unwrap_or(config.users.is_empty());
+                let ok = config
+                    .users
+                    .get(&user)
+                    .map(|p| p == &pass)
+                    .unwrap_or(config.users.is_empty());
                 authenticated = ok;
-                let resp_type = if ok { DrdaMessageType::Response } else { DrdaMessageType::Error };
+                let resp_type = if ok {
+                    DrdaMessageType::Response
+                } else {
+                    DrdaMessageType::Error
+                };
                 write_message_async(
                     &mut transport,
                     &DrdaMessage {
@@ -397,7 +418,10 @@ fn write_message<T: StreamTransport>(transport: &mut T, msg: &DrdaMessage) -> Co
     transport.write_all(&msg.encode())
 }
 
-async fn write_message_async<T: AsyncStreamTransport>(transport: &mut T, msg: &DrdaMessage) -> CoreResult<()> {
+async fn write_message_async<T: AsyncStreamTransport>(
+    transport: &mut T,
+    msg: &DrdaMessage,
+) -> CoreResult<()> {
     transport.write_all(&msg.encode()).await
 }
 
@@ -431,12 +455,19 @@ mod tests {
         users.insert("db2".to_string(), "moonlight".to_string());
         let server = crate::skip_if_perm!(DrdaServer::bind(
             "127.0.0.1:0".parse().unwrap(),
-            DrdaServerConfig { users, ..DrdaServerConfig::default() },
+            DrdaServerConfig {
+                users,
+                ..DrdaServerConfig::default()
+            },
         ));
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 
-        let mut client = DrdaClient::connect(&net::NetAddr::from_socket(addr), DrdaClientConfig::default()).unwrap();
+        let mut client = DrdaClient::connect(
+            &net::NetAddr::from_socket(addr),
+            DrdaClientConfig::default(),
+        )
+        .unwrap();
         let resp = client.query("select 1").unwrap();
         assert_eq!(resp, "1");
 

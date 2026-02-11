@@ -99,7 +99,11 @@ pub fn digest_authorization_with_body(
     };
 
     let response = md5_hex_bytes(
-        format!("{}:{}:{}:{}:{}:{}", ha1, challenge.nonce, nc, cnonce, qop, ha2).as_bytes(),
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            ha1, challenge.nonce, nc, cnonce, qop, ha2
+        )
+        .as_bytes(),
     );
 
     let resp = DigestResponse {
@@ -233,10 +237,9 @@ mod tests {
 
     #[test]
     fn digest_auth_header() {
-        let challenge = parse_digest_challenge(
-            "Digest realm=\"test\", nonce=\"abc\", qop=\"auth\"",
-        )
-        .expect("parse");
+        let challenge =
+            parse_digest_challenge("Digest realm=\"test\", nonce=\"abc\", qop=\"auth\"")
+                .expect("parse");
         let header = digest_authorization(&challenge, "user", "pass", "GET", "/").unwrap();
         assert!(header.starts_with("Digest "));
         assert!(header.contains("username=\"user\""));
@@ -245,11 +248,13 @@ mod tests {
 
     #[test]
     fn digest_auth_int_body() {
-        let challenge = parse_digest_challenge(
-            "Digest realm=\"test\", nonce=\"xyz\", qop=\"auth-int\"",
+        let challenge =
+            parse_digest_challenge("Digest realm=\"test\", nonce=\"xyz\", qop=\"auth-int\"")
+                .expect("parse");
+        let header = digest_authorization_with_body(
+            &challenge, "user", "pass", "POST", "/upload", b"payload",
         )
-        .expect("parse");
-        let header = digest_authorization_with_body(&challenge, "user", "pass", "POST", "/upload", b"payload").unwrap();
+        .unwrap();
         assert!(header.contains("qop=auth-int"));
         let response_pos = header.find("response=\"").expect("response");
         let response = &header[response_pos + "response=\"".len()..];
@@ -258,7 +263,13 @@ mod tests {
         let ha1 = md5_hex_bytes(b"user:test:pass");
         let body_hash = md5_hex_bytes(b"payload");
         let ha2 = md5_hex_bytes(format!("POST:/upload:{}", body_hash).as_bytes());
-        let expected = md5_hex_bytes(format!("{}:{}:{}:{}:{}:{}", ha1, "xyz", "00000001", "moonlight", "auth-int", ha2).as_bytes());
+        let expected = md5_hex_bytes(
+            format!(
+                "{}:{}:{}:{}:{}:{}",
+                ha1, "xyz", "00000001", "moonlight", "auth-int", ha2
+            )
+            .as_bytes(),
+        );
         assert_eq!(response, expected);
     }
 }

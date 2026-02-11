@@ -371,7 +371,10 @@ impl FtpBackend for InMemoryFtpBackend {
 
     fn list(&self, cwd: &str, path: Option<&str>) -> CoreResult<Vec<String>> {
         let path = resolve_path(cwd, path.unwrap_or(""));
-        let guard = self.files.lock().map_err(|_| CoreError::Message("files poisoned".to_string()))?;
+        let guard = self
+            .files
+            .lock()
+            .map_err(|_| CoreError::Message("files poisoned".to_string()))?;
         let mut out = Vec::new();
         for key in guard.keys() {
             if key.starts_with(&path) {
@@ -386,7 +389,10 @@ impl FtpBackend for InMemoryFtpBackend {
 
     fn retrieve(&self, cwd: &str, path: &str) -> CoreResult<Vec<u8>> {
         let path = resolve_path(cwd, path);
-        let guard = self.files.lock().map_err(|_| CoreError::Message("files poisoned".to_string()))?;
+        let guard = self
+            .files
+            .lock()
+            .map_err(|_| CoreError::Message("files poisoned".to_string()))?;
         guard
             .get(&path)
             .cloned()
@@ -395,7 +401,10 @@ impl FtpBackend for InMemoryFtpBackend {
 
     fn store(&self, cwd: &str, path: &str, data: &[u8]) -> CoreResult<()> {
         let path = resolve_path(cwd, path);
-        let mut guard = self.files.lock().map_err(|_| CoreError::Message("files poisoned".to_string()))?;
+        let mut guard = self
+            .files
+            .lock()
+            .map_err(|_| CoreError::Message("files poisoned".to_string()))?;
         guard.insert(path, data.to_vec());
         Ok(())
     }
@@ -408,7 +417,11 @@ pub struct FtpServer {
 }
 
 impl FtpServer {
-    pub fn bind(addr: SocketAddr, config: FtpServerConfig, backend: Arc<dyn FtpBackend>) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        config: FtpServerConfig,
+        backend: Arc<dyn FtpBackend>,
+    ) -> CoreResult<Self> {
         let listener = TcpListener::bind(addr).map_err(CoreError::Io)?;
         Ok(Self {
             listener,
@@ -441,8 +454,14 @@ pub struct AsyncFtpServer {
 }
 
 impl AsyncFtpServer {
-    pub async fn bind(addr: SocketAddr, config: FtpServerConfig, backend: Arc<dyn FtpBackend>) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+    pub async fn bind(
+        addr: SocketAddr,
+        config: FtpServerConfig,
+        backend: Arc<dyn FtpBackend>,
+    ) -> CoreResult<Self> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             backend,
@@ -481,13 +500,23 @@ fn handle_control_session(
     loop {
         let line = match buffer.read_line(&mut transport) {
             Ok(line) => line,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Ok(())
+            }
             Err(err) => return Err(err),
         };
         let cmd = FtpCommand::parse(&line)?;
         if is_data_command(&cmd) {
-            handle_data_command(&cmd, &mut session, &backend, &mut pending_data, &mut transport)?;
+            handle_data_command(
+                &cmd,
+                &mut session,
+                &backend,
+                &mut pending_data,
+                &mut transport,
+            )?;
             continue;
         }
         let response = handle_command(&cmd, &mut session, &backend, &config, &mut pending_data)?;
@@ -508,7 +537,9 @@ async fn handle_control_session_async(
 ) -> CoreResult<()> {
     let mut transport = AsyncTcpTransport::from_stream(stream);
     let mut buffer = AsyncLineBuffer::new();
-    transport.write_all(format!("{}\r\n", config.greeting).as_bytes()).await?;
+    transport
+        .write_all(format!("{}\r\n", config.greeting).as_bytes())
+        .await?;
 
     let mut session = FtpSession::default();
     let mut pending_data: Option<AsyncDataListener> = None;
@@ -516,16 +547,28 @@ async fn handle_control_session_async(
     loop {
         let line = match buffer.read_line(&mut transport).await {
             Ok(line) => line,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Ok(())
+            }
             Err(err) => return Err(err),
         };
         let cmd = FtpCommand::parse(&line)?;
         if is_data_command(&cmd) {
-            handle_data_command_async(&cmd, &mut session, &backend, &mut pending_data, &mut transport).await?;
+            handle_data_command_async(
+                &cmd,
+                &mut session,
+                &backend,
+                &mut pending_data,
+                &mut transport,
+            )
+            .await?;
             continue;
         }
-        let response = handle_command_async(&cmd, &mut session, &backend, &config, &mut pending_data).await?;
+        let response =
+            handle_command_async(&cmd, &mut session, &backend, &config, &mut pending_data).await?;
         if let Some(resp) = response {
             transport.write_all(resp.to_line().as_bytes()).await?;
             if resp.code == 221 {
@@ -563,36 +606,65 @@ fn handle_data_command(
     match cmd.name.as_str() {
         "LIST" => {
             let listing = backend.list(&session.cwd, cmd.argument.as_deref())?;
-            transport.write_all(FtpResponse::new(150, "Opening data connection").to_line().as_bytes())?;
+            transport.write_all(
+                FtpResponse::new(150, "Opening data connection")
+                    .to_line()
+                    .as_bytes(),
+            )?;
             let mut data_stream = listener.accept()?;
             for line in listing {
                 data_stream.write_all(format!("{}\r\n", line).as_bytes())?;
             }
-            transport.write_all(FtpResponse::new(226, "Transfer complete").to_line().as_bytes())?;
+            transport.write_all(
+                FtpResponse::new(226, "Transfer complete")
+                    .to_line()
+                    .as_bytes(),
+            )?;
         }
         "RETR" => {
             let path = cmd.argument.clone().unwrap_or_default();
             let data = backend.retrieve(&session.cwd, &path)?;
-            transport.write_all(FtpResponse::new(150, "Opening data connection").to_line().as_bytes())?;
+            transport.write_all(
+                FtpResponse::new(150, "Opening data connection")
+                    .to_line()
+                    .as_bytes(),
+            )?;
             let mut data_stream = listener.accept()?;
             data_stream.write_all(&data)?;
-            transport.write_all(FtpResponse::new(226, "Transfer complete").to_line().as_bytes())?;
+            transport.write_all(
+                FtpResponse::new(226, "Transfer complete")
+                    .to_line()
+                    .as_bytes(),
+            )?;
         }
         "STOR" => {
             let path = cmd.argument.clone().unwrap_or_default();
-            transport.write_all(FtpResponse::new(150, "Opening data connection").to_line().as_bytes())?;
+            transport.write_all(
+                FtpResponse::new(150, "Opening data connection")
+                    .to_line()
+                    .as_bytes(),
+            )?;
             let data = read_data_bytes(listener.accept()?)?;
             match backend.store(&session.cwd, &path, &data) {
                 Ok(()) => {
-                    transport.write_all(FtpResponse::new(226, "Transfer complete").to_line().as_bytes())?;
+                    transport.write_all(
+                        FtpResponse::new(226, "Transfer complete")
+                            .to_line()
+                            .as_bytes(),
+                    )?;
                 }
                 Err(err) => {
-                    transport.write_all(FtpResponse::new(550, err.to_string()).to_line().as_bytes())?;
+                    transport
+                        .write_all(FtpResponse::new(550, err.to_string()).to_line().as_bytes())?;
                 }
             }
         }
         _ => {
-            transport.write_all(FtpResponse::new(502, "Command not implemented").to_line().as_bytes())?;
+            transport.write_all(
+                FtpResponse::new(502, "Command not implemented")
+                    .to_line()
+                    .as_bytes(),
+            )?;
         }
     }
     Ok(())
@@ -621,36 +693,82 @@ async fn handle_data_command_async(
     match cmd.name.as_str() {
         "LIST" => {
             let listing = backend.list(&session.cwd, cmd.argument.as_deref())?;
-            transport.write_all(FtpResponse::new(150, "Opening data connection").to_line().as_bytes()).await?;
+            transport
+                .write_all(
+                    FtpResponse::new(150, "Opening data connection")
+                        .to_line()
+                        .as_bytes(),
+                )
+                .await?;
             let mut data_stream = listener.accept().await?;
             for line in listing {
-                data_stream.write_all(format!("{}\r\n", line).as_bytes()).await?;
+                data_stream
+                    .write_all(format!("{}\r\n", line).as_bytes())
+                    .await?;
             }
-            transport.write_all(FtpResponse::new(226, "Transfer complete").to_line().as_bytes()).await?;
+            transport
+                .write_all(
+                    FtpResponse::new(226, "Transfer complete")
+                        .to_line()
+                        .as_bytes(),
+                )
+                .await?;
         }
         "RETR" => {
             let path = cmd.argument.clone().unwrap_or_default();
             let data = backend.retrieve(&session.cwd, &path)?;
-            transport.write_all(FtpResponse::new(150, "Opening data connection").to_line().as_bytes()).await?;
+            transport
+                .write_all(
+                    FtpResponse::new(150, "Opening data connection")
+                        .to_line()
+                        .as_bytes(),
+                )
+                .await?;
             let mut data_stream = listener.accept().await?;
             data_stream.write_all(&data).await?;
-            transport.write_all(FtpResponse::new(226, "Transfer complete").to_line().as_bytes()).await?;
+            transport
+                .write_all(
+                    FtpResponse::new(226, "Transfer complete")
+                        .to_line()
+                        .as_bytes(),
+                )
+                .await?;
         }
         "STOR" => {
             let path = cmd.argument.clone().unwrap_or_default();
-            transport.write_all(FtpResponse::new(150, "Opening data connection").to_line().as_bytes()).await?;
+            transport
+                .write_all(
+                    FtpResponse::new(150, "Opening data connection")
+                        .to_line()
+                        .as_bytes(),
+                )
+                .await?;
             let data = read_data_bytes_async(listener.accept().await?).await?;
             match backend.store(&session.cwd, &path, &data) {
                 Ok(()) => {
-                    transport.write_all(FtpResponse::new(226, "Transfer complete").to_line().as_bytes()).await?;
+                    transport
+                        .write_all(
+                            FtpResponse::new(226, "Transfer complete")
+                                .to_line()
+                                .as_bytes(),
+                        )
+                        .await?;
                 }
                 Err(err) => {
-                    transport.write_all(FtpResponse::new(550, err.to_string()).to_line().as_bytes()).await?;
+                    transport
+                        .write_all(FtpResponse::new(550, err.to_string()).to_line().as_bytes())
+                        .await?;
                 }
             }
         }
         _ => {
-            transport.write_all(FtpResponse::new(502, "Command not implemented").to_line().as_bytes()).await?;
+            transport
+                .write_all(
+                    FtpResponse::new(502, "Command not implemented")
+                        .to_line()
+                        .as_bytes(),
+                )
+                .await?;
         }
     }
     Ok(())
@@ -710,7 +828,9 @@ fn handle_command(
             if !session.authed {
                 return Ok(Some(FtpResponse::new(530, "Not logged in")));
             }
-            let listener = pending_data.take().ok_or_else(|| CoreError::Message("PASV required".to_string()))?;
+            let listener = pending_data
+                .take()
+                .ok_or_else(|| CoreError::Message("PASV required".to_string()))?;
             let path = cmd.argument.as_deref();
             let listing = backend.list(&session.cwd, path)?;
             let mut data_stream = listener.accept()?;
@@ -723,8 +843,13 @@ fn handle_command(
             if !session.authed {
                 return Ok(Some(FtpResponse::new(530, "Not logged in")));
             }
-            let listener = pending_data.take().ok_or_else(|| CoreError::Message("PASV required".to_string()))?;
-            let path = cmd.argument.clone().ok_or_else(|| CoreError::Message("Missing path".to_string()))?;
+            let listener = pending_data
+                .take()
+                .ok_or_else(|| CoreError::Message("PASV required".to_string()))?;
+            let path = cmd
+                .argument
+                .clone()
+                .ok_or_else(|| CoreError::Message("Missing path".to_string()))?;
             let data = backend.retrieve(&session.cwd, &path)?;
             let mut data_stream = listener.accept()?;
             data_stream.write_all(&data)?;
@@ -734,8 +859,13 @@ fn handle_command(
             if !session.authed {
                 return Ok(Some(FtpResponse::new(530, "Not logged in")));
             }
-            let listener = pending_data.take().ok_or_else(|| CoreError::Message("PASV required".to_string()))?;
-            let path = cmd.argument.clone().ok_or_else(|| CoreError::Message("Missing path".to_string()))?;
+            let listener = pending_data
+                .take()
+                .ok_or_else(|| CoreError::Message("PASV required".to_string()))?;
+            let path = cmd
+                .argument
+                .clone()
+                .ok_or_else(|| CoreError::Message("Missing path".to_string()))?;
             let data = read_data_bytes(listener.accept()?)?;
             backend.store(&session.cwd, &path, &data)?;
             Ok(Some(FtpResponse::new(226, "Transfer complete")))
@@ -799,12 +929,16 @@ async fn handle_command_async(
             if !session.authed {
                 return Ok(Some(FtpResponse::new(530, "Not logged in")));
             }
-            let listener = pending_data.take().ok_or_else(|| CoreError::Message("PASV required".to_string()))?;
+            let listener = pending_data
+                .take()
+                .ok_or_else(|| CoreError::Message("PASV required".to_string()))?;
             let path = cmd.argument.as_deref();
             let listing = backend.list(&session.cwd, path)?;
             let mut data_stream = listener.accept().await?;
             for line in listing {
-                data_stream.write_all(format!("{}\r\n", line).as_bytes()).await?;
+                data_stream
+                    .write_all(format!("{}\r\n", line).as_bytes())
+                    .await?;
             }
             Ok(Some(FtpResponse::new(226, "Transfer complete")))
         }
@@ -812,8 +946,13 @@ async fn handle_command_async(
             if !session.authed {
                 return Ok(Some(FtpResponse::new(530, "Not logged in")));
             }
-            let listener = pending_data.take().ok_or_else(|| CoreError::Message("PASV required".to_string()))?;
-            let path = cmd.argument.clone().ok_or_else(|| CoreError::Message("Missing path".to_string()))?;
+            let listener = pending_data
+                .take()
+                .ok_or_else(|| CoreError::Message("PASV required".to_string()))?;
+            let path = cmd
+                .argument
+                .clone()
+                .ok_or_else(|| CoreError::Message("Missing path".to_string()))?;
             let data = backend.retrieve(&session.cwd, &path)?;
             let mut data_stream = listener.accept().await?;
             data_stream.write_all(&data).await?;
@@ -823,8 +962,13 @@ async fn handle_command_async(
             if !session.authed {
                 return Ok(Some(FtpResponse::new(530, "Not logged in")));
             }
-            let listener = pending_data.take().ok_or_else(|| CoreError::Message("PASV required".to_string()))?;
-            let path = cmd.argument.clone().ok_or_else(|| CoreError::Message("Missing path".to_string()))?;
+            let listener = pending_data
+                .take()
+                .ok_or_else(|| CoreError::Message("PASV required".to_string()))?;
+            let path = cmd
+                .argument
+                .clone()
+                .ok_or_else(|| CoreError::Message("Missing path".to_string()))?;
             let data = read_data_bytes_async(listener.accept().await?).await?;
             backend.store(&session.cwd, &path, &data)?;
             Ok(Some(FtpResponse::new(226, "Transfer complete")))
@@ -851,7 +995,9 @@ impl DataListener {
     }
 
     fn addr(&self) -> SocketAddr {
-        self.listener.local_addr().unwrap_or_else(|_| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+        self.listener
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
     }
 
     fn accept(self) -> CoreResult<TcpTransport> {
@@ -877,7 +1023,9 @@ impl AsyncDataListener {
     }
 
     fn addr(&self) -> SocketAddr {
-        self.listener.local_addr().unwrap_or_else(|_| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+        self.listener
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
     }
 
     async fn accept(self) -> CoreResult<AsyncTcpTransport> {
@@ -949,7 +1097,10 @@ impl AsyncLineBuffer {
         }
     }
 
-    async fn read_line<T: AsyncStreamTransport>(&mut self, transport: &mut T) -> CoreResult<String> {
+    async fn read_line<T: AsyncStreamTransport>(
+        &mut self,
+        transport: &mut T,
+    ) -> CoreResult<String> {
         loop {
             if let Some(pos) = find_crlf(&self.buf[self.start..self.end]) {
                 let end = self.start + pos;
@@ -994,8 +1145,14 @@ fn parse_response(line: &str) -> CoreResult<FtpResponse> {
 }
 
 fn parse_pasv_response(message: &str) -> CoreResult<SocketAddr> {
-    let start = message.find('(').ok_or_else(|| CoreError::Parse("invalid PASV response".to_string()))? + 1;
-    let end = message[start..].find(')').ok_or_else(|| CoreError::Parse("invalid PASV response".to_string()))? + start;
+    let start = message
+        .find('(')
+        .ok_or_else(|| CoreError::Parse("invalid PASV response".to_string()))?
+        + 1;
+    let end = message[start..]
+        .find(')')
+        .ok_or_else(|| CoreError::Parse("invalid PASV response".to_string()))?
+        + start;
     let parts: Vec<u16> = message[start..end]
         .split(',')
         .filter_map(|s| s.trim().parse::<u16>().ok())
@@ -1003,7 +1160,12 @@ fn parse_pasv_response(message: &str) -> CoreResult<SocketAddr> {
     if parts.len() != 6 {
         return Err(CoreError::Parse("invalid PASV response".to_string()));
     }
-    let ip = Ipv4Addr::new(parts[0] as u8, parts[1] as u8, parts[2] as u8, parts[3] as u8);
+    let ip = Ipv4Addr::new(
+        parts[0] as u8,
+        parts[1] as u8,
+        parts[2] as u8,
+        parts[3] as u8,
+    );
     let port = (parts[4] << 8) | parts[5];
     Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
 }
@@ -1013,7 +1175,15 @@ fn format_pasv(addr: SocketAddr) -> String {
         SocketAddr::V4(v4) => {
             let ip = v4.ip().octets();
             let port = v4.port();
-            format!("{},{},{},{},{},{}", ip[0], ip[1], ip[2], ip[3], port >> 8, port & 0xff)
+            format!(
+                "{},{},{},{},{},{}",
+                ip[0],
+                ip[1],
+                ip[2],
+                ip[3],
+                port >> 8,
+                port & 0xff
+            )
         }
         SocketAddr::V6(_) => "127,0,0,1,0,0".to_string(),
     }
@@ -1125,7 +1295,10 @@ mod tests {
     fn parse_pasv() {
         let msg = "Entering Passive Mode (127,0,0,1,195,80)";
         let addr = parse_pasv_response(msg).unwrap();
-        assert_eq!(addr, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 50000)));
+        assert_eq!(
+            addr,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 50000))
+        );
     }
 
     #[test]
@@ -1141,10 +1314,11 @@ mod tests {
     fn server_client_roundtrip() {
         let mut client_config = FtpClientConfig::default();
         client_config.timeouts.read = std::time::Duration::from_secs(20);
-        let backend = Arc::new(InMemoryFtpBackend::default().with_user("user", "pass").with_file(
-            "/file.txt",
-            b"data".to_vec(),
-        ));
+        let backend = Arc::new(
+            InMemoryFtpBackend::default()
+                .with_user("user", "pass")
+                .with_file("/file.txt", b"data".to_vec()),
+        );
         let server_config = FtpServerConfig::default();
         let server = match FtpServer::bind("127.0.0.1:0".parse().unwrap(), server_config, backend) {
             Ok(server) => server,

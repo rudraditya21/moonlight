@@ -38,7 +38,9 @@ impl TcpTransport {
         for socket in addr.resolve()? {
             match TcpStream::connect_timeout(&socket, timeouts.connect) {
                 Ok(stream) => {
-                    stream.set_read_timeout(Some(timeouts.read)).map_err(CoreError::Io)?;
+                    stream
+                        .set_read_timeout(Some(timeouts.read))
+                        .map_err(CoreError::Io)?;
                     stream
                         .set_write_timeout(Some(timeouts.write))
                         .map_err(CoreError::Io)?;
@@ -53,7 +55,9 @@ impl TcpTransport {
     }
 
     pub fn from_stream(stream: TcpStream, timeouts: Timeouts) -> CoreResult<Self> {
-        stream.set_read_timeout(Some(timeouts.read)).map_err(CoreError::Io)?;
+        stream
+            .set_read_timeout(Some(timeouts.read))
+            .map_err(CoreError::Io)?;
         stream
             .set_write_timeout(Some(timeouts.write))
             .map_err(CoreError::Io)?;
@@ -79,7 +83,9 @@ impl StreamTransport for TcpTransport {
     }
 
     fn shutdown(&mut self) -> CoreResult<()> {
-        self.stream.shutdown(std::net::Shutdown::Both).map_err(CoreError::Io)
+        self.stream
+            .shutdown(std::net::Shutdown::Both)
+            .map_err(CoreError::Io)
     }
 
     fn peer_addr(&self) -> CoreResult<SocketAddr> {
@@ -91,7 +97,9 @@ impl StreamTransport for TcpTransport {
     }
 
     fn set_write_timeout(&self, timeout: Option<Duration>) -> CoreResult<()> {
-        self.stream.set_write_timeout(timeout).map_err(CoreError::Io)
+        self.stream
+            .set_write_timeout(timeout)
+            .map_err(CoreError::Io)
     }
 }
 
@@ -187,7 +195,10 @@ pub struct TlsServerConfig {
 }
 
 impl TlsServerConfig {
-    pub fn from_der(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> CoreResult<Self> {
+    pub fn from_der(
+        certs: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> CoreResult<Self> {
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
@@ -263,14 +274,17 @@ impl TlsStreamTransport {
         for socket in addr.resolve()? {
             match TcpStream::connect_timeout(&socket, timeouts.connect) {
                 Ok(stream) => {
-                    stream.set_read_timeout(Some(timeouts.read)).map_err(CoreError::Io)?;
+                    stream
+                        .set_read_timeout(Some(timeouts.read))
+                        .map_err(CoreError::Io)?;
                     stream
                         .set_write_timeout(Some(timeouts.write))
                         .map_err(CoreError::Io)?;
                     let server_name = ServerName::try_from(server_name)
                         .map_err(|_| CoreError::Parse("invalid server name".to_string()))?;
-                    let conn = rustls::ClientConnection::new(config.inner(), server_name.to_owned())
-                        .map_err(|err| CoreError::Message(err.to_string()))?;
+                    let conn =
+                        rustls::ClientConnection::new(config.inner(), server_name.to_owned())
+                            .map_err(|err| CoreError::Message(err.to_string()))?;
                     return Ok(Self::Client(rustls::StreamOwned::new(conn, stream)));
                 }
                 Err(err) => last_err = Some(err),
@@ -281,9 +295,15 @@ impl TlsStreamTransport {
             .unwrap_or_else(|| CoreError::Parse("unable to connect".to_string())))
     }
 
-    pub fn accept(listener: &TcpListener, config: &TlsServerConfig, timeouts: Timeouts) -> CoreResult<Self> {
+    pub fn accept(
+        listener: &TcpListener,
+        config: &TlsServerConfig,
+        timeouts: Timeouts,
+    ) -> CoreResult<Self> {
         let (stream, _) = listener.accept().map_err(CoreError::Io)?;
-        stream.set_read_timeout(Some(timeouts.read)).map_err(CoreError::Io)?;
+        stream
+            .set_read_timeout(Some(timeouts.read))
+            .map_err(CoreError::Io)?;
         stream
             .set_write_timeout(Some(timeouts.write))
             .map_err(CoreError::Io)?;
@@ -363,9 +383,18 @@ impl StreamTransport for TlsStreamTransport {
 }
 
 pub trait AsyncStreamTransport {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Pin<Box<dyn Future<Output = CoreResult<usize>> + Send + 'a>>;
-    fn read_exact<'a>(&'a mut self, buf: &'a mut [u8]) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>>;
-    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>>;
+    fn read<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = CoreResult<usize>> + Send + 'a>>;
+    fn read_exact<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>>;
+    fn write_all<'a>(
+        &'a mut self,
+        buf: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>>;
     fn shutdown<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>>;
 }
 
@@ -408,11 +437,17 @@ impl AsyncTcpTransport {
 }
 
 impl AsyncStreamTransport for AsyncTcpTransport {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Pin<Box<dyn Future<Output = CoreResult<usize>> + Send + 'a>> {
+    fn read<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = CoreResult<usize>> + Send + 'a>> {
         Box::pin(async move { self.stream.read(buf).await.map_err(CoreError::Io) })
     }
 
-    fn read_exact<'a>(&'a mut self, buf: &'a mut [u8]) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
+    fn read_exact<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
         Box::pin(async move {
             self.stream
                 .read_exact(buf)
@@ -422,14 +457,15 @@ impl AsyncStreamTransport for AsyncTcpTransport {
         })
     }
 
-    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
+    fn write_all<'a>(
+        &'a mut self,
+        buf: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
         Box::pin(async move { self.stream.write_all(buf).await.map_err(CoreError::Io) })
     }
 
     fn shutdown<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
-        Box::pin(async move {
-            self.stream.shutdown().await.map_err(CoreError::Io)
-        })
+        Box::pin(async move { self.stream.shutdown().await.map_err(CoreError::Io) })
     }
 }
 
@@ -439,12 +475,16 @@ pub struct AsyncUdpTransport {
 
 impl AsyncUdpTransport {
     pub async fn bind(addr: SocketAddr) -> CoreResult<Self> {
-        let socket = tokio::net::UdpSocket::bind(addr).await.map_err(CoreError::Io)?;
+        let socket = tokio::net::UdpSocket::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { socket })
     }
 
     pub async fn bind_any() -> CoreResult<Self> {
-        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.map_err(CoreError::Io)?;
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { socket })
     }
 
@@ -454,7 +494,11 @@ impl AsyncUdpTransport {
 
     pub async fn recv_from(&self, max_bytes: usize) -> CoreResult<(Vec<u8>, SocketAddr)> {
         let mut buf = vec![0u8; max_bytes];
-        let (len, addr) = self.socket.recv_from(&mut buf).await.map_err(CoreError::Io)?;
+        let (len, addr) = self
+            .socket
+            .recv_from(&mut buf)
+            .await
+            .map_err(CoreError::Io)?;
         buf.truncate(len);
         Ok((buf, addr))
     }
@@ -485,11 +529,17 @@ impl AsyncTlsClientTransport {
 }
 
 impl AsyncStreamTransport for AsyncTlsClientTransport {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Pin<Box<dyn Future<Output = CoreResult<usize>> + Send + 'a>> {
+    fn read<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = CoreResult<usize>> + Send + 'a>> {
         Box::pin(async move { self.stream.read(buf).await.map_err(CoreError::Io) })
     }
 
-    fn read_exact<'a>(&'a mut self, buf: &'a mut [u8]) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
+    fn read_exact<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
         Box::pin(async move {
             self.stream
                 .read_exact(buf)
@@ -499,7 +549,10 @@ impl AsyncStreamTransport for AsyncTlsClientTransport {
         })
     }
 
-    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
+    fn write_all<'a>(
+        &'a mut self,
+        buf: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
         Box::pin(async move { self.stream.write_all(buf).await.map_err(CoreError::Io) })
     }
 
@@ -519,11 +572,17 @@ impl AsyncTlsServerTransport {
 }
 
 impl AsyncStreamTransport for AsyncTlsServerTransport {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Pin<Box<dyn Future<Output = CoreResult<usize>> + Send + 'a>> {
+    fn read<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = CoreResult<usize>> + Send + 'a>> {
         Box::pin(async move { self.stream.read(buf).await.map_err(CoreError::Io) })
     }
 
-    fn read_exact<'a>(&'a mut self, buf: &'a mut [u8]) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
+    fn read_exact<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
         Box::pin(async move {
             self.stream
                 .read_exact(buf)
@@ -533,7 +592,10 @@ impl AsyncStreamTransport for AsyncTlsServerTransport {
         })
     }
 
-    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
+    fn write_all<'a>(
+        &'a mut self,
+        buf: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'a>> {
         Box::pin(async move { self.stream.write_all(buf).await.map_err(CoreError::Io) })
     }
 

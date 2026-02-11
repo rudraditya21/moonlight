@@ -53,7 +53,9 @@ impl BcryptPublicKey {
         }
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         if magic != BCRYPT_PUBLIC_KEY_MAGIC {
-            return Err(CoreError::Parse("invalid bcrypt public key magic".to_string()));
+            return Err(CoreError::Parse(
+                "invalid bcrypt public key magic".to_string(),
+            ));
         }
         let key_length = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let exponent_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
@@ -77,7 +79,9 @@ impl BcryptPublicKey {
 
 fn read_slice(data: &[u8], offset: &mut usize, len: usize) -> CoreResult<Vec<u8>> {
     if *offset + len > data.len() {
-        return Err(CoreError::Parse("bcrypt public key out of bounds".to_string()));
+        return Err(CoreError::Parse(
+            "bcrypt public key out of bounds".to_string(),
+        ));
     }
     let out = data[*offset..*offset + len].to_vec();
     *offset += len;
@@ -172,7 +176,10 @@ impl InMemoryBcryptKeyStore {
 
 impl BcryptPublicKeyHandler for InMemoryBcryptKeyStore {
     fn on_key(&self, key: BcryptPublicKey) -> CoreResult<()> {
-        let mut guard = self.keys.lock().map_err(|_| CoreError::Message("keys poisoned".to_string()))?;
+        let mut guard = self
+            .keys
+            .lock()
+            .map_err(|_| CoreError::Message("keys poisoned".to_string()))?;
         guard.push_back(key);
         Ok(())
     }
@@ -242,11 +249,10 @@ impl AsyncBcryptPublicKeyServer {
         _config: BcryptPublicKeyServerConfig,
         handler: Arc<dyn BcryptPublicKeyHandler>,
     ) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
-        Ok(Self {
-            listener,
-            handler,
-        })
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
+        Ok(Self { listener, handler })
     }
 
     pub async fn serve(&self) -> CoreResult<()> {
@@ -285,7 +291,10 @@ fn write_message(transport: &mut TcpTransport, msg: &BcryptPublicKeyMessage) -> 
     write_len_prefixed(transport, &payload)
 }
 
-async fn write_message_async(transport: &mut AsyncTcpTransport, msg: &BcryptPublicKeyMessage) -> CoreResult<()> {
+async fn write_message_async(
+    transport: &mut AsyncTcpTransport,
+    msg: &BcryptPublicKeyMessage,
+) -> CoreResult<()> {
     let payload = encode_message(msg)?;
     write_len_prefixed_async(transport, &payload).await
 }
@@ -295,7 +304,9 @@ fn read_message(transport: &mut TcpTransport) -> CoreResult<BcryptPublicKeyMessa
     decode_message(&payload)
 }
 
-async fn read_message_async(transport: &mut AsyncTcpTransport) -> CoreResult<BcryptPublicKeyMessage> {
+async fn read_message_async(
+    transport: &mut AsyncTcpTransport,
+) -> CoreResult<BcryptPublicKeyMessage> {
     let payload = read_len_prefixed_async(transport).await?;
     decode_message(&payload)
 }
@@ -369,7 +380,10 @@ fn read_len_prefixed(transport: &mut TcpTransport) -> CoreResult<Vec<u8>> {
     Ok(payload)
 }
 
-async fn write_len_prefixed_async(transport: &mut AsyncTcpTransport, payload: &[u8]) -> CoreResult<()> {
+async fn write_len_prefixed_async(
+    transport: &mut AsyncTcpTransport,
+    payload: &[u8],
+) -> CoreResult<()> {
     let mut out = Vec::with_capacity(4 + payload.len());
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     out.extend_from_slice(payload);
@@ -409,8 +423,11 @@ mod tests {
         thread::spawn(move || {
             let _ = server.serve();
         });
-        let mut client =
-            BcryptPublicKeyClient::connect(&NetAddr::from_socket(addr), BcryptPublicKeyClientConfig::default()).unwrap();
+        let mut client = BcryptPublicKeyClient::connect(
+            &NetAddr::from_socket(addr),
+            BcryptPublicKeyClientConfig::default(),
+        )
+        .unwrap();
         let key = BcryptPublicKey::new(vec![1, 0, 1], vec![0x01, 0x02, 0x03]);
         client.send_key(&key).unwrap();
         let stored = handler.latest().unwrap();

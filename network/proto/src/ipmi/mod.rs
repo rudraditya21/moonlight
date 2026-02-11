@@ -117,17 +117,15 @@ impl IpmiHandler for DefaultIpmiHandler {
                     self.config.manufacturer_id[1],
                     self.config.manufacturer_id[2],
                 ]);
-                response.data.extend_from_slice(&self.config.product_id.to_le_bytes());
+                response
+                    .data
+                    .extend_from_slice(&self.config.product_id.to_le_bytes());
             }
             (NETFN_APP, CMD_GET_CHANNEL_AUTH_CAP) => {
                 let channel = request.data.get(0).copied().unwrap_or(0x0E);
-                response.data.extend_from_slice(&[
-                    channel,
-                    0x07,
-                    0x00,
-                    0x00,
-                    0x00,
-                ]);
+                response
+                    .data
+                    .extend_from_slice(&[channel, 0x07, 0x00, 0x00, 0x00]);
             }
             _ => {
                 response.completion_code = 0xC1;
@@ -143,7 +141,11 @@ pub struct IpmiServer {
 }
 
 impl IpmiServer {
-    pub fn bind(addr: SocketAddr, handler: Arc<dyn IpmiHandler>, config: IpmiServerConfig) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        handler: Arc<dyn IpmiHandler>,
+        config: IpmiServerConfig,
+    ) -> CoreResult<Self> {
         let socket = UdpTransport::bind(addr)?;
         socket.set_read_timeout(Some(config.timeouts.read))?;
         Ok(Self { socket, handler })
@@ -202,7 +204,13 @@ impl IpmiClient {
         Ok(Self { socket })
     }
 
-    pub fn request(&self, addr: SocketAddr, netfn: u8, cmd: u8, data: &[u8]) -> CoreResult<IpmiResponse> {
+    pub fn request(
+        &self,
+        addr: SocketAddr,
+        netfn: u8,
+        cmd: u8,
+        data: &[u8],
+    ) -> CoreResult<IpmiResponse> {
         let msg = encode_ipmi_request(netfn, cmd, data, 0x81, 1);
         let packet = encode_rmcp_packet(&msg);
         self.socket.send_to(&packet, addr)?;
@@ -214,7 +222,11 @@ impl IpmiClient {
         self.request(addr, NETFN_APP, CMD_GET_DEVICE_ID, &[])
     }
 
-    pub fn get_channel_auth_capabilities(&self, addr: SocketAddr, channel: u8) -> CoreResult<IpmiResponse> {
+    pub fn get_channel_auth_capabilities(
+        &self,
+        addr: SocketAddr,
+        channel: u8,
+    ) -> CoreResult<IpmiResponse> {
         self.request(addr, NETFN_APP, CMD_GET_CHANNEL_AUTH_CAP, &[channel, 0x00])
     }
 }
@@ -229,7 +241,13 @@ impl AsyncIpmiClient {
         Ok(Self { socket })
     }
 
-    pub async fn request(&self, addr: SocketAddr, netfn: u8, cmd: u8, data: &[u8]) -> CoreResult<IpmiResponse> {
+    pub async fn request(
+        &self,
+        addr: SocketAddr,
+        netfn: u8,
+        cmd: u8,
+        data: &[u8],
+    ) -> CoreResult<IpmiResponse> {
         let msg = encode_ipmi_request(netfn, cmd, data, 0x81, 1);
         let packet = encode_rmcp_packet(&msg);
         self.socket.send_to(&packet, addr).await?;

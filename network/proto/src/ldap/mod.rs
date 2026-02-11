@@ -100,7 +100,10 @@ pub struct BindRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindAuth {
     Simple(Vec<u8>),
-    Sasl { mechanism: String, credentials: Option<Vec<u8>> },
+    Sasl {
+        mechanism: String,
+        credentials: Option<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +215,10 @@ pub enum Filter {
     Or(Vec<Filter>),
     Not(Box<Filter>),
     Equality(AttributeValueAssertion),
-    Substrings { attribute: String, substrings: Vec<Substring> },
+    Substrings {
+        attribute: String,
+        substrings: Vec<Substring>,
+    },
     GreaterOrEqual(AttributeValueAssertion),
     LessOrEqual(AttributeValueAssertion),
     Present(String),
@@ -439,7 +445,10 @@ impl LdapClient {
         }
     }
 
-    pub fn search(&mut self, request: SearchRequest) -> CoreResult<(Vec<SearchResultEntry>, LdapResult)> {
+    pub fn search(
+        &mut self,
+        request: SearchRequest,
+    ) -> CoreResult<(Vec<SearchResultEntry>, LdapResult)> {
         let msg_id = self.send(ProtocolOp::SearchRequest(request))?;
         let mut entries = Vec::new();
         loop {
@@ -653,8 +662,13 @@ impl LdapBackend for InMemoryBackend {
                     return Ok(ldap_success());
                 }
                 let dn = normalize_dn(&req.name);
-                let guard = self.entries.lock().map_err(|_| CoreError::Message("entries poisoned".to_string()))?;
-                let entry = guard.get(&dn).ok_or_else(|| CoreError::Message("no such object".to_string()))?;
+                let guard = self
+                    .entries
+                    .lock()
+                    .map_err(|_| CoreError::Message("entries poisoned".to_string()))?;
+                let entry = guard
+                    .get(&dn)
+                    .ok_or_else(|| CoreError::Message("no such object".to_string()))?;
                 let mut password_ok = false;
                 for attr in &entry.attributes {
                     if attr.name.eq_ignore_ascii_case("userpassword") {
@@ -687,7 +701,10 @@ impl LdapBackend for InMemoryBackend {
     }
 
     fn search(&self, req: &SearchRequest) -> CoreResult<Vec<SearchResultEntry>> {
-        let guard = self.entries.lock().map_err(|_| CoreError::Message("entries poisoned".to_string()))?;
+        let guard = self
+            .entries
+            .lock()
+            .map_err(|_| CoreError::Message("entries poisoned".to_string()))?;
         let mut results = Vec::new();
         let base = normalize_dn(&req.base_dn);
         for entry in guard.values() {
@@ -711,7 +728,10 @@ impl LdapBackend for InMemoryBackend {
     }
 
     fn add(&self, req: &AddRequest) -> CoreResult<LdapResult> {
-        let mut guard = self.entries.lock().map_err(|_| CoreError::Message("entries poisoned".to_string()))?;
+        let mut guard = self
+            .entries
+            .lock()
+            .map_err(|_| CoreError::Message("entries poisoned".to_string()))?;
         let dn = normalize_dn(&req.dn);
         if guard.contains_key(&dn) {
             return Ok(LdapResult {
@@ -730,9 +750,14 @@ impl LdapBackend for InMemoryBackend {
     }
 
     fn modify(&self, req: &ModifyRequest) -> CoreResult<LdapResult> {
-        let mut guard = self.entries.lock().map_err(|_| CoreError::Message("entries poisoned".to_string()))?;
+        let mut guard = self
+            .entries
+            .lock()
+            .map_err(|_| CoreError::Message("entries poisoned".to_string()))?;
         let dn = normalize_dn(&req.dn);
-        let entry = guard.get_mut(&dn).ok_or_else(|| CoreError::Message("no such object".to_string()))?;
+        let entry = guard
+            .get_mut(&dn)
+            .ok_or_else(|| CoreError::Message("no such object".to_string()))?;
         for change in &req.changes {
             apply_change(entry, change)?;
         }
@@ -740,7 +765,10 @@ impl LdapBackend for InMemoryBackend {
     }
 
     fn delete(&self, dn: &str) -> CoreResult<LdapResult> {
-        let mut guard = self.entries.lock().map_err(|_| CoreError::Message("entries poisoned".to_string()))?;
+        let mut guard = self
+            .entries
+            .lock()
+            .map_err(|_| CoreError::Message("entries poisoned".to_string()))?;
         let key = normalize_dn(dn);
         if guard.remove(&key).is_some() {
             Ok(ldap_success())
@@ -755,9 +783,14 @@ impl LdapBackend for InMemoryBackend {
     }
 
     fn compare(&self, req: &CompareRequest) -> CoreResult<LdapResult> {
-        let guard = self.entries.lock().map_err(|_| CoreError::Message("entries poisoned".to_string()))?;
+        let guard = self
+            .entries
+            .lock()
+            .map_err(|_| CoreError::Message("entries poisoned".to_string()))?;
         let dn = normalize_dn(&req.dn);
-        let entry = guard.get(&dn).ok_or_else(|| CoreError::Message("no such object".to_string()))?;
+        let entry = guard
+            .get(&dn)
+            .ok_or_else(|| CoreError::Message("no such object".to_string()))?;
         let mut matched = false;
         for attr in &entry.attributes {
             if attr.name.eq_ignore_ascii_case(&req.ava.attribute) {
@@ -773,7 +806,11 @@ impl LdapBackend for InMemoryBackend {
             }
         }
         Ok(LdapResult {
-            code: if matched { ResultCode::CompareTrue } else { ResultCode::CompareFalse },
+            code: if matched {
+                ResultCode::CompareTrue
+            } else {
+                ResultCode::CompareFalse
+            },
             matched_dn: req.dn.clone(),
             message: String::new(),
             referrals: Vec::new(),
@@ -801,7 +838,11 @@ pub struct LdapServer {
 }
 
 impl LdapServer {
-    pub fn bind(addr: SocketAddr, timeouts: Timeouts, backend: Arc<dyn LdapBackend>) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        timeouts: Timeouts,
+        backend: Arc<dyn LdapBackend>,
+    ) -> CoreResult<Self> {
         let listener = TcpListener::bind(addr).map_err(CoreError::Io)?;
         Ok(Self {
             listener,
@@ -834,8 +875,14 @@ pub struct AsyncLdapServer {
 }
 
 impl AsyncLdapServer {
-    pub async fn bind(addr: SocketAddr, timeouts: Timeouts, backend: Arc<dyn LdapBackend>) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+    pub async fn bind(
+        addr: SocketAddr,
+        timeouts: Timeouts,
+        backend: Arc<dyn LdapBackend>,
+    ) -> CoreResult<Self> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             backend,
@@ -859,13 +906,21 @@ impl AsyncLdapServer {
     }
 }
 
-fn handle_session(stream: TcpStream, timeouts: Timeouts, backend: Arc<dyn LdapBackend>) -> CoreResult<()> {
+fn handle_session(
+    stream: TcpStream,
+    timeouts: Timeouts,
+    backend: Arc<dyn LdapBackend>,
+) -> CoreResult<()> {
     let mut transport = TcpTransport::from_stream(stream, timeouts)?;
     loop {
         let data = match read_ber_message(&mut transport) {
             Ok(data) => data,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Ok(())
+            }
             Err(err) => return Err(err),
         };
         let message = LdapMessage::decode(&data)?;
@@ -886,8 +941,12 @@ async fn handle_session_async(
     loop {
         let data = match read_ber_message_async(&mut transport).await {
             Ok(data) => data,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Ok(())
+            }
             Err(err) => return Err(err),
         };
         let message = LdapMessage::decode(&data)?;
@@ -899,7 +958,10 @@ async fn handle_session_async(
     }
 }
 
-fn handle_message(backend: &Arc<dyn LdapBackend>, message: LdapMessage) -> CoreResult<Vec<LdapMessage>> {
+fn handle_message(
+    backend: &Arc<dyn LdapBackend>,
+    message: LdapMessage,
+) -> CoreResult<Vec<LdapMessage>> {
     let msg_id = message.message_id;
     match message.op {
         ProtocolOp::BindRequest(req) => {
@@ -1056,16 +1118,32 @@ fn encode_protocol_op(op: &ProtocolOp) -> CoreResult<Vec<u8>> {
         ProtocolOp::SearchResultDone(result) => Ok(encode_search_done(result)),
         ProtocolOp::SearchResultReference(uris) => Ok(encode_search_ref(uris)),
         ProtocolOp::ModifyRequest(req) => Ok(encode_modify_request(req)?),
-        ProtocolOp::ModifyResponse(result) => Ok(encode_tagged(TAG_MODIFY_RESPONSE, encode_ldap_result(result))),
+        ProtocolOp::ModifyResponse(result) => Ok(encode_tagged(
+            TAG_MODIFY_RESPONSE,
+            encode_ldap_result(result),
+        )),
         ProtocolOp::AddRequest(req) => Ok(encode_add_request(req)?),
-        ProtocolOp::AddResponse(result) => Ok(encode_tagged(TAG_ADD_RESPONSE, encode_ldap_result(result))),
+        ProtocolOp::AddResponse(result) => {
+            Ok(encode_tagged(TAG_ADD_RESPONSE, encode_ldap_result(result)))
+        }
         ProtocolOp::DelRequest(dn) => Ok(encode_tagged(TAG_DEL_REQUEST, dn.as_bytes().to_vec())),
-        ProtocolOp::DelResponse(result) => Ok(encode_tagged(TAG_DEL_RESPONSE, encode_ldap_result(result))),
+        ProtocolOp::DelResponse(result) => {
+            Ok(encode_tagged(TAG_DEL_RESPONSE, encode_ldap_result(result)))
+        }
         ProtocolOp::ModifyDnRequest(req) => Ok(encode_moddn_request(req)?),
-        ProtocolOp::ModifyDnResponse(result) => Ok(encode_tagged(TAG_MODDN_RESPONSE, encode_ldap_result(result))),
+        ProtocolOp::ModifyDnResponse(result) => Ok(encode_tagged(
+            TAG_MODDN_RESPONSE,
+            encode_ldap_result(result),
+        )),
         ProtocolOp::CompareRequest(req) => Ok(encode_compare_request(req)?),
-        ProtocolOp::CompareResponse(result) => Ok(encode_tagged(TAG_COMPARE_RESPONSE, encode_ldap_result(result))),
-        ProtocolOp::AbandonRequest(msg_id) => Ok(encode_tagged(TAG_ABANDON_REQUEST, encode_integer_content(*msg_id as i64))),
+        ProtocolOp::CompareResponse(result) => Ok(encode_tagged(
+            TAG_COMPARE_RESPONSE,
+            encode_ldap_result(result),
+        )),
+        ProtocolOp::AbandonRequest(msg_id) => Ok(encode_tagged(
+            TAG_ABANDON_REQUEST,
+            encode_integer_content(*msg_id as i64),
+        )),
         ProtocolOp::ExtendedRequest(req) => Ok(encode_extended_request(req)?),
         ProtocolOp::ExtendedResponse(resp) => Ok(encode_extended_response(resp)?),
     }
@@ -1077,25 +1155,37 @@ fn decode_protocol_op(element: BerElement) -> CoreResult<ProtocolOp> {
         TAG_BIND_RESPONSE => Ok(ProtocolOp::BindResponse(decode_bind_response(&element)?)),
         TAG_UNBIND_REQUEST => Ok(ProtocolOp::UnbindRequest),
         TAG_SEARCH_REQUEST => Ok(ProtocolOp::SearchRequest(decode_search_request(&element)?)),
-        TAG_SEARCH_ENTRY => Ok(ProtocolOp::SearchResultEntry(decode_search_entry(&element)?)),
+        TAG_SEARCH_ENTRY => Ok(ProtocolOp::SearchResultEntry(decode_search_entry(
+            &element,
+        )?)),
         TAG_SEARCH_DONE => Ok(ProtocolOp::SearchResultDone(decode_ldap_result(&element)?)),
-        TAG_SEARCH_REF => Ok(ProtocolOp::SearchResultReference(decode_search_ref(&element)?)),
+        TAG_SEARCH_REF => Ok(ProtocolOp::SearchResultReference(decode_search_ref(
+            &element,
+        )?)),
         TAG_MODIFY_REQUEST => Ok(ProtocolOp::ModifyRequest(decode_modify_request(&element)?)),
         TAG_MODIFY_RESPONSE => Ok(ProtocolOp::ModifyResponse(decode_ldap_result(&element)?)),
         TAG_ADD_REQUEST => Ok(ProtocolOp::AddRequest(decode_add_request(&element)?)),
         TAG_ADD_RESPONSE => Ok(ProtocolOp::AddResponse(decode_ldap_result(&element)?)),
-        TAG_DEL_REQUEST => Ok(ProtocolOp::DelRequest(String::from_utf8_lossy(&element.content).to_string())),
+        TAG_DEL_REQUEST => Ok(ProtocolOp::DelRequest(
+            String::from_utf8_lossy(&element.content).to_string(),
+        )),
         TAG_DEL_RESPONSE => Ok(ProtocolOp::DelResponse(decode_ldap_result(&element)?)),
         TAG_MODDN_REQUEST => Ok(ProtocolOp::ModifyDnRequest(decode_moddn_request(&element)?)),
         TAG_MODDN_RESPONSE => Ok(ProtocolOp::ModifyDnResponse(decode_ldap_result(&element)?)),
-        TAG_COMPARE_REQUEST => Ok(ProtocolOp::CompareRequest(decode_compare_request(&element)?)),
+        TAG_COMPARE_REQUEST => Ok(ProtocolOp::CompareRequest(decode_compare_request(
+            &element,
+        )?)),
         TAG_COMPARE_RESPONSE => Ok(ProtocolOp::CompareResponse(decode_ldap_result(&element)?)),
         TAG_ABANDON_REQUEST => {
             let msg_id = decode_integer_content(&element.content)? as i32;
             Ok(ProtocolOp::AbandonRequest(msg_id))
         }
-        TAG_EXTENDED_REQUEST => Ok(ProtocolOp::ExtendedRequest(decode_extended_request(&element)?)),
-        TAG_EXTENDED_RESPONSE => Ok(ProtocolOp::ExtendedResponse(decode_extended_response(&element)?)),
+        TAG_EXTENDED_REQUEST => Ok(ProtocolOp::ExtendedRequest(decode_extended_request(
+            &element,
+        )?)),
+        TAG_EXTENDED_RESPONSE => Ok(ProtocolOp::ExtendedResponse(decode_extended_response(
+            &element,
+        )?)),
         _ => Err(CoreError::Parse("unknown protocol op".to_string())),
     }
 }
@@ -1108,7 +1198,10 @@ fn encode_bind_request(req: &BindRequest) -> Vec<u8> {
         BindAuth::Simple(secret) => {
             elements.push(encode_tagged(0x80, secret.clone()));
         }
-        BindAuth::Sasl { mechanism, credentials } => {
+        BindAuth::Sasl {
+            mechanism,
+            credentials,
+        } => {
             let mut sasl = Vec::new();
             sasl.push(encode_octet_string(mechanism.as_bytes()));
             if let Some(creds) = credentials {
@@ -1143,7 +1236,11 @@ fn decode_bind_request(element: &BerElement) -> CoreResult<BindRequest> {
         }
         _ => return Err(CoreError::Parse("invalid bind auth".to_string())),
     };
-    Ok(BindRequest { version, name, auth })
+    Ok(BindRequest {
+        version,
+        name,
+        auth,
+    })
 }
 
 fn encode_bind_response(resp: &BindResponse) -> Vec<u8> {
@@ -1281,7 +1378,10 @@ fn decode_modify_request(element: &BerElement) -> CoreResult<ModifyRequest> {
         let op = ModifyOp::from_u32(inner.read_enum()? as u32)?;
         let attr_elem = inner.read_element()?;
         let modification = decode_partial_attribute(&attr_elem)?;
-        changes.push(Change { operation: op, modification });
+        changes.push(Change {
+            operation: op,
+            modification,
+        });
     }
     Ok(ModifyRequest { dn, changes })
 }
@@ -1403,7 +1503,11 @@ fn decode_extended_response(element: &BerElement) -> CoreResult<ExtendedResponse
             _ => {}
         }
     }
-    Ok(ExtendedResponse { result, name, value })
+    Ok(ExtendedResponse {
+        result,
+        name,
+        value,
+    })
 }
 
 fn encode_ldap_result(result: &LdapResult) -> Vec<u8> {
@@ -1492,7 +1596,11 @@ fn decode_controls(element: &BerElement) -> CoreResult<Vec<Control>> {
                 _ => {}
             }
         }
-        controls.push(Control { oid, critical, value });
+        controls.push(Control {
+            oid,
+            critical,
+            value,
+        });
     }
     Ok(controls)
 }
@@ -1562,7 +1670,10 @@ fn encode_filter(filter: &Filter) -> CoreResult<Vec<u8>> {
             encode_tagged(TAG_FILTER_NOT, inner)
         }
         Filter::Equality(ava) => encode_tagged(TAG_FILTER_EQUALITY, encode_ava(ava)),
-        Filter::Substrings { attribute, substrings } => {
+        Filter::Substrings {
+            attribute,
+            substrings,
+        } => {
             let mut elements = Vec::new();
             elements.push(encode_octet_string(attribute.as_bytes()));
             let mut subs = Vec::new();
@@ -1642,17 +1753,28 @@ fn decode_filter(element: BerElement) -> CoreResult<Filter> {
             while sub_reader.remaining() > 0 {
                 let sub = sub_reader.read_element()?;
                 match sub.tag {
-                    0x80 => substrings.push(Substring::Initial(String::from_utf8_lossy(&sub.content).to_string())),
-                    0x81 => substrings.push(Substring::Any(String::from_utf8_lossy(&sub.content).to_string())),
-                    0x82 => substrings.push(Substring::Final(String::from_utf8_lossy(&sub.content).to_string())),
+                    0x80 => substrings.push(Substring::Initial(
+                        String::from_utf8_lossy(&sub.content).to_string(),
+                    )),
+                    0x81 => substrings.push(Substring::Any(
+                        String::from_utf8_lossy(&sub.content).to_string(),
+                    )),
+                    0x82 => substrings.push(Substring::Final(
+                        String::from_utf8_lossy(&sub.content).to_string(),
+                    )),
                     _ => {}
                 }
             }
-            Ok(Filter::Substrings { attribute, substrings })
+            Ok(Filter::Substrings {
+                attribute,
+                substrings,
+            })
         }
         TAG_FILTER_GE => Ok(Filter::GreaterOrEqual(decode_ava(&element)?)),
         TAG_FILTER_LE => Ok(Filter::LessOrEqual(decode_ava(&element)?)),
-        TAG_FILTER_PRESENT => Ok(Filter::Present(String::from_utf8_lossy(&element.content).to_string())),
+        TAG_FILTER_PRESENT => Ok(Filter::Present(
+            String::from_utf8_lossy(&element.content).to_string(),
+        )),
         TAG_FILTER_APPROX => Ok(Filter::Approx(decode_ava(&element)?)),
         TAG_FILTER_EXTENSIBLE => {
             let mut reader = BerReader::new(&element.content);
@@ -1663,7 +1785,9 @@ fn decode_filter(element: BerElement) -> CoreResult<Filter> {
             while reader.remaining() > 0 {
                 let elem = reader.read_element()?;
                 match elem.tag {
-                    0x81 => matching_rule = Some(String::from_utf8_lossy(&elem.content).to_string()),
+                    0x81 => {
+                        matching_rule = Some(String::from_utf8_lossy(&elem.content).to_string())
+                    }
                     0x82 => attribute = Some(String::from_utf8_lossy(&elem.content).to_string()),
                     0x83 => value = elem.content,
                     0x84 => dn_attributes = !elem.content.is_empty() && elem.content[0] != 0,
@@ -1750,7 +1874,9 @@ fn read_ber_message<T: StreamTransport>(transport: &mut T) -> CoreResult<Vec<u8>
     if len_byte[0] & 0x80 != 0 {
         let count = (len_byte[0] & 0x7f) as usize;
         if count == 0 {
-            return Err(CoreError::Parse("indefinite length not supported".to_string()));
+            return Err(CoreError::Parse(
+                "indefinite length not supported".to_string(),
+            ));
         }
         len_bytes.resize(count, 0);
         transport.read_exact(&mut len_bytes)?;
@@ -1779,7 +1905,9 @@ async fn read_ber_message_async<T: AsyncStreamTransport>(transport: &mut T) -> C
     if len_byte[0] & 0x80 != 0 {
         let count = (len_byte[0] & 0x7f) as usize;
         if count == 0 {
-            return Err(CoreError::Parse("indefinite length not supported".to_string()));
+            return Err(CoreError::Parse(
+                "indefinite length not supported".to_string(),
+            ));
         }
         len_bytes.resize(count, 0);
         transport.read_exact(&mut len_bytes).await?;
@@ -1835,7 +1963,9 @@ impl<'a> BerReader<'a> {
         let mut len = (len_byte & 0x7f) as usize;
         if len_byte & 0x80 != 0 {
             if len == 0 {
-                return Err(CoreError::Parse("indefinite length not supported".to_string()));
+                return Err(CoreError::Parse(
+                    "indefinite length not supported".to_string(),
+                ));
             }
             if self.remaining() < len {
                 return Err(CoreError::Parse("invalid length".to_string()));
@@ -2052,7 +2182,11 @@ fn decode_oid(data: &[u8]) -> CoreResult<String> {
         }
         parts.push(value);
     }
-    Ok(parts.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("."))
+    Ok(parts
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join("."))
 }
 
 fn normalize_dn(dn: &str) -> String {
@@ -2103,9 +2237,15 @@ fn filter_match(filter: &Filter, entry: &SearchResultEntry) -> bool {
         Filter::Equality(ava) => attr_equals(entry, ava),
         Filter::GreaterOrEqual(ava) => attr_compare(entry, ava, |a, b| a >= b),
         Filter::LessOrEqual(ava) => attr_compare(entry, ava, |a, b| a <= b),
-        Filter::Present(attr) => entry.attributes.iter().any(|a| a.name.eq_ignore_ascii_case(attr)),
+        Filter::Present(attr) => entry
+            .attributes
+            .iter()
+            .any(|a| a.name.eq_ignore_ascii_case(attr)),
         Filter::Approx(ava) => attr_approx(entry, ava),
-        Filter::Substrings { attribute, substrings } => attr_substrings(entry, attribute, substrings),
+        Filter::Substrings {
+            attribute,
+            substrings,
+        } => attr_substrings(entry, attribute, substrings),
         Filter::Extensible(ext) => {
             if let Some(attr) = &ext.attribute {
                 let ava = AttributeValueAssertion {
@@ -2146,7 +2286,11 @@ fn attr_approx(entry: &SearchResultEntry, ava: &AttributeValueAssertion) -> bool
     false
 }
 
-fn attr_compare(entry: &SearchResultEntry, ava: &AttributeValueAssertion, cmp: impl Fn(String, String) -> bool) -> bool {
+fn attr_compare(
+    entry: &SearchResultEntry,
+    ava: &AttributeValueAssertion,
+    cmp: impl Fn(String, String) -> bool,
+) -> bool {
     let target = String::from_utf8_lossy(&ava.value).to_string();
     for attr in &entry.attributes {
         if attr.name.eq_ignore_ascii_case(&ava.attribute) {
@@ -2210,7 +2354,12 @@ fn values_equal(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn approx_equal(a: &[u8], b: &[u8]) -> bool {
-    let normalize = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+    let normalize = |s: &str| {
+        s.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase()
+    };
     if let (Ok(sa), Ok(sb)) = (std::str::from_utf8(a), std::str::from_utf8(b)) {
         normalize(sa) == normalize(sb)
     } else {
@@ -2262,7 +2411,8 @@ fn apply_change(entry: &mut SearchResultEntry, change: &Change) -> CoreResult<()
                     .iter_mut()
                     .find(|a| a.name.eq_ignore_ascii_case(&change.modification.name))
                 {
-                    attr.values.retain(|v| !change.modification.values.contains(v));
+                    attr.values
+                        .retain(|v| !change.modification.values.contains(v));
                 }
             }
         }
@@ -2387,18 +2537,24 @@ mod tests {
             ],
         };
         let backend = Arc::new(InMemoryBackend::new().with_entry(entry));
-        let server = match LdapServer::bind("127.0.0.1:0".parse().unwrap(), Timeouts::default(), backend) {
-            Ok(server) => server,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(err) => panic!("bind: {err:?}"),
-        };
+        let server =
+            match LdapServer::bind("127.0.0.1:0".parse().unwrap(), Timeouts::default(), backend) {
+                Ok(server) => server,
+                Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return
+                }
+                Err(err) => panic!("bind: {err:?}"),
+            };
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();
         });
 
-        let mut client = LdapClient::connect(&NetAddr::from_socket(addr), Timeouts::default()).unwrap();
-        let result = client.bind_simple("cn=user,dc=example,dc=com", "secret").unwrap();
+        let mut client =
+            LdapClient::connect(&NetAddr::from_socket(addr), Timeouts::default()).unwrap();
+        let result = client
+            .bind_simple("cn=user,dc=example,dc=com", "secret")
+            .unwrap();
         assert_eq!(result.code, ResultCode::Success);
         let (entries, result) = client
             .search(SearchRequest {

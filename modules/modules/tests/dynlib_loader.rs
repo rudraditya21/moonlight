@@ -8,18 +8,14 @@ fn dynlib_loader_smoke() {
     let mut module = load_dyn_module(&lib_path).expect("load dynlib module");
     assert_eq!(module.metadata().name, "auxiliary/test/dynlib_echo");
     module.options_mut().set("INPUT", "world").expect("set");
-    let result = module
-        .run(&ModuleContext { session_id: 1 })
-        .expect("run");
+    let result = module.run(&ModuleContext { session_id: 1 }).expect("run");
     assert!(result.success);
     assert!(result.message.contains("echo: world"));
 }
 
 fn find_dynlib() -> Option<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())?;
+    let workspace_root = manifest_dir.parent().and_then(|p| p.parent())?;
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     let target = workspace_root.join("target").join(profile);
     let _ = build_dynlib(workspace_root);

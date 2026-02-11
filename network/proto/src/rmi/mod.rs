@@ -149,7 +149,9 @@ pub struct AsyncRmiServer {
 
 impl AsyncRmiServer {
     pub async fn bind(addr: SocketAddr, config: RmiServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { listener, config })
     }
 
@@ -430,7 +432,11 @@ fn read_frame<T: StreamTransport>(transport: &mut T) -> CoreResult<RmiFrame> {
     if len > 0 {
         transport.read_exact(&mut payload)?;
     }
-    Ok(RmiFrame { op, call_id, payload })
+    Ok(RmiFrame {
+        op,
+        call_id,
+        payload,
+    })
 }
 
 async fn read_frame_async<T: AsyncStreamTransport>(transport: &mut T) -> CoreResult<RmiFrame> {
@@ -443,7 +449,11 @@ async fn read_frame_async<T: AsyncStreamTransport>(transport: &mut T) -> CoreRes
     if len > 0 {
         transport.read_exact(&mut payload).await?;
     }
-    Ok(RmiFrame { op, call_id, payload })
+    Ok(RmiFrame {
+        op,
+        call_id,
+        payload,
+    })
 }
 
 fn write_frame<T: StreamTransport>(transport: &mut T, frame: &RmiFrame) -> CoreResult<()> {
@@ -488,8 +498,12 @@ mod tests {
             let _ = server.serve();
         });
 
-        let mut client = RmiClient::connect(&net::NetAddr::from_socket(addr), RmiClientConfig::default()).unwrap();
-        let result = client.call("sum", &["2".to_string(), "5".to_string()]).unwrap();
+        let mut client =
+            RmiClient::connect(&net::NetAddr::from_socket(addr), RmiClientConfig::default())
+                .unwrap();
+        let result = client
+            .call("sum", &["2".to_string(), "5".to_string()])
+            .unwrap();
         assert_eq!(result, "7");
     }
 }

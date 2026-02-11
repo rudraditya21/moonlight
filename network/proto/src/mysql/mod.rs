@@ -149,7 +149,9 @@ struct MysqlHandshakeResponse {
 impl MysqlHandshakeResponse {
     fn decode(payload: &[u8]) -> CoreResult<Self> {
         if payload.len() < 36 {
-            return Err(CoreError::Parse("mysql handshake response too short".to_string()));
+            return Err(CoreError::Parse(
+                "mysql handshake response too short".to_string(),
+            ));
         }
         let mut idx = 0;
         let capability_flags = u32::from_le_bytes(payload[idx..idx + 4].try_into().unwrap());
@@ -190,7 +192,8 @@ impl MysqlHandshakeResponse {
             None
         };
 
-        let auth_plugin_name = if capability_flags & CLIENT_PLUGIN_AUTH != 0 && idx < payload.len() {
+        let auth_plugin_name = if capability_flags & CLIENT_PLUGIN_AUTH != 0 && idx < payload.len()
+        {
             Some(read_null_terminated(payload, &mut idx)?)
         } else {
             None
@@ -261,7 +264,8 @@ impl MysqlClient {
         if config.database.is_some() {
             capabilities |= CLIENT_CONNECT_WITH_DB;
         }
-        let auth_response = mysql_native_password_token(&config.password, &handshake.auth_plugin_data);
+        let auth_response =
+            mysql_native_password_token(&config.password, &handshake.auth_plugin_data);
 
         let response = encode_handshake_response(
             capabilities,
@@ -388,7 +392,8 @@ impl AsyncMysqlClient {
         if config.database.is_some() {
             capabilities |= CLIENT_CONNECT_WITH_DB;
         }
-        let auth_response = mysql_native_password_token(&config.password, &handshake.auth_plugin_data);
+        let auth_response =
+            mysql_native_password_token(&config.password, &handshake.auth_plugin_data);
         let response = encode_handshake_response(
             capabilities,
             config.character_set,
@@ -555,7 +560,9 @@ pub struct AsyncMysqlServer {
 
 impl AsyncMysqlServer {
     pub async fn bind(addr: SocketAddr, config: MysqlServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { listener, config })
     }
 
@@ -597,7 +604,9 @@ fn handle_mysql_stream(stream: TcpStream, config: MysqlServerConfig) -> CoreResu
 
     let mut state = MysqlState {
         authenticated: true,
-        database: response.database.unwrap_or_else(|| config.default_database.clone()),
+        database: response
+            .database
+            .unwrap_or_else(|| config.default_database.clone()),
     };
     loop {
         let (payload, _) = match read_packet(&mut transport) {
@@ -663,7 +672,9 @@ async fn handle_mysql_stream_async(
 
     let mut state = MysqlState {
         authenticated: true,
-        database: response.database.unwrap_or_else(|| config.default_database.clone()),
+        database: response
+            .database
+            .unwrap_or_else(|| config.default_database.clone()),
     };
     loop {
         let (payload, _) = match read_packet_async(&mut transport).await {
@@ -727,11 +738,7 @@ fn respond_to_query(
             return Ok(());
         }
         if lower.contains("1") {
-            send_result_set(
-                transport,
-                &["1"],
-                vec![vec![Some(b"1".to_vec())]],
-            )?;
+            send_result_set(transport, &["1"], vec![vec![Some(b"1".to_vec())]])?;
             return Ok(());
         }
         send_result_set(
@@ -783,12 +790,7 @@ async fn respond_to_query_async(
             return Ok(());
         }
         if lower.contains("1") {
-            send_result_set_async(
-                transport,
-                &["1"],
-                vec![vec![Some(b"1".to_vec())]],
-            )
-            .await?;
+            send_result_set_async(transport, &["1"], vec![vec![Some(b"1".to_vec())]]).await?;
             return Ok(());
         }
         send_result_set_async(
@@ -812,7 +814,11 @@ async fn respond_to_query_async(
     Ok(())
 }
 
-fn authenticate_user(config: &MysqlServerConfig, response: &MysqlHandshakeResponse, scramble: &[u8; 20]) -> bool {
+fn authenticate_user(
+    config: &MysqlServerConfig,
+    response: &MysqlHandshakeResponse,
+    scramble: &[u8; 20],
+) -> bool {
     if response.capability_flags & CLIENT_PROTOCOL_41 == 0 {
         return false;
     }
@@ -887,7 +893,10 @@ impl MysqlErrPacket {
         if self.state.is_empty() {
             format!("mysql error {}: {}", self.code, self.message)
         } else {
-            format!("mysql error {} ({}) {}", self.code, self.state, self.message)
+            format!(
+                "mysql error {} ({}) {}",
+                self.code, self.state, self.message
+            )
         }
     }
 }
@@ -932,10 +941,19 @@ fn parse_err_packet(payload: &[u8]) -> CoreResult<MysqlErrPacket> {
     } else {
         String::new()
     };
-    Ok(MysqlErrPacket { code, state, message })
+    Ok(MysqlErrPacket {
+        code,
+        state,
+        message,
+    })
 }
 
-fn build_ok_packet(affected_rows: u64, last_insert_id: u64, status_flags: u16, warnings: u16) -> Vec<u8> {
+fn build_ok_packet(
+    affected_rows: u64,
+    last_insert_id: u64,
+    status_flags: u16,
+    warnings: u16,
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(0x00);
     encode_lenenc_int(&mut out, affected_rows);
@@ -1142,7 +1160,9 @@ fn read_packet<T: StreamTransport>(transport: &mut T) -> CoreResult<(Vec<u8>, u8
     Ok((payload, seq))
 }
 
-async fn read_packet_async<T: AsyncStreamTransport>(transport: &mut T) -> CoreResult<(Vec<u8>, u8)> {
+async fn read_packet_async<T: AsyncStreamTransport>(
+    transport: &mut T,
+) -> CoreResult<(Vec<u8>, u8)> {
     let mut header = [0u8; 4];
     transport.read_exact(&mut header).await?;
     let length = (header[0] as usize) | ((header[1] as usize) << 8) | ((header[2] as usize) << 16);
@@ -1225,7 +1245,9 @@ fn decode_lenenc_int(data: &[u8], idx: &mut usize) -> CoreResult<u64> {
             if *idx + 3 > data.len() {
                 return Err(CoreError::Parse("mysql lenenc int".to_string()));
             }
-            let value = (data[*idx] as u64) | ((data[*idx + 1] as u64) << 8) | ((data[*idx + 2] as u64) << 16);
+            let value = (data[*idx] as u64)
+                | ((data[*idx + 1] as u64) << 8)
+                | ((data[*idx + 2] as u64) << 16);
             *idx += 3;
             Ok(value)
         }

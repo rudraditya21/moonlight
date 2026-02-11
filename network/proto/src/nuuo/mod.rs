@@ -171,7 +171,9 @@ pub struct AsyncNuuoServer {
 
 impl AsyncNuuoServer {
     pub async fn bind(addr: SocketAddr, config: NuuoServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { listener, config })
     }
 
@@ -194,7 +196,10 @@ impl NuuoClient {
     pub fn connect(addr: &net::NetAddr, config: NuuoClientConfig) -> CoreResult<Self> {
         let mut transport = TcpTransport::connect(addr, config.timeouts)?;
         let hello = build_hello("moonlight", "1.0");
-        write_frame(&mut transport, &NuuoFrame::new(NuuoMessageType::Hello, hello))?;
+        write_frame(
+            &mut transport,
+            &NuuoFrame::new(NuuoMessageType::Hello, hello),
+        )?;
         let _ = read_frame(&mut transport)?;
         let auth = build_auth(&config.username, &config.password);
         write_frame(&mut transport, &NuuoFrame::new(NuuoMessageType::Auth, auth))?;
@@ -206,7 +211,10 @@ impl NuuoClient {
     }
 
     pub fn ping(&mut self) -> CoreResult<()> {
-        write_frame(&mut self.transport, &NuuoFrame::new(NuuoMessageType::Ping, Vec::new()))?;
+        write_frame(
+            &mut self.transport,
+            &NuuoFrame::new(NuuoMessageType::Ping, Vec::new()),
+        )?;
         let response = read_frame(&mut self.transport)?;
         if response.msg_type != NuuoMessageType::Pong {
             return Err(CoreError::Parse("nuuo expected pong".to_string()));
@@ -215,7 +223,10 @@ impl NuuoClient {
     }
 
     pub fn get_info(&mut self) -> CoreResult<HashMap<String, String>> {
-        write_frame(&mut self.transport, &NuuoFrame::new(NuuoMessageType::GetInfo, Vec::new()))?;
+        write_frame(
+            &mut self.transport,
+            &NuuoFrame::new(NuuoMessageType::GetInfo, Vec::new()),
+        )?;
         let response = read_frame(&mut self.transport)?;
         if response.msg_type != NuuoMessageType::Info {
             return Err(CoreError::Parse("nuuo expected info".to_string()));
@@ -224,7 +235,10 @@ impl NuuoClient {
     }
 
     pub fn list_cameras(&mut self) -> CoreResult<Vec<NuuoCamera>> {
-        write_frame(&mut self.transport, &NuuoFrame::new(NuuoMessageType::ListCameras, Vec::new()))?;
+        write_frame(
+            &mut self.transport,
+            &NuuoFrame::new(NuuoMessageType::ListCameras, Vec::new()),
+        )?;
         let response = read_frame(&mut self.transport)?;
         if response.msg_type != NuuoMessageType::CameraList {
             return Err(CoreError::Parse("nuuo expected camera list".to_string()));
@@ -241,7 +255,11 @@ impl AsyncNuuoClient {
     pub async fn connect(addr: &net::NetAddr, config: NuuoClientConfig) -> CoreResult<Self> {
         let mut transport = AsyncTcpTransport::connect(addr, config.timeouts).await?;
         let hello = build_hello("moonlight", "1.0");
-        write_frame_async(&mut transport, &NuuoFrame::new(NuuoMessageType::Hello, hello)).await?;
+        write_frame_async(
+            &mut transport,
+            &NuuoFrame::new(NuuoMessageType::Hello, hello),
+        )
+        .await?;
         let _ = read_frame_async(&mut transport).await?;
         let auth = build_auth(&config.username, &config.password);
         write_frame_async(&mut transport, &NuuoFrame::new(NuuoMessageType::Auth, auth)).await?;
@@ -253,7 +271,11 @@ impl AsyncNuuoClient {
     }
 
     pub async fn ping(&mut self) -> CoreResult<()> {
-        write_frame_async(&mut self.transport, &NuuoFrame::new(NuuoMessageType::Ping, Vec::new())).await?;
+        write_frame_async(
+            &mut self.transport,
+            &NuuoFrame::new(NuuoMessageType::Ping, Vec::new()),
+        )
+        .await?;
         let response = read_frame_async(&mut self.transport).await?;
         if response.msg_type != NuuoMessageType::Pong {
             return Err(CoreError::Parse("nuuo expected pong".to_string()));
@@ -262,7 +284,11 @@ impl AsyncNuuoClient {
     }
 
     pub async fn get_info(&mut self) -> CoreResult<HashMap<String, String>> {
-        write_frame_async(&mut self.transport, &NuuoFrame::new(NuuoMessageType::GetInfo, Vec::new())).await?;
+        write_frame_async(
+            &mut self.transport,
+            &NuuoFrame::new(NuuoMessageType::GetInfo, Vec::new()),
+        )
+        .await?;
         let response = read_frame_async(&mut self.transport).await?;
         if response.msg_type != NuuoMessageType::Info {
             return Err(CoreError::Parse("nuuo expected info".to_string()));
@@ -271,7 +297,11 @@ impl AsyncNuuoClient {
     }
 
     pub async fn list_cameras(&mut self) -> CoreResult<Vec<NuuoCamera>> {
-        write_frame_async(&mut self.transport, &NuuoFrame::new(NuuoMessageType::ListCameras, Vec::new())).await?;
+        write_frame_async(
+            &mut self.transport,
+            &NuuoFrame::new(NuuoMessageType::ListCameras, Vec::new()),
+        )
+        .await?;
         let response = read_frame_async(&mut self.transport).await?;
         if response.msg_type != NuuoMessageType::CameraList {
             return Err(CoreError::Parse("nuuo expected camera list".to_string()));
@@ -287,7 +317,10 @@ fn handle_session(stream: TcpStream, config: NuuoServerConfig) -> CoreResult<()>
         return Err(CoreError::Parse("nuuo expected hello".to_string()));
     }
     let server_hello = build_hello(&config.product_name, &config.version);
-    write_frame(&mut transport, &NuuoFrame::new(NuuoMessageType::Hello, server_hello))?;
+    write_frame(
+        &mut transport,
+        &NuuoFrame::new(NuuoMessageType::Hello, server_hello),
+    )?;
 
     let auth = read_frame(&mut transport)?;
     if auth.msg_type != NuuoMessageType::Auth {
@@ -295,10 +328,16 @@ fn handle_session(stream: TcpStream, config: NuuoServerConfig) -> CoreResult<()>
     }
     let auth_ok = validate_auth(&config.users, &auth.payload);
     if !auth_ok {
-        write_frame(&mut transport, &NuuoFrame::new(NuuoMessageType::AuthFail, Vec::new()))?;
+        write_frame(
+            &mut transport,
+            &NuuoFrame::new(NuuoMessageType::AuthFail, Vec::new()),
+        )?;
         return Ok(());
     }
-    write_frame(&mut transport, &NuuoFrame::new(NuuoMessageType::AuthOk, Vec::new()))?;
+    write_frame(
+        &mut transport,
+        &NuuoFrame::new(NuuoMessageType::AuthOk, Vec::new()),
+    )?;
 
     loop {
         let frame = match read_frame(&mut transport) {
@@ -307,32 +346,51 @@ fn handle_session(stream: TcpStream, config: NuuoServerConfig) -> CoreResult<()>
         };
         match frame.msg_type {
             NuuoMessageType::Ping => {
-                write_frame(&mut transport, &NuuoFrame::new(NuuoMessageType::Pong, Vec::new()))?;
+                write_frame(
+                    &mut transport,
+                    &NuuoFrame::new(NuuoMessageType::Pong, Vec::new()),
+                )?;
             }
             NuuoMessageType::GetInfo => {
                 let payload = build_info(&config);
-                write_frame(&mut transport, &NuuoFrame::new(NuuoMessageType::Info, payload))?;
+                write_frame(
+                    &mut transport,
+                    &NuuoFrame::new(NuuoMessageType::Info, payload),
+                )?;
             }
             NuuoMessageType::ListCameras => {
                 let payload = build_camera_list(&config.cameras);
-                write_frame(&mut transport, &NuuoFrame::new(NuuoMessageType::CameraList, payload))?;
+                write_frame(
+                    &mut transport,
+                    &NuuoFrame::new(NuuoMessageType::CameraList, payload),
+                )?;
             }
             _ => {
-                write_frame(&mut transport, &NuuoFrame::new(NuuoMessageType::Error, b"unsupported".to_vec()))?;
+                write_frame(
+                    &mut transport,
+                    &NuuoFrame::new(NuuoMessageType::Error, b"unsupported".to_vec()),
+                )?;
             }
         }
     }
     Ok(())
 }
 
-async fn handle_session_async(stream: tokio::net::TcpStream, config: NuuoServerConfig) -> CoreResult<()> {
+async fn handle_session_async(
+    stream: tokio::net::TcpStream,
+    config: NuuoServerConfig,
+) -> CoreResult<()> {
     let mut transport = AsyncTcpTransport::from_stream(stream);
     let hello = read_frame_async(&mut transport).await?;
     if hello.msg_type != NuuoMessageType::Hello {
         return Err(CoreError::Parse("nuuo expected hello".to_string()));
     }
     let server_hello = build_hello(&config.product_name, &config.version);
-    write_frame_async(&mut transport, &NuuoFrame::new(NuuoMessageType::Hello, server_hello)).await?;
+    write_frame_async(
+        &mut transport,
+        &NuuoFrame::new(NuuoMessageType::Hello, server_hello),
+    )
+    .await?;
 
     let auth = read_frame_async(&mut transport).await?;
     if auth.msg_type != NuuoMessageType::Auth {
@@ -340,10 +398,18 @@ async fn handle_session_async(stream: tokio::net::TcpStream, config: NuuoServerC
     }
     let auth_ok = validate_auth(&config.users, &auth.payload);
     if !auth_ok {
-        write_frame_async(&mut transport, &NuuoFrame::new(NuuoMessageType::AuthFail, Vec::new())).await?;
+        write_frame_async(
+            &mut transport,
+            &NuuoFrame::new(NuuoMessageType::AuthFail, Vec::new()),
+        )
+        .await?;
         return Ok(());
     }
-    write_frame_async(&mut transport, &NuuoFrame::new(NuuoMessageType::AuthOk, Vec::new())).await?;
+    write_frame_async(
+        &mut transport,
+        &NuuoFrame::new(NuuoMessageType::AuthOk, Vec::new()),
+    )
+    .await?;
 
     loop {
         let frame = match read_frame_async(&mut transport).await {
@@ -352,18 +418,34 @@ async fn handle_session_async(stream: tokio::net::TcpStream, config: NuuoServerC
         };
         match frame.msg_type {
             NuuoMessageType::Ping => {
-                write_frame_async(&mut transport, &NuuoFrame::new(NuuoMessageType::Pong, Vec::new())).await?;
+                write_frame_async(
+                    &mut transport,
+                    &NuuoFrame::new(NuuoMessageType::Pong, Vec::new()),
+                )
+                .await?;
             }
             NuuoMessageType::GetInfo => {
                 let payload = build_info(&config);
-                write_frame_async(&mut transport, &NuuoFrame::new(NuuoMessageType::Info, payload)).await?;
+                write_frame_async(
+                    &mut transport,
+                    &NuuoFrame::new(NuuoMessageType::Info, payload),
+                )
+                .await?;
             }
             NuuoMessageType::ListCameras => {
                 let payload = build_camera_list(&config.cameras);
-                write_frame_async(&mut transport, &NuuoFrame::new(NuuoMessageType::CameraList, payload)).await?;
+                write_frame_async(
+                    &mut transport,
+                    &NuuoFrame::new(NuuoMessageType::CameraList, payload),
+                )
+                .await?;
             }
             _ => {
-                write_frame_async(&mut transport, &NuuoFrame::new(NuuoMessageType::Error, b"unsupported".to_vec())).await?;
+                write_frame_async(
+                    &mut transport,
+                    &NuuoFrame::new(NuuoMessageType::Error, b"unsupported".to_vec()),
+                )
+                .await?;
             }
         }
     }
@@ -395,7 +477,10 @@ fn build_info(config: &NuuoServerConfig) -> Vec<u8> {
 fn build_camera_list(cameras: &[NuuoCamera]) -> Vec<u8> {
     let mut lines = Vec::new();
     for cam in cameras {
-        let ip = cam.ip.map(|ip| ip.to_string()).unwrap_or_else(|| "".to_string());
+        let ip = cam
+            .ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "".to_string());
         lines.push(format!("id={},name={},ip={}", cam.id, cam.name, ip));
     }
     lines.join("\n").into_bytes()
@@ -435,7 +520,10 @@ fn validate_auth(users: &HashMap<String, String>, payload: &[u8]) -> bool {
     let map = parse_kv_payload(payload);
     let username = map.get("username").cloned().unwrap_or_default();
     let password = map.get("password").cloned().unwrap_or_default();
-    users.get(&username).map(|p| p == &password).unwrap_or(false)
+    users
+        .get(&username)
+        .map(|p| p == &password)
+        .unwrap_or(false)
 }
 
 fn encode_kv_payload(map: &HashMap<String, String>) -> Vec<u8> {

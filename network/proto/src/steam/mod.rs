@@ -409,7 +409,9 @@ fn handle_request(
         }
         A2S_PLAYER => {
             let challenge = decode_challenge(&data);
-            let mut guard = state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+            let mut guard = state
+                .lock()
+                .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
             if challenge == -1 || !guard.validate_challenge(addr, challenge) {
                 let value = guard.issue_challenge(addr);
                 let response = build_challenge_response(value);
@@ -421,7 +423,9 @@ fn handle_request(
         }
         A2S_RULES => {
             let challenge = decode_challenge(&data);
-            let mut guard = state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+            let mut guard = state
+                .lock()
+                .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
             if challenge == -1 || !guard.validate_challenge(addr, challenge) {
                 let value = guard.issue_challenge(addr);
                 let response = build_challenge_response(value);
@@ -448,7 +452,9 @@ async fn handle_request_async(
     match data[4] {
         A2S_INFO => {
             let response = {
-                let guard = state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+                let guard = state
+                    .lock()
+                    .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
                 build_info_response(&guard.info)
             };
             socket.send_to(&response, addr).await?;
@@ -456,7 +462,9 @@ async fn handle_request_async(
         A2S_PLAYER => {
             let challenge = decode_challenge(&data);
             let response = {
-                let mut guard = state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+                let mut guard = state
+                    .lock()
+                    .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
                 if challenge == -1 || !guard.validate_challenge(addr, challenge) {
                     let value = guard.issue_challenge(addr);
                     build_challenge_response(value)
@@ -469,7 +477,9 @@ async fn handle_request_async(
         A2S_RULES => {
             let challenge = decode_challenge(&data);
             let response = {
-                let mut guard = state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+                let mut guard = state
+                    .lock()
+                    .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
                 if challenge == -1 || !guard.validate_challenge(addr, challenge) {
                     let value = guard.issue_challenge(addr);
                     build_challenge_response(value)
@@ -647,10 +657,8 @@ mod tests {
             duration: 12.5,
         }];
         config.rules.insert("rule".to_string(), "value".to_string());
-        let server = crate::skip_if_perm!(SteamServer::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            config,
-        ));
+        let server =
+            crate::skip_if_perm!(SteamServer::bind("127.0.0.1:0".parse().unwrap(), config,));
         let addr = server.local_addr().unwrap();
         thread::spawn(move || {
             let _ = server.serve();

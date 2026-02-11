@@ -121,7 +121,8 @@ impl MqttPacket {
                 let mut vh = Vec::new();
                 encode_string(&mut vh, topic);
                 if *qos > 0 {
-                    let id = packet_id.ok_or_else(|| CoreError::Parse("mqtt missing packet id".to_string()))?;
+                    let id = packet_id
+                        .ok_or_else(|| CoreError::Parse("mqtt missing packet id".to_string()))?;
                     vh.extend_from_slice(&id.to_be_bytes());
                 }
                 let mut flags = (*qos & 0x03) << 1;
@@ -225,7 +226,9 @@ fn decode_connect(payload: &[u8]) -> CoreResult<MqttPacket> {
     let level = payload[idx];
     idx += 1;
     if level != 4 {
-        return Err(CoreError::Parse("mqtt protocol level unsupported".to_string()));
+        return Err(CoreError::Parse(
+            "mqtt protocol level unsupported".to_string(),
+        ));
     }
     if idx >= payload.len() {
         return Err(CoreError::Parse("mqtt flags missing".to_string()));
@@ -263,7 +266,9 @@ fn decode_publish(payload: &[u8], flags: u8) -> CoreResult<MqttPacket> {
     let qos = (flags >> 1) & 0x03;
     let packet_id = if qos > 0 {
         if idx + 2 > payload.len() {
-            return Err(CoreError::Parse("mqtt publish missing packet id".to_string()));
+            return Err(CoreError::Parse(
+                "mqtt publish missing packet id".to_string(),
+            ));
         }
         let id = u16::from_be_bytes([payload[idx], payload[idx + 1]]);
         idx += 2;
@@ -332,7 +337,9 @@ fn decode_remaining_length(data: &[u8]) -> CoreResult<(usize, usize)> {
     let mut idx = 0;
     loop {
         if idx >= data.len() {
-            return Err(CoreError::Parse("mqtt remaining length missing".to_string()));
+            return Err(CoreError::Parse(
+                "mqtt remaining length missing".to_string(),
+            ));
         }
         let encoded = data[idx];
         idx += 1;
@@ -342,7 +349,9 @@ fn decode_remaining_length(data: &[u8]) -> CoreResult<(usize, usize)> {
         }
         multiplier *= 128;
         if multiplier > 128 * 128 * 128 * 128 {
-            return Err(CoreError::Parse("mqtt remaining length overflow".to_string()));
+            return Err(CoreError::Parse(
+                "mqtt remaining length overflow".to_string(),
+            ));
         }
     }
     Ok((value, idx))
@@ -663,7 +672,9 @@ pub struct AsyncMqttServer {
 
 impl AsyncMqttServer {
     pub async fn bind(addr: SocketAddr, config: MqttServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             config,
@@ -687,7 +698,11 @@ impl AsyncMqttServer {
     }
 }
 
-fn handle_mqtt_client(stream: TcpStream, broker: Arc<Mutex<MqttBroker>>, config: MqttServerConfig) -> CoreResult<()> {
+fn handle_mqtt_client(
+    stream: TcpStream,
+    broker: Arc<Mutex<MqttBroker>>,
+    config: MqttServerConfig,
+) -> CoreResult<()> {
     let mut transport = TcpTransport::from_stream(stream, config.timeouts)?;
     transport.set_read_timeout(Some(config.poll_interval))?;
 
@@ -708,7 +723,9 @@ fn handle_mqtt_client(stream: TcpStream, broker: Arc<Mutex<MqttBroker>>, config:
     };
     if !config.allow_anonymous {
         let valid = match (username.clone(), password.clone()) {
-            (Some(user), Some(pass)) => config.users.get(&user).map(|p| p == &pass).unwrap_or(false),
+            (Some(user), Some(pass)) => {
+                config.users.get(&user).map(|p| p == &pass).unwrap_or(false)
+            }
             _ => false,
         };
         if !valid {
@@ -744,7 +761,10 @@ fn handle_mqtt_client(stream: TcpStream, broker: Arc<Mutex<MqttBroker>>, config:
                     break;
                 }
             }
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::WouldBlock || err.kind() == std::io::ErrorKind::TimedOut => {
+            Err(CoreError::Io(err))
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
                 while let Ok(packet) = rx.try_recv() {
                     let _ = write_packet(&mut transport, &packet);
                 }
@@ -777,7 +797,9 @@ async fn handle_mqtt_client_async(
     };
     if !config.allow_anonymous {
         let valid = match (username.clone(), password.clone()) {
-            (Some(user), Some(pass)) => config.users.get(&user).map(|p| p == &pass).unwrap_or(false),
+            (Some(user), Some(pass)) => {
+                config.users.get(&user).map(|p| p == &pass).unwrap_or(false)
+            }
             _ => false,
         };
         if !valid {
@@ -837,7 +859,13 @@ fn handle_server_packet(
     packet: MqttPacket,
 ) -> CoreResult<bool> {
     match packet {
-        MqttPacket::Publish { topic, payload, qos, packet_id, .. } => {
+        MqttPacket::Publish {
+            topic,
+            payload,
+            qos,
+            packet_id,
+            ..
+        } => {
             if qos == 1 {
                 if let Some(id) = packet_id {
                     write_packet(transport, &MqttPacket::PubAck { packet_id: id })?;
@@ -854,7 +882,13 @@ fn handle_server_packet(
                 }
             }
             let return_codes = topics.iter().map(|(_, qos)| *qos).collect();
-            write_packet(transport, &MqttPacket::SubAck { packet_id, return_codes })?;
+            write_packet(
+                transport,
+                &MqttPacket::SubAck {
+                    packet_id,
+                    return_codes,
+                },
+            )?;
         }
         MqttPacket::PingReq => {
             write_packet(transport, &MqttPacket::PingResp)?;
@@ -872,7 +906,13 @@ async fn handle_server_packet_async(
     packet: MqttPacket,
 ) -> CoreResult<bool> {
     match packet {
-        MqttPacket::Publish { topic, payload, qos, packet_id, .. } => {
+        MqttPacket::Publish {
+            topic,
+            payload,
+            qos,
+            packet_id,
+            ..
+        } => {
             if qos == 1 {
                 if let Some(id) = packet_id {
                     write_packet_async(transport, &MqttPacket::PubAck { packet_id: id }).await?;
@@ -889,7 +929,14 @@ async fn handle_server_packet_async(
                 }
             }
             let return_codes = topics.iter().map(|(_, qos)| *qos).collect();
-            write_packet_async(transport, &MqttPacket::SubAck { packet_id, return_codes }).await?;
+            write_packet_async(
+                transport,
+                &MqttPacket::SubAck {
+                    packet_id,
+                    return_codes,
+                },
+            )
+            .await?;
         }
         MqttPacket::PingReq => {
             write_packet_async(transport, &MqttPacket::PingResp).await?;
@@ -912,7 +959,9 @@ fn read_packet<T: StreamTransport>(transport: &mut T) -> CoreResult<MqttPacket> 
             break;
         }
         if len_bytes.len() >= 4 {
-            return Err(CoreError::Parse("mqtt remaining length too long".to_string()));
+            return Err(CoreError::Parse(
+                "mqtt remaining length too long".to_string(),
+            ));
         }
     }
     let (remaining, _) = decode_remaining_length(&len_bytes)?;
@@ -939,7 +988,9 @@ async fn read_packet_async<T: AsyncStreamTransport>(transport: &mut T) -> CoreRe
             break;
         }
         if len_bytes.len() >= 4 {
-            return Err(CoreError::Parse("mqtt remaining length too long".to_string()));
+            return Err(CoreError::Parse(
+                "mqtt remaining length too long".to_string(),
+            ));
         }
     }
     let (remaining, _) = decode_remaining_length(&len_bytes)?;
@@ -959,7 +1010,10 @@ fn write_packet<T: StreamTransport>(transport: &mut T, packet: &MqttPacket) -> C
     transport.write_all(&bytes)
 }
 
-async fn write_packet_async<T: AsyncStreamTransport>(transport: &mut T, packet: &MqttPacket) -> CoreResult<()> {
+async fn write_packet_async<T: AsyncStreamTransport>(
+    transport: &mut T,
+    packet: &MqttPacket,
+) -> CoreResult<()> {
     let bytes = packet.encode()?;
     transport.write_all(&bytes).await
 }
@@ -985,7 +1039,9 @@ fn topic_matches(filter: &str, topic: &str) -> bool {
 }
 
 fn rand_seed() -> u64 {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     now.as_nanos() as u64
 }
 
@@ -1002,10 +1058,12 @@ mod tests {
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 
-        let mut sub = MqttClient::connect(&NetAddr::from_socket(addr), MqttClientConfig::default()).unwrap();
+        let mut sub =
+            MqttClient::connect(&NetAddr::from_socket(addr), MqttClientConfig::default()).unwrap();
         sub.subscribe(vec![("test/#".to_string(), 0)]).unwrap();
 
-        let mut pubc = MqttClient::connect(&NetAddr::from_socket(addr), MqttClientConfig::default()).unwrap();
+        let mut pubc =
+            MqttClient::connect(&NetAddr::from_socket(addr), MqttClientConfig::default()).unwrap();
         pubc.publish("test/hello", b"world".to_vec(), 0).unwrap();
 
         let packet = sub.recv().unwrap();

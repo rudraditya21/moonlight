@@ -2,10 +2,25 @@ use crate::options::{ModuleOption, ModuleOptionKind, ModuleOptionValue, ModuleOp
 
 pub fn build_hash_options() -> ModuleOptions {
     let options = vec![
-        ModuleOption::new("INPUT", "Input string to hash", ModuleOptionKind::String, true),
-        ModuleOption::new("HASH", "Optional expected hash (hex)", ModuleOptionKind::String, false),
-        ModuleOption::new("OUTPUT_HEX", "Return hex output", ModuleOptionKind::Bool, false)
-            .with_default(ModuleOptionValue::Bool(true)),
+        ModuleOption::new(
+            "INPUT",
+            "Input string to hash",
+            ModuleOptionKind::String,
+            true,
+        ),
+        ModuleOption::new(
+            "HASH",
+            "Optional expected hash (hex)",
+            ModuleOptionKind::String,
+            false,
+        ),
+        ModuleOption::new(
+            "OUTPUT_HEX",
+            "Return hex output",
+            ModuleOptionKind::Bool,
+            false,
+        )
+        .with_default(ModuleOptionValue::Bool(true)),
     ];
     ModuleOptions::new(options)
 }

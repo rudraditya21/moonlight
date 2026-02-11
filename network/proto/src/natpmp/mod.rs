@@ -264,7 +264,9 @@ impl NatPmpClient {
         let request = NatPmpRequest::public_address();
         let response = self.send_request(&request)?;
         match response {
-            NatPmpResponse::PublicAddress { result, address, .. } => match result {
+            NatPmpResponse::PublicAddress {
+                result, address, ..
+            } => match result {
                 NatPmpResultCode::Success => Ok(address),
                 _ => Err(CoreError::Message("natpmp failed".to_string())),
             },
@@ -272,12 +274,22 @@ impl NatPmpClient {
         }
     }
 
-    pub fn map_udp(&self, internal_port: u16, requested_external: u16, lifetime: u32) -> CoreResult<NatPmpResponse> {
+    pub fn map_udp(
+        &self,
+        internal_port: u16,
+        requested_external: u16,
+        lifetime: u32,
+    ) -> CoreResult<NatPmpResponse> {
         let request = NatPmpRequest::map_udp(internal_port, requested_external, lifetime);
         self.send_request(&request)
     }
 
-    pub fn map_tcp(&self, internal_port: u16, requested_external: u16, lifetime: u32) -> CoreResult<NatPmpResponse> {
+    pub fn map_tcp(
+        &self,
+        internal_port: u16,
+        requested_external: u16,
+        lifetime: u32,
+    ) -> CoreResult<NatPmpResponse> {
         let request = NatPmpRequest::map_tcp(internal_port, requested_external, lifetime);
         self.send_request(&request)
     }
@@ -338,7 +350,13 @@ impl NatPmpState {
         let expired: Vec<_> = self
             .mappings
             .iter()
-            .filter_map(|(key, lease)| if lease.expires_at <= now { Some((*key, lease.external_port)) } else { None })
+            .filter_map(|(key, lease)| {
+                if lease.expires_at <= now {
+                    Some((*key, lease.external_port))
+                } else {
+                    None
+                }
+            })
             .collect();
         for (key, port) in expired {
             self.mappings.remove(&key);
@@ -419,11 +437,13 @@ impl NatPmpServer {
         };
         let internal_addr = match peer {
             SocketAddr::V4(addr) => *addr.ip(),
-            SocketAddr::V6(_) => return Ok(NatPmpResponse::PublicAddress {
-                result: NatPmpResultCode::UnsupportedOpcode,
-                epoch,
-                address: self.config.public_address,
-            }),
+            SocketAddr::V6(_) => {
+                return Ok(NatPmpResponse::PublicAddress {
+                    result: NatPmpResultCode::UnsupportedOpcode,
+                    epoch,
+                    address: self.config.public_address,
+                })
+            }
         };
         let mut state = self.state.lock().unwrap();
         state.cleanup();
@@ -474,7 +494,9 @@ impl NatPmpServer {
                             port
                         }
                     }
-                    None => match state.allocate_port(requested_external_port, &self.config.port_range) {
+                    None => match state
+                        .allocate_port(requested_external_port, &self.config.port_range)
+                    {
                         Some(port) => port,
                         None => {
                             return Ok(NatPmpResponse::Map {
@@ -552,11 +574,13 @@ impl AsyncNatPmpServer {
         };
         let internal_addr = match peer {
             SocketAddr::V4(addr) => *addr.ip(),
-            SocketAddr::V6(_) => return Ok(NatPmpResponse::PublicAddress {
-                result: NatPmpResultCode::UnsupportedOpcode,
-                epoch,
-                address: self.config.public_address,
-            }),
+            SocketAddr::V6(_) => {
+                return Ok(NatPmpResponse::PublicAddress {
+                    result: NatPmpResultCode::UnsupportedOpcode,
+                    epoch,
+                    address: self.config.public_address,
+                })
+            }
         };
         let mut state = self.state.lock().unwrap();
         state.cleanup();
@@ -607,7 +631,9 @@ impl AsyncNatPmpServer {
                             port
                         }
                     }
-                    None => match state.allocate_port(requested_external_port, &self.config.port_range) {
+                    None => match state
+                        .allocate_port(requested_external_port, &self.config.port_range)
+                    {
                         Some(port) => port,
                         None => {
                             return Ok(NatPmpResponse::Map {

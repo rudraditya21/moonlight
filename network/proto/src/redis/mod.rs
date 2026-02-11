@@ -195,10 +195,7 @@ impl RedisCommand {
                     return Err(CoreError::Parse("empty command".to_string()));
                 }
                 let name = parts[0].to_ascii_uppercase();
-                let args = parts[1..]
-                    .iter()
-                    .map(|s| s.as_bytes().to_vec())
-                    .collect();
+                let args = parts[1..].iter().map(|s| s.as_bytes().to_vec()).collect();
                 Ok(Self { name, args })
             }
             _ => Err(CoreError::Parse("invalid command frame".to_string())),
@@ -236,7 +233,12 @@ impl Default for RedisContext {
 }
 
 pub trait RedisHandler: Send + Sync {
-    fn handle(&self, cmd: &RedisCommand, ctx: &mut RedisContext, store: &mut RedisStore) -> CoreResult<RespFrame>;
+    fn handle(
+        &self,
+        cmd: &RedisCommand,
+        ctx: &mut RedisContext,
+        store: &mut RedisStore,
+    ) -> CoreResult<RespFrame>;
 }
 
 #[derive(Debug, Clone)]
@@ -332,14 +334,18 @@ impl RedisStore {
             Some(RedisValue::Hash(_)) => return Err(CoreError::Message("WRONGTYPE".to_string())),
             None => 0,
         };
-        let new_value = value.checked_add(delta).ok_or_else(|| CoreError::Message("overflow".to_string()))?;
+        let new_value = value
+            .checked_add(delta)
+            .ok_or_else(|| CoreError::Message("overflow".to_string()))?;
         db_ref.insert(key, RedisValue::String(new_value.to_string().into_bytes()));
         Ok(new_value)
     }
 
     fn hset(&mut self, db: usize, key: Vec<u8>, pairs: &[(Vec<u8>, Vec<u8>)]) -> CoreResult<i64> {
         let db_ref = self.get_db_mut(db)?;
-        let entry = db_ref.entry(key).or_insert_with(|| RedisValue::Hash(HashMap::new()));
+        let entry = db_ref
+            .entry(key)
+            .or_insert_with(|| RedisValue::Hash(HashMap::new()));
         match entry {
             RedisValue::Hash(map) => {
                 let mut added = 0i64;
@@ -384,7 +390,9 @@ impl RedisStore {
     fn hgetall(&self, db: usize, key: &[u8]) -> CoreResult<Vec<(Vec<u8>, Vec<u8>)>> {
         let db_ref = self.get_db(db)?;
         match db_ref.get(key) {
-            Some(RedisValue::Hash(map)) => Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            Some(RedisValue::Hash(map)) => {
+                Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            }
             Some(RedisValue::String(_)) => Err(CoreError::Message("WRONGTYPE".to_string())),
             None => Ok(Vec::new()),
         }
@@ -399,7 +407,11 @@ pub struct RedisServer {
 }
 
 impl RedisServer {
-    pub fn bind(addr: SocketAddr, config: RedisServerConfig, handler: Arc<dyn RedisHandler>) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        config: RedisServerConfig,
+        handler: Arc<dyn RedisHandler>,
+    ) -> CoreResult<Self> {
         let listener = TcpListener::bind(addr).map_err(CoreError::Io)?;
         let store = Arc::new(Mutex::new(RedisStore::new(config.databases)));
         Ok(Self {
@@ -436,8 +448,14 @@ pub struct AsyncRedisServer {
 }
 
 impl AsyncRedisServer {
-    pub async fn bind(addr: SocketAddr, config: RedisServerConfig, handler: Arc<dyn RedisHandler>) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+    pub async fn bind(
+        addr: SocketAddr,
+        config: RedisServerConfig,
+        handler: Arc<dyn RedisHandler>,
+    ) -> CoreResult<Self> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         let store = Arc::new(Mutex::new(RedisStore::new(config.databases)));
         Ok(Self {
             listener,
@@ -485,7 +503,10 @@ impl RedisClient {
     }
 
     pub fn auth(&mut self, password: &str) -> CoreResult<RespFrame> {
-        self.call(RedisCommand::new("AUTH", vec![password.as_bytes().to_vec()]))
+        self.call(RedisCommand::new(
+            "AUTH",
+            vec![password.as_bytes().to_vec()],
+        ))
     }
 
     pub fn hello(&mut self, version: RespVersion) -> CoreResult<RespFrame> {
@@ -520,8 +541,11 @@ impl AsyncRedisClient {
     }
 
     pub async fn auth(&mut self, password: &str) -> CoreResult<RespFrame> {
-        self.call(RedisCommand::new("AUTH", vec![password.as_bytes().to_vec()]))
-            .await
+        self.call(RedisCommand::new(
+            "AUTH",
+            vec![password.as_bytes().to_vec()],
+        ))
+        .await
     }
 
     pub async fn hello(&mut self, version: RespVersion) -> CoreResult<RespFrame> {
@@ -606,8 +630,12 @@ fn handle_connection(
     loop {
         let frame = match conn.read_frame() {
             Ok(frame) => frame,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Ok(())
+            }
             Err(err) => {
                 conn.write_frame(&RespFrame::Error(format!("ERR {err}")), ctx.resp_version)?;
                 continue;
@@ -650,7 +678,10 @@ fn handle_connection(
         if cmd.name == "SELECT" {
             let idx = parse_arg_i64(&cmd, 0)?;
             if idx < 0 {
-                conn.write_frame(&RespFrame::Error("ERR invalid DB index".to_string()), ctx.resp_version)?;
+                conn.write_frame(
+                    &RespFrame::Error("ERR invalid DB index".to_string()),
+                    ctx.resp_version,
+                )?;
                 continue;
             }
             ctx.db = idx as usize;
@@ -659,13 +690,17 @@ fn handle_connection(
         }
 
         let response = {
-            let mut store = store.lock().map_err(|_| CoreError::Message("store poisoned".to_string()))?;
+            let mut store = store
+                .lock()
+                .map_err(|_| CoreError::Message("store poisoned".to_string()))?;
             handler.handle(&cmd, &mut ctx, &mut store)
         };
 
         match response {
             Ok(frame) => conn.write_frame(&frame, ctx.resp_version)?,
-            Err(err) => conn.write_frame(&RespFrame::Error(format!("ERR {err}")), ctx.resp_version)?,
+            Err(err) => {
+                conn.write_frame(&RespFrame::Error(format!("ERR {err}")), ctx.resp_version)?
+            }
         };
     }
     Ok(())
@@ -689,8 +724,12 @@ async fn handle_async_connection(
     loop {
         let frame = match conn.read_frame().await {
             Ok(frame) => frame,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Ok(())
+            }
             Err(err) => {
                 conn.write_frame(&RespFrame::Error(format!("ERR {err}")), ctx.resp_version)
                     .await?;
@@ -738,8 +777,11 @@ async fn handle_async_connection(
         if cmd.name == "SELECT" {
             let idx = parse_arg_i64(&cmd, 0)?;
             if idx < 0 {
-                conn.write_frame(&RespFrame::Error("ERR invalid DB index".to_string()), ctx.resp_version)
-                    .await?;
+                conn.write_frame(
+                    &RespFrame::Error("ERR invalid DB index".to_string()),
+                    ctx.resp_version,
+                )
+                .await?;
                 continue;
             }
             ctx.db = idx as usize;
@@ -749,13 +791,18 @@ async fn handle_async_connection(
         }
 
         let response = {
-            let mut store = store.lock().map_err(|_| CoreError::Message("store poisoned".to_string()))?;
+            let mut store = store
+                .lock()
+                .map_err(|_| CoreError::Message("store poisoned".to_string()))?;
             handler.handle(&cmd, &mut ctx, &mut store)
         };
 
         match response {
             Ok(frame) => conn.write_frame(&frame, ctx.resp_version).await?,
-            Err(err) => conn.write_frame(&RespFrame::Error(format!("ERR {err}")), ctx.resp_version).await?,
+            Err(err) => {
+                conn.write_frame(&RespFrame::Error(format!("ERR {err}")), ctx.resp_version)
+                    .await?
+            }
         };
     }
     Ok(())
@@ -780,7 +827,11 @@ fn handle_auth(cmd: &RedisCommand, config: &RedisServerConfig) -> CoreResult<boo
     Err(CoreError::Message("ERR invalid password".to_string()))
 }
 
-fn handle_hello(cmd: &RedisCommand, ctx: &mut RedisContext, config: &RedisServerConfig) -> CoreResult<RespFrame> {
+fn handle_hello(
+    cmd: &RedisCommand,
+    ctx: &mut RedisContext,
+    config: &RedisServerConfig,
+) -> CoreResult<RespFrame> {
     let mut version = ctx.resp_version;
     let mut i = 0;
     if !cmd.args.is_empty() {
@@ -801,7 +852,10 @@ fn handle_hello(cmd: &RedisCommand, ctx: &mut RedisContext, config: &RedisServer
             }
             let pass_idx = if i + 2 < cmd.args.len() { i + 2 } else { i + 1 };
             let auth_cmd = if pass_idx == i + 2 {
-                RedisCommand::new("AUTH", vec![cmd.args[i + 1].clone(), cmd.args[i + 2].clone()])
+                RedisCommand::new(
+                    "AUTH",
+                    vec![cmd.args[i + 1].clone(), cmd.args[i + 2].clone()],
+                )
             } else {
                 RedisCommand::new("AUTH", vec![cmd.args[i + 1].clone()])
             };
@@ -868,7 +922,12 @@ fn handle_hello(cmd: &RedisCommand, ctx: &mut RedisContext, config: &RedisServer
 pub struct DefaultRedisHandler;
 
 impl RedisHandler for DefaultRedisHandler {
-    fn handle(&self, cmd: &RedisCommand, ctx: &mut RedisContext, store: &mut RedisStore) -> CoreResult<RespFrame> {
+    fn handle(
+        &self,
+        cmd: &RedisCommand,
+        ctx: &mut RedisContext,
+        store: &mut RedisStore,
+    ) -> CoreResult<RespFrame> {
         match cmd.name.as_str() {
             "PING" => {
                 if cmd.args.is_empty() {
@@ -879,13 +938,17 @@ impl RedisHandler for DefaultRedisHandler {
             }
             "ECHO" => {
                 if cmd.args.len() != 1 {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 Ok(RespFrame::BulkString(Some(cmd.args[0].clone())))
             }
             "GET" => {
                 if cmd.args.len() != 1 {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 let value = store.get_string(ctx.db, &cmd.args[0])?;
                 Ok(match value {
@@ -895,35 +958,45 @@ impl RedisHandler for DefaultRedisHandler {
             }
             "SET" => {
                 if cmd.args.len() < 2 {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 store.set_string(ctx.db, cmd.args[0].clone(), cmd.args[1].clone())?;
                 Ok(RespFrame::SimpleString("OK".to_string()))
             }
             "DEL" => {
                 if cmd.args.is_empty() {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 let count = store.del_keys(ctx.db, &cmd.args)?;
                 Ok(RespFrame::Integer(count))
             }
             "EXISTS" => {
                 if cmd.args.is_empty() {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 let count = store.exists(ctx.db, &cmd.args)?;
                 Ok(RespFrame::Integer(count))
             }
             "INCR" => {
                 if cmd.args.len() != 1 {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 let value = store.incr_by(ctx.db, cmd.args[0].clone(), 1)?;
                 Ok(RespFrame::Integer(value))
             }
             "INCRBY" => {
                 if cmd.args.len() != 2 {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 let delta = parse_i64(&cmd.args[1])?;
                 let value = store.incr_by(ctx.db, cmd.args[0].clone(), delta)?;
@@ -931,14 +1004,18 @@ impl RedisHandler for DefaultRedisHandler {
             }
             "DECR" => {
                 if cmd.args.len() != 1 {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 let value = store.incr_by(ctx.db, cmd.args[0].clone(), -1)?;
                 Ok(RespFrame::Integer(value))
             }
             "DECRBY" => {
                 if cmd.args.len() != 2 {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 let delta = parse_i64(&cmd.args[1])?;
                 let value = store.incr_by(ctx.db, cmd.args[0].clone(), -delta)?;
@@ -946,7 +1023,9 @@ impl RedisHandler for DefaultRedisHandler {
             }
             "HSET" => {
                 if cmd.args.len() < 3 || cmd.args.len() % 2 == 0 {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 let mut pairs = Vec::new();
                 let mut idx = 1;
@@ -959,7 +1038,9 @@ impl RedisHandler for DefaultRedisHandler {
             }
             "HGET" => {
                 if cmd.args.len() != 2 {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 let value = store.hget(ctx.db, &cmd.args[0], &cmd.args[1])?;
                 Ok(match value {
@@ -969,14 +1050,18 @@ impl RedisHandler for DefaultRedisHandler {
             }
             "HDEL" => {
                 if cmd.args.len() < 2 {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 let removed = store.hdel(ctx.db, &cmd.args[0], &cmd.args[1..])?;
                 Ok(RespFrame::Integer(removed))
             }
             "HGETALL" => {
                 if cmd.args.len() != 1 {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 let entries = store.hgetall(ctx.db, &cmd.args[0])?;
                 let mut frames = Vec::with_capacity(entries.len() * 2);
@@ -988,7 +1073,9 @@ impl RedisHandler for DefaultRedisHandler {
             }
             "MGET" => {
                 if cmd.args.is_empty() {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 let mut out = Vec::with_capacity(cmd.args.len());
                 for key in &cmd.args {
@@ -1002,7 +1089,9 @@ impl RedisHandler for DefaultRedisHandler {
             }
             "MSET" => {
                 if cmd.args.is_empty() || cmd.args.len() % 2 != 0 {
-                    return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+                    return Err(CoreError::Message(
+                        "ERR wrong number of arguments".to_string(),
+                    ));
                 }
                 let mut idx = 0;
                 while idx < cmd.args.len() {
@@ -1054,7 +1143,11 @@ impl ReadBuffer {
         }
     }
 
-    fn read_exact<T: StreamTransport>(&mut self, transport: &mut T, len: usize) -> CoreResult<Vec<u8>> {
+    fn read_exact<T: StreamTransport>(
+        &mut self,
+        transport: &mut T,
+        len: usize,
+    ) -> CoreResult<Vec<u8>> {
         while self.end - self.start < len {
             if self.fill(transport)? == 0 {
                 return Err(CoreError::Io(std::io::Error::new(
@@ -1099,7 +1192,10 @@ impl AsyncReadBuffer {
         }
     }
 
-    async fn read_line<T: AsyncStreamTransport>(&mut self, transport: &mut T) -> CoreResult<Vec<u8>> {
+    async fn read_line<T: AsyncStreamTransport>(
+        &mut self,
+        transport: &mut T,
+    ) -> CoreResult<Vec<u8>> {
         loop {
             if let Some(pos) = find_crlf(&self.buf[self.start..self.end]) {
                 let end = self.start + pos;
@@ -1116,7 +1212,11 @@ impl AsyncReadBuffer {
         }
     }
 
-    async fn read_exact<T: AsyncStreamTransport>(&mut self, transport: &mut T, len: usize) -> CoreResult<Vec<u8>> {
+    async fn read_exact<T: AsyncStreamTransport>(
+        &mut self,
+        transport: &mut T,
+        len: usize,
+    ) -> CoreResult<Vec<u8>> {
         while self.end - self.start < len {
             if self.fill(transport).await? == 0 {
                 return Err(CoreError::Io(std::io::Error::new(
@@ -1158,7 +1258,11 @@ fn find_crlf(data: &[u8]) -> Option<usize> {
     None
 }
 
-fn read_frame<T: StreamTransport>(transport: &mut T, buffer: &mut ReadBuffer, depth: usize) -> CoreResult<RespFrame> {
+fn read_frame<T: StreamTransport>(
+    transport: &mut T,
+    buffer: &mut ReadBuffer,
+    depth: usize,
+) -> CoreResult<RespFrame> {
     if depth > MAX_DEPTH {
         return Err(CoreError::Parse("frame too deep".to_string()));
     }
@@ -1169,7 +1273,9 @@ fn read_frame<T: StreamTransport>(transport: &mut T, buffer: &mut ReadBuffer, de
     let prefix = line[0];
     let rest = &line[1..];
     match prefix {
-        b'+' => Ok(RespFrame::SimpleString(String::from_utf8_lossy(rest).to_string())),
+        b'+' => Ok(RespFrame::SimpleString(
+            String::from_utf8_lossy(rest).to_string(),
+        )),
         b'-' => Ok(RespFrame::Error(String::from_utf8_lossy(rest).to_string())),
         b':' => Ok(RespFrame::Integer(parse_i64(rest)?)),
         b'$' => {
@@ -1211,7 +1317,9 @@ fn read_frame<T: StreamTransport>(transport: &mut T, buffer: &mut ReadBuffer, de
                 .map_err(|_| CoreError::Parse("invalid double".to_string()))?;
             Ok(RespFrame::Double(value))
         }
-        b'(' => Ok(RespFrame::BigNumber(String::from_utf8_lossy(rest).to_string())),
+        b'(' => Ok(RespFrame::BigNumber(
+            String::from_utf8_lossy(rest).to_string(),
+        )),
         b'!' => {
             let len = parse_i64(rest)?;
             if len < 0 {
@@ -1296,7 +1404,9 @@ fn read_frame_async<'a, T: AsyncStreamTransport + Send + 'a>(
         let prefix = line[0];
         let rest = &line[1..];
         match prefix {
-            b'+' => Ok(RespFrame::SimpleString(String::from_utf8_lossy(rest).to_string())),
+            b'+' => Ok(RespFrame::SimpleString(
+                String::from_utf8_lossy(rest).to_string(),
+            )),
             b'-' => Ok(RespFrame::Error(String::from_utf8_lossy(rest).to_string())),
             b':' => Ok(RespFrame::Integer(parse_i64(rest)?)),
             b'$' => {
@@ -1338,7 +1448,9 @@ fn read_frame_async<'a, T: AsyncStreamTransport + Send + 'a>(
                     .map_err(|_| CoreError::Parse("invalid double".to_string()))?;
                 Ok(RespFrame::Double(value))
             }
-            b'(' => Ok(RespFrame::BigNumber(String::from_utf8_lossy(rest).to_string())),
+            b'(' => Ok(RespFrame::BigNumber(
+                String::from_utf8_lossy(rest).to_string(),
+            )),
             b'!' => {
                 let len = parse_i64(rest)?;
                 if len < 0 {
@@ -1409,13 +1521,17 @@ fn read_frame_async<'a, T: AsyncStreamTransport + Send + 'a>(
 }
 
 fn parse_i64(bytes: &[u8]) -> CoreResult<i64> {
-    let s = std::str::from_utf8(bytes).map_err(|_| CoreError::Parse("invalid number".to_string()))?;
-    s.parse::<i64>().map_err(|_| CoreError::Parse("invalid number".to_string()))
+    let s =
+        std::str::from_utf8(bytes).map_err(|_| CoreError::Parse("invalid number".to_string()))?;
+    s.parse::<i64>()
+        .map_err(|_| CoreError::Parse("invalid number".to_string()))
 }
 
 fn parse_arg_i64(cmd: &RedisCommand, idx: usize) -> CoreResult<i64> {
     if idx >= cmd.args.len() {
-        return Err(CoreError::Message("ERR wrong number of arguments".to_string()));
+        return Err(CoreError::Message(
+            "ERR wrong number of arguments".to_string(),
+        ));
     }
     parse_i64(&cmd.args[idx])
 }
@@ -1438,8 +1554,14 @@ mod tests {
     #[test]
     fn resp_roundtrip_map() {
         let frame = RespFrame::Map(vec![
-            (RespFrame::SimpleString("a".to_string()), RespFrame::Integer(1)),
-            (RespFrame::SimpleString("b".to_string()), RespFrame::Integer(2)),
+            (
+                RespFrame::SimpleString("a".to_string()),
+                RespFrame::Integer(1),
+            ),
+            (
+                RespFrame::SimpleString("b".to_string()),
+                RespFrame::Integer(2),
+            ),
         ]);
         let encoded = frame.encode(RespVersion::Resp3);
         let mut transport = TestTransport::new(encoded);
@@ -1462,12 +1584,17 @@ mod tests {
             let _ = server.serve();
         });
 
-        let mut client = RedisClient::connect(&NetAddr::from_socket(addr), Timeouts::default()).unwrap();
+        let mut client =
+            RedisClient::connect(&NetAddr::from_socket(addr), Timeouts::default()).unwrap();
         let resp = client.call(RedisCommand::new("PING", vec![])).unwrap();
         assert_eq!(resp, RespFrame::SimpleString("PONG".to_string()));
-        let resp = client.call(RedisCommand::new("SET", vec![b"k".to_vec(), b"v".to_vec()])).unwrap();
+        let resp = client
+            .call(RedisCommand::new("SET", vec![b"k".to_vec(), b"v".to_vec()]))
+            .unwrap();
         assert_eq!(resp, RespFrame::SimpleString("OK".to_string()));
-        let resp = client.call(RedisCommand::new("GET", vec![b"k".to_vec()])).unwrap();
+        let resp = client
+            .call(RedisCommand::new("GET", vec![b"k".to_vec()]))
+            .unwrap();
         assert_eq!(resp, RespFrame::BulkString(Some(b"v".to_vec())));
     }
 
@@ -1486,7 +1613,8 @@ mod tests {
             let _ = server.serve();
         });
 
-        let mut client = RedisClient::connect(&NetAddr::from_socket(addr), Timeouts::default()).unwrap();
+        let mut client =
+            RedisClient::connect(&NetAddr::from_socket(addr), Timeouts::default()).unwrap();
         let resp = client.call(RedisCommand::new("PING", vec![])).unwrap();
         match resp {
             RespFrame::Error(value) => assert!(value.contains("NOAUTH")),

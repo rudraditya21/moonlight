@@ -90,7 +90,9 @@ pub struct AddpServer {
 impl AddpServer {
     pub fn bind(addr: SocketAddr, config: AddpServerConfig) -> CoreResult<Self> {
         let socket = UdpSocket::bind(addr).map_err(CoreError::Io)?;
-        socket.set_read_timeout(Some(config.timeouts.read)).map_err(CoreError::Io)?;
+        socket
+            .set_read_timeout(Some(config.timeouts.read))
+            .map_err(CoreError::Io)?;
         Ok(Self { socket, config })
     }
 
@@ -158,7 +160,9 @@ pub struct AddpClient {
 impl AddpClient {
     pub fn connect(config: AddpClientConfig) -> CoreResult<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0").map_err(CoreError::Io)?;
-        socket.set_read_timeout(Some(config.timeouts.read)).map_err(CoreError::Io)?;
+        socket
+            .set_read_timeout(Some(config.timeouts.read))
+            .map_err(CoreError::Io)?;
         Ok(Self { socket })
     }
 
@@ -169,7 +173,9 @@ impl AddpClient {
             flags: 0,
             payload: query.as_bytes().to_vec(),
         };
-        self.socket.send_to(&msg.encode(), addr).map_err(CoreError::Io)?;
+        self.socket
+            .send_to(&msg.encode(), addr)
+            .map_err(CoreError::Io)?;
         let mut buf = [0u8; 2048];
         let (len, _) = self.socket.recv_from(&mut buf).map_err(CoreError::Io)?;
         AddpMessage::decode(&buf[..len])
@@ -199,7 +205,12 @@ impl AsyncAddpClient {
     }
 }
 
-fn handle_addp_request(socket: UdpSocket, config: AddpServerConfig, data: &[u8], peer: SocketAddr) -> CoreResult<()> {
+fn handle_addp_request(
+    socket: UdpSocket,
+    config: AddpServerConfig,
+    data: &[u8],
+    peer: SocketAddr,
+) -> CoreResult<()> {
     let msg = AddpMessage::decode(data)?;
     match msg.msg_type {
         AddpMessageType::Discover | AddpMessageType::Query => {
@@ -210,7 +221,9 @@ fn handle_addp_request(socket: UdpSocket, config: AddpServerConfig, data: &[u8],
                 flags: 0,
                 payload: payload.into_bytes(),
             };
-            socket.send_to(&resp.encode(), peer).map_err(CoreError::Io)?;
+            socket
+                .send_to(&resp.encode(), peer)
+                .map_err(CoreError::Io)?;
         }
         _ => {}
     }

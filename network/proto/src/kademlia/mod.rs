@@ -178,9 +178,17 @@ fn bencode_decode_at(data: &[u8], idx: usize, depth: usize) -> CoreResult<(Benco
     }
     match data[idx] {
         b'i' => {
-            let end = data[idx + 1..].iter().position(|&b| b == b'e').ok_or_else(|| CoreError::Parse("bencode int missing end".to_string()))? + idx + 1;
-            let number = std::str::from_utf8(&data[idx + 1..end]).map_err(|_| CoreError::Parse("bencode int utf8".to_string()))?;
-            let value = number.parse::<i64>().map_err(|_| CoreError::Parse("bencode int parse".to_string()))?;
+            let end = data[idx + 1..]
+                .iter()
+                .position(|&b| b == b'e')
+                .ok_or_else(|| CoreError::Parse("bencode int missing end".to_string()))?
+                + idx
+                + 1;
+            let number = std::str::from_utf8(&data[idx + 1..end])
+                .map_err(|_| CoreError::Parse("bencode int utf8".to_string()))?;
+            let value = number
+                .parse::<i64>()
+                .map_err(|_| CoreError::Parse("bencode int parse".to_string()))?;
             Ok((Bencode::Int(value), end + 1))
         }
         b'l' => {
@@ -222,12 +230,17 @@ fn bencode_decode_at(data: &[u8], idx: usize, depth: usize) -> CoreResult<(Benco
             if cursor >= data.len() {
                 return Err(CoreError::Parse("bencode bytes missing colon".to_string()));
             }
-            let len_str = std::str::from_utf8(&data[idx..cursor]).map_err(|_| CoreError::Parse("bencode len utf8".to_string()))?;
-            let len = len_str.parse::<usize>().map_err(|_| CoreError::Parse("bencode len parse".to_string()))?;
+            let len_str = std::str::from_utf8(&data[idx..cursor])
+                .map_err(|_| CoreError::Parse("bencode len utf8".to_string()))?;
+            let len = len_str
+                .parse::<usize>()
+                .map_err(|_| CoreError::Parse("bencode len parse".to_string()))?;
             let start = cursor + 1;
             let end = start + len;
             if end > data.len() {
-                return Err(CoreError::Parse("bencode bytes length overflow".to_string()));
+                return Err(CoreError::Parse(
+                    "bencode bytes length overflow".to_string(),
+                ));
             }
             Ok((Bencode::Bytes(data[start..end].to_vec()), end))
         }
@@ -272,7 +285,10 @@ fn encode_krpc(message: &KrpcMessage) -> Vec<u8> {
             dict.insert(b"y".to_vec(), Bencode::Bytes(b"e".to_vec()));
             dict.insert(
                 b"e".to_vec(),
-                Bencode::List(vec![Bencode::Int(*code), Bencode::Bytes(message.as_bytes().to_vec())]),
+                Bencode::List(vec![
+                    Bencode::Int(*code),
+                    Bencode::Bytes(message.as_bytes().to_vec()),
+                ]),
             );
         }
     }
@@ -364,7 +380,12 @@ fn parse_nodes(bytes: &[u8]) -> Vec<NodeInfo> {
     while idx + 26 <= bytes.len() {
         let id = NodeId(bytes[idx..idx + 20].try_into().unwrap());
         idx += 20;
-        let ip = IpAddr::V4(std::net::Ipv4Addr::new(bytes[idx], bytes[idx + 1], bytes[idx + 2], bytes[idx + 3]));
+        let ip = IpAddr::V4(std::net::Ipv4Addr::new(
+            bytes[idx],
+            bytes[idx + 1],
+            bytes[idx + 2],
+            bytes[idx + 3],
+        ));
         idx += 4;
         let port = u16::from_be_bytes([bytes[idx], bytes[idx + 1]]);
         idx += 2;
@@ -384,7 +405,11 @@ pub struct KademliaServer {
 }
 
 impl KademliaServer {
-    pub fn bind(addr: SocketAddr, config: KademliaConfig, store: Arc<dyn KademliaStore>) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        config: KademliaConfig,
+        store: Arc<dyn KademliaStore>,
+    ) -> CoreResult<Self> {
         let socket = UdpTransport::bind(addr)?;
         socket.set_read_timeout(Some(config.timeouts.read))?;
         Ok(Self {
@@ -421,7 +446,11 @@ pub struct AsyncKademliaServer {
 }
 
 impl AsyncKademliaServer {
-    pub async fn bind(addr: SocketAddr, config: KademliaConfig, store: Arc<dyn KademliaStore>) -> CoreResult<Self> {
+    pub async fn bind(
+        addr: SocketAddr,
+        config: KademliaConfig,
+        store: Arc<dyn KademliaStore>,
+    ) -> CoreResult<Self> {
         let socket = AsyncUdpTransport::bind(addr).await?;
         Ok(Self {
             socket,
@@ -442,7 +471,8 @@ impl AsyncKademliaServer {
                     Ok(socket) => socket,
                     Err(_) => return,
                 };
-                let _ = handle_krpc_request_async(socket, config, store, routing, &data, addr).await;
+                let _ =
+                    handle_krpc_request_async(socket, config, store, routing, &data, addr).await;
             });
         }
     }
@@ -463,7 +493,10 @@ impl KademliaClient {
     pub fn ping(&self, addr: SocketAddr) -> CoreResult<NodeId> {
         let tid = b"aa".to_vec();
         let mut args = BTreeMap::new();
-        args.insert(b"id".to_vec(), Bencode::Bytes(self.config.node_id.0.to_vec()));
+        args.insert(
+            b"id".to_vec(),
+            Bencode::Bytes(self.config.node_id.0.to_vec()),
+        );
         let msg = KrpcMessage::Query {
             tid,
             query: "ping".to_string(),
@@ -487,7 +520,10 @@ impl KademliaClient {
     pub fn find_node(&self, addr: SocketAddr, target: NodeId) -> CoreResult<Vec<NodeInfo>> {
         let tid = b"fn".to_vec();
         let mut args = BTreeMap::new();
-        args.insert(b"id".to_vec(), Bencode::Bytes(self.config.node_id.0.to_vec()));
+        args.insert(
+            b"id".to_vec(),
+            Bencode::Bytes(self.config.node_id.0.to_vec()),
+        );
         args.insert(b"target".to_vec(), Bencode::Bytes(target.0.to_vec()));
         let msg = KrpcMessage::Query {
             tid,
@@ -509,7 +545,10 @@ impl KademliaClient {
     pub fn find_value(&self, addr: SocketAddr, key: &[u8]) -> CoreResult<Option<Vec<u8>>> {
         let tid = b"fv".to_vec();
         let mut args = BTreeMap::new();
-        args.insert(b"id".to_vec(), Bencode::Bytes(self.config.node_id.0.to_vec()));
+        args.insert(
+            b"id".to_vec(),
+            Bencode::Bytes(self.config.node_id.0.to_vec()),
+        );
         args.insert(b"key".to_vec(), Bencode::Bytes(key.to_vec()));
         let msg = KrpcMessage::Query {
             tid,
@@ -528,10 +567,19 @@ impl KademliaClient {
         }
     }
 
-    pub fn store(&self, addr: SocketAddr, key: &[u8], value: &[u8], token: Option<Vec<u8>>) -> CoreResult<()> {
+    pub fn store(
+        &self,
+        addr: SocketAddr,
+        key: &[u8],
+        value: &[u8],
+        token: Option<Vec<u8>>,
+    ) -> CoreResult<()> {
         let tid = b"st".to_vec();
         let mut args = BTreeMap::new();
-        args.insert(b"id".to_vec(), Bencode::Bytes(self.config.node_id.0.to_vec()));
+        args.insert(
+            b"id".to_vec(),
+            Bencode::Bytes(self.config.node_id.0.to_vec()),
+        );
         args.insert(b"key".to_vec(), Bencode::Bytes(key.to_vec()));
         args.insert(b"value".to_vec(), Bencode::Bytes(value.to_vec()));
         if let Some(token) = token {
@@ -547,7 +595,9 @@ impl KademliaClient {
         let msg = decode_krpc(&resp)?;
         match msg {
             KrpcMessage::Response { .. } => Ok(()),
-            KrpcMessage::Error { code, message, .. } => Err(CoreError::Message(format!("krpc error {code}: {message}"))),
+            KrpcMessage::Error { code, message, .. } => {
+                Err(CoreError::Message(format!("krpc error {code}: {message}")))
+            }
             _ => Err(CoreError::Parse("krpc unexpected response".to_string())),
         }
     }
@@ -567,7 +617,10 @@ impl AsyncKademliaClient {
     pub async fn ping(&self, addr: SocketAddr) -> CoreResult<NodeId> {
         let tid = b"aa".to_vec();
         let mut args = BTreeMap::new();
-        args.insert(b"id".to_vec(), Bencode::Bytes(self.config.node_id.0.to_vec()));
+        args.insert(
+            b"id".to_vec(),
+            Bencode::Bytes(self.config.node_id.0.to_vec()),
+        );
         let msg = KrpcMessage::Query {
             tid,
             query: "ping".to_string(),
@@ -631,8 +684,16 @@ fn handle_krpc_message(
     match msg {
         KrpcMessage::Query { tid, query, args } => {
             let node_id = match args.get(b"id".as_ref()) {
-                Some(Bencode::Bytes(value)) if value.len() == NODE_ID_LEN => NodeId(value.clone().try_into().unwrap()),
-                _ => return Some(KrpcMessage::Error { tid, code: 201, message: "missing id".to_string() }),
+                Some(Bencode::Bytes(value)) if value.len() == NODE_ID_LEN => {
+                    NodeId(value.clone().try_into().unwrap())
+                }
+                _ => {
+                    return Some(KrpcMessage::Error {
+                        tid,
+                        code: 201,
+                        message: "missing id".to_string(),
+                    })
+                }
             };
             if let Ok(mut routing) = routing.lock() {
                 routing.update(NodeInfo { id: node_id, addr }, config.k_bucket_size);
@@ -645,10 +706,21 @@ fn handle_krpc_message(
                 }
                 "find_node" => {
                     let target = match args.get(b"target".as_ref()) {
-                        Some(Bencode::Bytes(value)) if value.len() == NODE_ID_LEN => NodeId(value.clone().try_into().unwrap()),
-                        _ => return Some(KrpcMessage::Error { tid, code: 203, message: "missing target".to_string() }),
+                        Some(Bencode::Bytes(value)) if value.len() == NODE_ID_LEN => {
+                            NodeId(value.clone().try_into().unwrap())
+                        }
+                        _ => {
+                            return Some(KrpcMessage::Error {
+                                tid,
+                                code: 203,
+                                message: "missing target".to_string(),
+                            })
+                        }
                     };
-                    let nodes = routing.lock().map(|r| r.closest(&target, config.k_bucket_size)).unwrap_or_default();
+                    let nodes = routing
+                        .lock()
+                        .map(|r| r.closest(&target, config.k_bucket_size))
+                        .unwrap_or_default();
                     let mut resp = BTreeMap::new();
                     resp.insert(b"id".to_vec(), Bencode::Bytes(config.node_id.0.to_vec()));
                     resp.insert(b"nodes".to_vec(), Bencode::Bytes(compact_nodes(&nodes)));
@@ -657,41 +729,73 @@ fn handle_krpc_message(
                 "find_value" => {
                     let key = match args.get(b"key".as_ref()) {
                         Some(Bencode::Bytes(value)) => value.clone(),
-                        _ => return Some(KrpcMessage::Error { tid, code: 203, message: "missing key".to_string() }),
+                        _ => {
+                            return Some(KrpcMessage::Error {
+                                tid,
+                                code: 203,
+                                message: "missing key".to_string(),
+                            })
+                        }
                     };
                     let mut resp = BTreeMap::new();
                     resp.insert(b"id".to_vec(), Bencode::Bytes(config.node_id.0.to_vec()));
                     if let Some(value) = store.get(&key) {
                         resp.insert(b"value".to_vec(), Bencode::Bytes(value));
                     } else {
-                        let nodes = routing.lock().map(|r| r.closest(&config.node_id, config.k_bucket_size)).unwrap_or_default();
+                        let nodes = routing
+                            .lock()
+                            .map(|r| r.closest(&config.node_id, config.k_bucket_size))
+                            .unwrap_or_default();
                         resp.insert(b"nodes".to_vec(), Bencode::Bytes(compact_nodes(&nodes)));
                     }
-                    resp.insert(b"token".to_vec(), Bencode::Bytes(token_for(addr, &config.secret)));
+                    resp.insert(
+                        b"token".to_vec(),
+                        Bencode::Bytes(token_for(addr, &config.secret)),
+                    );
                     Some(KrpcMessage::Response { tid, resp })
                 }
                 "store" => {
                     let key = match args.get(b"key".as_ref()) {
                         Some(Bencode::Bytes(value)) => value.clone(),
-                        _ => return Some(KrpcMessage::Error { tid, code: 203, message: "missing key".to_string() }),
+                        _ => {
+                            return Some(KrpcMessage::Error {
+                                tid,
+                                code: 203,
+                                message: "missing key".to_string(),
+                            })
+                        }
                     };
                     let value = match args.get(b"value".as_ref()) {
                         Some(Bencode::Bytes(value)) => value.clone(),
-                        _ => return Some(KrpcMessage::Error { tid, code: 203, message: "missing value".to_string() }),
+                        _ => {
+                            return Some(KrpcMessage::Error {
+                                tid,
+                                code: 203,
+                                message: "missing value".to_string(),
+                            })
+                        }
                     };
                     let token_ok = match args.get(b"token".as_ref()) {
                         Some(Bencode::Bytes(token)) => *token == token_for(addr, &config.secret),
                         _ => config.allow_store_without_token,
                     };
                     if !token_ok {
-                        return Some(KrpcMessage::Error { tid, code: 204, message: "invalid token".to_string() });
+                        return Some(KrpcMessage::Error {
+                            tid,
+                            code: 204,
+                            message: "invalid token".to_string(),
+                        });
                     }
                     store.put(key, value);
                     let mut resp = BTreeMap::new();
                     resp.insert(b"id".to_vec(), Bencode::Bytes(config.node_id.0.to_vec()));
                     Some(KrpcMessage::Response { tid, resp })
                 }
-                _ => Some(KrpcMessage::Error { tid, code: 204, message: "unknown query".to_string() }),
+                _ => Some(KrpcMessage::Error {
+                    tid,
+                    code: 204,
+                    message: "unknown query".to_string(),
+                }),
             }
         }
         _ => None,

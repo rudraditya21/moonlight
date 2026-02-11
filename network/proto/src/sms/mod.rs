@@ -140,12 +140,19 @@ pub struct SmsError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SmsMessage {
     Bind(SmsBind),
-    BindOk { system_id: String },
+    BindOk {
+        system_id: String,
+    },
     Submit(SmsSubmit),
     Deliver(SmsDeliver),
-    StatusReq { message_id: String },
+    StatusReq {
+        message_id: String,
+    },
     StatusResp(SmsStatus),
-    DeliverAck { message_id: String, status: SmsDeliveryStatus },
+    DeliverAck {
+        message_id: String,
+        status: SmsDeliveryStatus,
+    },
     Unbind,
     UnbindOk,
     Ping,
@@ -531,7 +538,9 @@ impl AsyncSmsServer {
         handler: Arc<dyn SmsHandler>,
         config: SmsServerConfig,
     ) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             handler,
@@ -603,7 +612,9 @@ impl SmsClient {
             return match resp {
                 SmsMessage::BindOk { .. } => Ok(()),
                 SmsMessage::Error(err) => Err(CoreError::Message(err.message)),
-                other => Err(CoreError::Parse(format!("sms unexpected bind response {other:?}"))),
+                other => Err(CoreError::Parse(format!(
+                    "sms unexpected bind response {other:?}"
+                ))),
             };
         }
     }
@@ -619,7 +630,9 @@ impl SmsClient {
             return match resp {
                 SmsMessage::StatusResp(status) => Ok(status),
                 SmsMessage::Error(err) => Err(CoreError::Message(err.message)),
-                other => Err(CoreError::Parse(format!("sms unexpected submit response {other:?}"))),
+                other => Err(CoreError::Parse(format!(
+                    "sms unexpected submit response {other:?}"
+                ))),
             };
         }
     }
@@ -637,7 +650,9 @@ impl SmsClient {
             return match resp {
                 SmsMessage::StatusResp(status) => Ok(status),
                 SmsMessage::Error(err) => Err(CoreError::Message(err.message)),
-                other => Err(CoreError::Parse(format!("sms unexpected status response {other:?}"))),
+                other => Err(CoreError::Parse(format!(
+                    "sms unexpected status response {other:?}"
+                ))),
             };
         }
     }
@@ -677,7 +692,9 @@ impl SmsClient {
             return match resp {
                 SmsMessage::UnbindOk => Ok(()),
                 SmsMessage::Error(err) => Err(CoreError::Message(err.message)),
-                other => Err(CoreError::Parse(format!("sms unexpected unbind response {other:?}"))),
+                other => Err(CoreError::Parse(format!(
+                    "sms unexpected unbind response {other:?}"
+                ))),
             };
         }
     }
@@ -749,7 +766,9 @@ impl AsyncSmsClient {
             return match resp {
                 SmsMessage::BindOk { .. } => Ok(()),
                 SmsMessage::Error(err) => Err(CoreError::Message(err.message)),
-                other => Err(CoreError::Parse(format!("sms unexpected bind response {other:?}"))),
+                other => Err(CoreError::Parse(format!(
+                    "sms unexpected bind response {other:?}"
+                ))),
             };
         }
     }
@@ -765,7 +784,9 @@ impl AsyncSmsClient {
             return match resp {
                 SmsMessage::StatusResp(status) => Ok(status),
                 SmsMessage::Error(err) => Err(CoreError::Message(err.message)),
-                other => Err(CoreError::Parse(format!("sms unexpected submit response {other:?}"))),
+                other => Err(CoreError::Parse(format!(
+                    "sms unexpected submit response {other:?}"
+                ))),
             };
         }
     }
@@ -785,7 +806,9 @@ impl AsyncSmsClient {
             return match resp {
                 SmsMessage::StatusResp(status) => Ok(status),
                 SmsMessage::Error(err) => Err(CoreError::Message(err.message)),
-                other => Err(CoreError::Parse(format!("sms unexpected status response {other:?}"))),
+                other => Err(CoreError::Parse(format!(
+                    "sms unexpected status response {other:?}"
+                ))),
             };
         }
     }
@@ -806,7 +829,11 @@ impl AsyncSmsClient {
         }
     }
 
-    pub async fn ack_delivery(&mut self, message_id: &str, status: SmsDeliveryStatus) -> CoreResult<()> {
+    pub async fn ack_delivery(
+        &mut self,
+        message_id: &str,
+        status: SmsDeliveryStatus,
+    ) -> CoreResult<()> {
         let _ = self
             .send_message(SmsMessage::DeliverAck {
                 message_id: message_id.to_string(),
@@ -827,7 +854,9 @@ impl AsyncSmsClient {
             return match resp {
                 SmsMessage::UnbindOk => Ok(()),
                 SmsMessage::Error(err) => Err(CoreError::Message(err.message)),
-                other => Err(CoreError::Parse(format!("sms unexpected unbind response {other:?}"))),
+                other => Err(CoreError::Parse(format!(
+                    "sms unexpected unbind response {other:?}"
+                ))),
             };
         }
     }
@@ -1022,7 +1051,8 @@ async fn handle_sms_stream_async(
             }
         }
         if bound {
-            send_pending_deliveries_async(&mut transport, &handler, &system_id, &mut server_seq).await?;
+            send_pending_deliveries_async(&mut transport, &handler, &system_id, &mut server_seq)
+                .await?;
         }
     }
     let _ = transport.shutdown().await;
@@ -1111,7 +1141,10 @@ async fn send_error_async(
     .await
 }
 
-fn read_frame_with_limit<T: StreamTransport>(transport: &mut T, max_payload: usize) -> CoreResult<SmsFrame> {
+fn read_frame_with_limit<T: StreamTransport>(
+    transport: &mut T,
+    max_payload: usize,
+) -> CoreResult<SmsFrame> {
     let mut header = [0u8; HEADER_LEN];
     transport.read_exact(&mut header)?;
     if &header[0..4] != MAGIC {
@@ -1164,7 +1197,10 @@ async fn read_frame_with_limit_async<T: AsyncStreamTransport>(
     })
 }
 
-async fn write_frame_async<T: AsyncStreamTransport>(transport: &mut T, frame: &SmsFrame) -> CoreResult<()> {
+async fn write_frame_async<T: AsyncStreamTransport>(
+    transport: &mut T,
+    frame: &SmsFrame,
+) -> CoreResult<()> {
     transport.write_all(&frame.encode()).await
 }
 

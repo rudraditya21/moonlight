@@ -249,7 +249,11 @@ pub struct DceRpcServer {
 }
 
 impl DceRpcServer {
-    pub fn bind(addr: SocketAddr, config: DceRpcServerConfig, handler: Arc<dyn DceRpcHandler>) -> CoreResult<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        config: DceRpcServerConfig,
+        handler: Arc<dyn DceRpcHandler>,
+    ) -> CoreResult<Self> {
         let listener = TcpListener::bind(addr).map_err(CoreError::Io)?;
         Ok(Self {
             listener,
@@ -282,8 +286,14 @@ pub struct AsyncDceRpcServer {
 }
 
 impl AsyncDceRpcServer {
-    pub async fn bind(addr: SocketAddr, config: DceRpcServerConfig, handler: Arc<dyn DceRpcHandler>) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+    pub async fn bind(
+        addr: SocketAddr,
+        config: DceRpcServerConfig,
+        handler: Arc<dyn DceRpcHandler>,
+    ) -> CoreResult<Self> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             handler,
@@ -337,7 +347,10 @@ impl DceRpcClient {
         if ack.header.pdu_type != PduType::BindAck {
             return Err(CoreError::Parse("dcerpc expected bind_ack".to_string()));
         }
-        Ok(Self { transport, call_id: 1 })
+        Ok(Self {
+            transport,
+            call_id: 1,
+        })
     }
 
     pub fn request(&mut self, opnum: u16, stub: &[u8]) -> CoreResult<Vec<u8>> {
@@ -373,7 +386,10 @@ impl AsyncDceRpcClient {
         if ack.header.pdu_type != PduType::BindAck {
             return Err(CoreError::Parse("dcerpc expected bind_ack".to_string()));
         }
-        Ok(Self { transport, call_id: 1 })
+        Ok(Self {
+            transport,
+            call_id: 1,
+        })
     }
 
     pub async fn request(&mut self, opnum: u16, stub: &[u8]) -> CoreResult<Vec<u8>> {
@@ -388,7 +404,11 @@ impl AsyncDceRpcClient {
     }
 }
 
-fn handle_dcerpc_stream(stream: TcpStream, handler: Arc<dyn DceRpcHandler>, config: DceRpcServerConfig) -> CoreResult<()> {
+fn handle_dcerpc_stream(
+    stream: TcpStream,
+    handler: Arc<dyn DceRpcHandler>,
+    config: DceRpcServerConfig,
+) -> CoreResult<()> {
     let mut transport = TcpTransport::from_stream(stream, config.timeouts)?;
     loop {
         let pdu = read_pdu(&mut transport)?;
@@ -472,7 +492,10 @@ fn write_pdu<T: StreamTransport>(transport: &mut T, pdu: &DceRpcPdu) -> CoreResu
     transport.write_all(&pdu.encode())
 }
 
-async fn write_pdu_async<T: AsyncStreamTransport>(transport: &mut T, pdu: &DceRpcPdu) -> CoreResult<()> {
+async fn write_pdu_async<T: AsyncStreamTransport>(
+    transport: &mut T,
+    pdu: &DceRpcPdu,
+) -> CoreResult<()> {
     transport.write_all(&pdu.encode()).await
 }
 
@@ -490,7 +513,11 @@ mod tests {
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 
-        let mut client = DceRpcClient::connect(&net::NetAddr::from_socket(addr), DceRpcClientConfig::default()).unwrap();
+        let mut client = DceRpcClient::connect(
+            &net::NetAddr::from_socket(addr),
+            DceRpcClientConfig::default(),
+        )
+        .unwrap();
         let resp = client.request(0, b"ping").unwrap();
         assert_eq!(resp, b"ping".to_vec());
 

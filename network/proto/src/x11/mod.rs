@@ -103,7 +103,9 @@ impl X11Client {
         let payload = request.encode(self.order);
         self.send_request(&payload)?;
         let reply = read_reply(&mut self.transport, self.order)?;
-        let atom = self.order.decode_u32([reply[8], reply[9], reply[10], reply[11]]);
+        let atom = self
+            .order
+            .decode_u32([reply[8], reply[9], reply[10], reply[11]]);
         Ok(atom)
     }
 
@@ -127,7 +129,12 @@ impl X11Client {
         Ok(())
     }
 
-    pub fn change_property(&mut self, window_id: u32, property: u32, data: &[u8]) -> CoreResult<()> {
+    pub fn change_property(
+        &mut self,
+        window_id: u32,
+        property: u32,
+        data: &[u8],
+    ) -> CoreResult<()> {
         let request = X11Request::ChangeProperty {
             window_id,
             property,
@@ -146,7 +153,9 @@ impl X11Client {
         let payload = request.encode(self.order);
         self.send_request(&payload)?;
         let reply = read_reply(&mut self.transport, self.order)?;
-        let len = self.order.decode_u32([reply[16], reply[17], reply[18], reply[19]]) as usize;
+        let len = self
+            .order
+            .decode_u32([reply[16], reply[17], reply[18], reply[19]]) as usize;
         let format = reply[1];
         if format == 0 {
             return Ok(Vec::new());
@@ -161,7 +170,9 @@ impl X11Client {
     }
 
     pub fn query_extension(&mut self, name: &str) -> CoreResult<bool> {
-        let request = X11Request::QueryExtension { name: name.to_string() };
+        let request = X11Request::QueryExtension {
+            name: name.to_string(),
+        };
         let payload = request.encode(self.order);
         self.send_request(&payload)?;
         let reply = read_reply(&mut self.transport, self.order)?;
@@ -209,7 +220,9 @@ impl AsyncX11Client {
         let payload = request.encode(self.order);
         self.send_request(&payload).await?;
         let reply = read_reply_async(&mut self.transport, self.order).await?;
-        let atom = self.order.decode_u32([reply[8], reply[9], reply[10], reply[11]]);
+        let atom = self
+            .order
+            .decode_u32([reply[8], reply[9], reply[10], reply[11]]);
         Ok(atom)
     }
 
@@ -233,7 +246,12 @@ impl AsyncX11Client {
         Ok(())
     }
 
-    pub async fn change_property(&mut self, window_id: u32, property: u32, data: &[u8]) -> CoreResult<()> {
+    pub async fn change_property(
+        &mut self,
+        window_id: u32,
+        property: u32,
+        data: &[u8],
+    ) -> CoreResult<()> {
         let request = X11Request::ChangeProperty {
             window_id,
             property,
@@ -252,7 +270,9 @@ impl AsyncX11Client {
         let payload = request.encode(self.order);
         self.send_request(&payload).await?;
         let reply = read_reply_async(&mut self.transport, self.order).await?;
-        let len = self.order.decode_u32([reply[16], reply[17], reply[18], reply[19]]) as usize;
+        let len = self
+            .order
+            .decode_u32([reply[16], reply[17], reply[18], reply[19]]) as usize;
         let format = reply[1];
         if format == 0 {
             return Ok(Vec::new());
@@ -267,7 +287,9 @@ impl AsyncX11Client {
     }
 
     pub async fn query_extension(&mut self, name: &str) -> CoreResult<bool> {
-        let request = X11Request::QueryExtension { name: name.to_string() };
+        let request = X11Request::QueryExtension {
+            name: name.to_string(),
+        };
         let payload = request.encode(self.order);
         self.send_request(&payload).await?;
         let reply = read_reply_async(&mut self.transport, self.order).await?;
@@ -372,7 +394,9 @@ pub struct AsyncX11Server {
 
 impl AsyncX11Server {
     pub async fn bind(addr: SocketAddr, config: X11ServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             config,
@@ -392,7 +416,11 @@ impl AsyncX11Server {
     }
 }
 
-fn handle_connection(stream: TcpStream, config: X11ServerConfig, state: Arc<Mutex<X11State>>) -> CoreResult<()> {
+fn handle_connection(
+    stream: TcpStream,
+    config: X11ServerConfig,
+    state: Arc<Mutex<X11State>>,
+) -> CoreResult<()> {
     let mut transport = TcpTransport::from_stream(stream, config.timeouts)?;
     let (order, setup) = read_setup_request(&mut transport)?;
     let reply = X11SetupReply::new(order, setup);
@@ -401,7 +429,9 @@ fn handle_connection(stream: TcpStream, config: X11ServerConfig, state: Arc<Mute
     loop {
         let (opcode, data, payload) = match read_request(&mut transport, order) {
             Ok(msg) => msg,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
             Err(err) => return Err(err),
         };
         let response = handle_request(opcode, data, &payload, order, seq, &state)?;
@@ -425,7 +455,9 @@ async fn handle_connection_async(
     loop {
         let (opcode, data, payload) = match read_request_async(&mut transport, order).await {
             Ok(msg) => msg,
-            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(())
+            }
             Err(err) => return Err(err),
         };
         let response = handle_request(opcode, data, &payload, order, seq, &state)?;
@@ -447,7 +479,9 @@ fn handle_request(
     match opcode {
         1 => {
             let window_id = order.decode_u32([payload[0], payload[1], payload[2], payload[3]]);
-            let mut guard = state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+            let mut guard = state
+                .lock()
+                .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
             guard.windows.entry(window_id).or_insert_with(HashMap::new);
             Ok(None)
         }
@@ -456,7 +490,9 @@ fn handle_request(
             let name_len = order.decode_u16([payload[0], payload[1]]) as usize;
             let name = std::str::from_utf8(&payload[4..4 + name_len])
                 .map_err(|_| CoreError::Parse("invalid atom name".to_string()))?;
-            let mut guard = state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+            let mut guard = state
+                .lock()
+                .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
             let atom = guard.intern_atom(name);
             let reply = encode_intern_atom_reply(order, seq, atom);
             Ok(Some(reply))
@@ -466,14 +502,17 @@ fn handle_request(
             let property = order.decode_u32([payload[4], payload[5], payload[6], payload[7]]);
             let prop_type = order.decode_u32([payload[8], payload[9], payload[10], payload[11]]);
             let format = payload[12];
-            let data_len = order.decode_u32([payload[16], payload[17], payload[18], payload[19]]) as usize;
+            let data_len =
+                order.decode_u32([payload[16], payload[17], payload[18], payload[19]]) as usize;
             let bytes = match format {
                 8 => data_len,
                 16 => data_len * 2,
                 32 => data_len * 4,
                 _ => 0,
             };
-            let mut guard = state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+            let mut guard = state
+                .lock()
+                .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
             let window = guard.windows.entry(window_id).or_insert_with(HashMap::new);
             window.insert(
                 property,
@@ -488,7 +527,9 @@ fn handle_request(
         20 => {
             let window_id = order.decode_u32([payload[0], payload[1], payload[2], payload[3]]);
             let property = order.decode_u32([payload[4], payload[5], payload[6], payload[7]]);
-            let guard = state.lock().map_err(|_| CoreError::Message("state poisoned".to_string()))?;
+            let guard = state
+                .lock()
+                .map_err(|_| CoreError::Message("state poisoned".to_string()))?;
             let value = guard
                 .windows
                 .get(&window_id)
@@ -652,7 +693,10 @@ impl X11Request {
                 pad_to_4(&mut payload);
                 wrap_request(order, 18, 0, payload)
             }
-            X11Request::GetProperty { window_id, property } => {
+            X11Request::GetProperty {
+                window_id,
+                property,
+            } => {
                 let mut payload = Vec::new();
                 payload.extend_from_slice(&order.encode_u32(*window_id));
                 payload.extend_from_slice(&order.encode_u32(*property));
@@ -690,7 +734,9 @@ fn read_setup_request(transport: &mut TcpTransport) -> CoreResult<(ByteOrder, X1
     Ok((order, X11SetupRequest::new(order)))
 }
 
-async fn read_setup_request_async(transport: &mut AsyncTcpTransport) -> CoreResult<(ByteOrder, X11SetupRequest)> {
+async fn read_setup_request_async(
+    transport: &mut AsyncTcpTransport,
+) -> CoreResult<(ByteOrder, X11SetupRequest)> {
     let mut header = [0u8; 12];
     transport.read_exact(&mut header).await?;
     let order = ByteOrder::from_byte(header[0])?;
@@ -708,7 +754,10 @@ fn read_setup_reply(transport: &mut TcpTransport, order: ByteOrder) -> CoreResul
     })
 }
 
-async fn read_setup_reply_async(transport: &mut AsyncTcpTransport, order: ByteOrder) -> CoreResult<X11SetupReply> {
+async fn read_setup_reply_async(
+    transport: &mut AsyncTcpTransport,
+    order: ByteOrder,
+) -> CoreResult<X11SetupReply> {
     let mut header = [0u8; 40];
     transport.read_exact(&mut header).await?;
     let resource_id_base = order.decode_u32([header[12], header[13], header[14], header[15]]);
@@ -731,7 +780,10 @@ fn read_request(transport: &mut TcpTransport, order: ByteOrder) -> CoreResult<(u
     Ok((opcode, data, payload))
 }
 
-async fn read_request_async(transport: &mut AsyncTcpTransport, order: ByteOrder) -> CoreResult<(u8, u8, Vec<u8>)> {
+async fn read_request_async(
+    transport: &mut AsyncTcpTransport,
+    order: ByteOrder,
+) -> CoreResult<(u8, u8, Vec<u8>)> {
     let mut header = [0u8; 4];
     transport.read_exact(&mut header).await?;
     let opcode = header[0];
@@ -756,7 +808,10 @@ fn read_reply(transport: &mut TcpTransport, order: ByteOrder) -> CoreResult<Vec<
     Ok(out)
 }
 
-async fn read_reply_async(transport: &mut AsyncTcpTransport, order: ByteOrder) -> CoreResult<Vec<u8>> {
+async fn read_reply_async(
+    transport: &mut AsyncTcpTransport,
+    order: ByteOrder,
+) -> CoreResult<Vec<u8>> {
     let mut header = [0u8; 32];
     transport.read_exact(&mut header).await?;
     let length = order.decode_u32([header[4], header[5], header[6], header[7]]) as usize;
@@ -833,7 +888,8 @@ mod tests {
             let _ = server.serve();
         });
 
-        let mut client = X11Client::connect(&NetAddr::from_socket(addr), X11ClientConfig::default()).unwrap();
+        let mut client =
+            X11Client::connect(&NetAddr::from_socket(addr), X11ClientConfig::default()).unwrap();
         client.handshake().unwrap();
         let atom = client.intern_atom("XTEST").unwrap();
         let window = client.create_window(1, 100, 100).unwrap();

@@ -1,5 +1,7 @@
 use crate::config::Config;
-use modules::{register_builtin_modules, ModuleCatalog, ModuleRegistry, ModuleRegistryBuilder, RegistryError};
+use modules::{
+    register_builtin_modules, ModuleCatalog, ModuleRegistry, ModuleRegistryBuilder, RegistryError,
+};
 use repl::{Repl, ReplError};
 use std::path::Path;
 

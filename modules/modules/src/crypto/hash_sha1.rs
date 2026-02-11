@@ -57,8 +57,7 @@ impl Module for HashSha1Module {
         if expected.is_empty() {
             return Ok(ModuleResult::ok(&format!("sha1: {}", hash)));
         }
-        let expected = normalize_expected_hex(&expected, 40)
-            .map_err(ModuleError::Execution)?;
+        let expected = normalize_expected_hex(&expected, 40).map_err(ModuleError::Execution)?;
         let ok = expected == hash;
         Ok(ModuleResult::ok(&format!(
             "sha1 match: {}",
@@ -100,11 +99,10 @@ mod tests {
     #[test]
     fn sha1_module_compute() {
         let mut module = HashSha1Module::new();
-        module
-            .options_mut()
-            .set("INPUT", "abc")
-            .expect("set");
+        module.options_mut().set("INPUT", "abc").expect("set");
         let result = module.run(&ModuleContext { session_id: 1 }).expect("run");
-        assert!(result.message.contains("a9993e364706816aba3e25717850c26c9cd0d89d"));
+        assert!(result
+            .message
+            .contains("a9993e364706816aba3e25717850c26c9cd0d89d"));
     }
 }

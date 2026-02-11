@@ -100,7 +100,8 @@ impl Repl {
             "info" => self.cmd_info(tokens),
             _ => println!(
                 "{}",
-                self.palette.error(&format!("Unknown command: {}", tokens[0]))
+                self.palette
+                    .error(&format!("Unknown command: {}", tokens[0]))
             ),
         }
         false
@@ -157,7 +158,10 @@ impl Repl {
                     }
                 }
             }
-            println!("{}", self.palette.error(&format!("Module not found: {name}")));
+            println!(
+                "{}",
+                self.palette.error(&format!("Module not found: {name}"))
+            );
             return;
         };
         self.active = Some(module);
@@ -183,9 +187,8 @@ impl Repl {
                     }
                     println!(
                         "{}",
-                        self.palette.info(&format!(
-                            "Indexed modules: {total}. Showing up to {limit}."
-                        ))
+                        self.palette
+                            .info(&format!("Indexed modules: {total}. Showing up to {limit}."))
                     );
                     let rows: Vec<(&str, &str)> = catalog
                         .iter()
@@ -318,10 +321,7 @@ impl Repl {
                     if let Some(val) = tokens.get(i) {
                         let rank = ModuleRank::parse(val);
                         if rank == ModuleRank::Unknown {
-                            println!(
-                                "{}",
-                                self.palette.error(&format!("Unknown rank: {val}"))
-                            );
+                            println!("{}", self.palette.error(&format!("Unknown rank: {val}")));
                         } else {
                             query.rank = Some(rank);
                         }
@@ -384,7 +384,8 @@ impl Repl {
         if let Err(err) = module.options().validate() {
             println!(
                 "{}",
-                self.palette.error(&format!("Option validation failed: {err}"))
+                self.palette
+                    .error(&format!("Option validation failed: {err}"))
             );
             return;
         }
@@ -396,7 +397,8 @@ impl Repl {
                 if result.success {
                     println!(
                         "{}",
-                        self.palette.success(&format!("Success: {}", result.message))
+                        self.palette
+                            .success(&format!("Success: {}", result.message))
                     );
                 } else {
                     println!(
@@ -591,8 +593,7 @@ impl Repl {
 
 fn command_candidates(prefix: &str) -> Vec<String> {
     let commands = [
-        "help", "show", "use", "search", "set", "get", "run", "history", "info", "exit",
-        "quit",
+        "help", "show", "use", "search", "set", "get", "run", "history", "info", "exit", "quit",
     ];
     commands
         .iter()

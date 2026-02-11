@@ -101,9 +101,12 @@ impl MsDnspRecord {
             return Err(CoreError::Parse("ms_dnsp rdata out of bounds".to_string()));
         }
         let rdata = match record_type {
-            MsDnspRecordType::A if data_len == 4 => {
-                MsDnspRData::A([data[start], data[start + 1], data[start + 2], data[start + 3]])
-            }
+            MsDnspRecordType::A if data_len == 4 => MsDnspRData::A([
+                data[start],
+                data[start + 1],
+                data[start + 2],
+                data[start + 3],
+            ]),
             MsDnspRecordType::AAAA if data_len == 16 => {
                 let mut arr = [0u8; 16];
                 arr.copy_from_slice(&data[start..end]);
@@ -239,7 +242,13 @@ impl ZoneStore {
     fn get(&self, name: &str, rtype: MsDnspRecordType) -> Vec<MsDnspRecord> {
         self.records
             .get(name)
-            .map(|items| items.iter().filter(|r| r.record_type == rtype).cloned().collect())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|r| r.record_type == rtype)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -352,7 +361,12 @@ impl MsDnspClient {
         Ok(Self { socket })
     }
 
-    pub fn query(&self, addr: SocketAddr, name: &str, rtype: MsDnspRecordType) -> CoreResult<Vec<MsDnspRecord>> {
+    pub fn query(
+        &self,
+        addr: SocketAddr,
+        name: &str,
+        rtype: MsDnspRecordType,
+    ) -> CoreResult<Vec<MsDnspRecord>> {
         let msg = MsDnspMessage {
             id: rand_id(),
             opcode: MsDnspOpcode::Query,
@@ -409,7 +423,12 @@ impl AsyncMsDnspClient {
         Ok(Self { socket })
     }
 
-    pub async fn query(&self, addr: SocketAddr, name: &str, rtype: MsDnspRecordType) -> CoreResult<Vec<MsDnspRecord>> {
+    pub async fn query(
+        &self,
+        addr: SocketAddr,
+        name: &str,
+        rtype: MsDnspRecordType,
+    ) -> CoreResult<Vec<MsDnspRecord>> {
         let msg = MsDnspMessage {
             id: rand_id(),
             opcode: MsDnspOpcode::Query,
@@ -511,12 +530,16 @@ fn handle_dnsp_message(
 }
 
 fn rand_id() -> u16 {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     (now.as_nanos() & 0xFFFF) as u16
 }
 
 fn current_timestamp() -> u32 {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     now.as_secs() as u32
 }
 
@@ -546,7 +569,9 @@ mod tests {
             data: MsDnspRData::A([127, 0, 0, 1]),
         };
         client.update(addr, "example.local", record).unwrap();
-        let result = client.query(addr, "example.local", MsDnspRecordType::A).unwrap();
+        let result = client
+            .query(addr, "example.local", MsDnspRecordType::A)
+            .unwrap();
         assert_eq!(result.len(), 1);
 
         drop(handle);

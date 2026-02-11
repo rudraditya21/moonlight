@@ -63,18 +63,23 @@ impl NtpPacket {
             root_delay: 0,
             root_dispersion: 0,
             reference_id: 0,
-            reference_timestamp: NtpTimestamp { seconds: 0, fraction: 0 },
-            originate_timestamp: NtpTimestamp { seconds: 0, fraction: 0 },
-            receive_timestamp: NtpTimestamp { seconds: 0, fraction: 0 },
+            reference_timestamp: NtpTimestamp {
+                seconds: 0,
+                fraction: 0,
+            },
+            originate_timestamp: NtpTimestamp {
+                seconds: 0,
+                fraction: 0,
+            },
+            receive_timestamp: NtpTimestamp {
+                seconds: 0,
+                fraction: 0,
+            },
             transmit_timestamp: transmit,
         }
     }
 
-    pub fn server_response(
-        request: &NtpPacket,
-        stratum: u8,
-        reference_id: u32,
-    ) -> Self {
+    pub fn server_response(request: &NtpPacket, stratum: u8, reference_id: u32) -> Self {
         let now = SystemTime::now();
         let timestamp = NtpTimestamp::from_system_time(now);
         Self {
@@ -237,11 +242,8 @@ impl NtpServer {
             if request.mode() != 3 {
                 continue;
             }
-            let response = NtpPacket::server_response(
-                &request,
-                self.config.stratum,
-                self.config.reference_id,
-            );
+            let response =
+                NtpPacket::server_response(&request, self.config.stratum, self.config.reference_id);
             let payload = response.encode();
             let _ = self.socket.send_to(&payload, peer);
         }
@@ -269,11 +271,8 @@ impl AsyncNtpServer {
             if request.mode() != 3 {
                 continue;
             }
-            let response = NtpPacket::server_response(
-                &request,
-                self.config.stratum,
-                self.config.reference_id,
-            );
+            let response =
+                NtpPacket::server_response(&request, self.config.stratum, self.config.reference_id);
             let payload = response.encode();
             let _ = self.socket.send_to(&payload, peer).await;
         }

@@ -271,17 +271,19 @@ impl KerbKdcServer {
     pub fn add_user(&self, username: &str, password: &str) {
         let mut state = self.state.lock().unwrap();
         let realm = state.realm.clone();
-        state
-            .users
-            .insert(username.to_string(), derive_key(password.as_bytes(), realm.as_bytes()));
+        state.users.insert(
+            username.to_string(),
+            derive_key(password.as_bytes(), realm.as_bytes()),
+        );
     }
 
     pub fn add_service(&self, service: &str, password: &str) {
         let mut state = self.state.lock().unwrap();
         let realm = state.realm.clone();
-        state
-            .services
-            .insert(service.to_string(), derive_key(password.as_bytes(), realm.as_bytes()));
+        state.services.insert(
+            service.to_string(),
+            derive_key(password.as_bytes(), realm.as_bytes()),
+        );
     }
 
     pub fn serve(&self) -> CoreResult<()> {
@@ -303,7 +305,9 @@ pub struct AsyncKerbKdcServer {
 
 impl AsyncKerbKdcServer {
     pub async fn bind(addr: SocketAddr, config: KerbKdcConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self {
             listener,
             state: Arc::new(Mutex::new(config)),
@@ -355,7 +359,9 @@ pub struct AsyncKerbServiceServer {
 
 impl AsyncKerbServiceServer {
     pub async fn bind(addr: SocketAddr, config: KerbServiceConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { listener, config })
     }
 
@@ -516,7 +522,9 @@ fn handle_kdc_stream(stream: TcpStream, state: Arc<Mutex<KerbKdcConfig>>) -> Cor
         };
         let payload = match response {
             Ok(frame) => frame.encode(),
-            Err(err) => KerbFrame::new(KerbMsgType::Error, encode_error(1, &err.to_string())).encode(),
+            Err(err) => {
+                KerbFrame::new(KerbMsgType::Error, encode_error(1, &err.to_string())).encode()
+            }
         };
         transport.write_all(&payload)?;
     }
@@ -540,7 +548,9 @@ async fn handle_kdc_stream_async(
         };
         let payload = match response {
             Ok(frame) => frame.encode(),
-            Err(err) => KerbFrame::new(KerbMsgType::Error, encode_error(1, &err.to_string())).encode(),
+            Err(err) => {
+                KerbFrame::new(KerbMsgType::Error, encode_error(1, &err.to_string())).encode()
+            }
         };
         transport.write_all(&payload).await?;
     }
@@ -586,10 +596,16 @@ async fn handle_service_stream_async(
     Ok(())
 }
 
-fn request_tgt(transport: &mut TcpTransport, config: &KerbClientConfig) -> CoreResult<(KerbEncryptedTicket, [u8; 32])> {
+fn request_tgt(
+    transport: &mut TcpTransport,
+    config: &KerbClientConfig,
+) -> CoreResult<(KerbEncryptedTicket, [u8; 32])> {
     let client = KerbPrincipal::new(&config.username, &config.realm);
     let nonce = next_nonce();
-    let preauth = hmac_sha256(&derive_key(config.password.as_bytes(), config.realm.as_bytes()), &nonce.to_be_bytes());
+    let preauth = hmac_sha256(
+        &derive_key(config.password.as_bytes(), config.realm.as_bytes()),
+        &nonce.to_be_bytes(),
+    );
     let req = KerbAsReq {
         client,
         realm: config.realm.clone(),
@@ -602,7 +618,10 @@ fn request_tgt(transport: &mut TcpTransport, config: &KerbClientConfig) -> CoreR
     match response.msg_type {
         KerbMsgType::AsRep => {
             let rep = decode_as_rep(&response.payload)?;
-            let session = decrypt_session_key(&rep.enc_part, &derive_key(config.password.as_bytes(), config.realm.as_bytes()))?;
+            let session = decrypt_session_key(
+                &rep.enc_part,
+                &derive_key(config.password.as_bytes(), config.realm.as_bytes()),
+            )?;
             Ok((rep.ticket, session))
         }
         KerbMsgType::Error => Err(CoreError::Message(decode_error(&response.payload)?.message)),
@@ -616,7 +635,10 @@ async fn request_tgt_async(
 ) -> CoreResult<(KerbEncryptedTicket, [u8; 32])> {
     let client = KerbPrincipal::new(&config.username, &config.realm);
     let nonce = next_nonce();
-    let preauth = hmac_sha256(&derive_key(config.password.as_bytes(), config.realm.as_bytes()), &nonce.to_be_bytes());
+    let preauth = hmac_sha256(
+        &derive_key(config.password.as_bytes(), config.realm.as_bytes()),
+        &nonce.to_be_bytes(),
+    );
     let req = KerbAsReq {
         client,
         realm: config.realm.clone(),
@@ -629,7 +651,10 @@ async fn request_tgt_async(
     match response.msg_type {
         KerbMsgType::AsRep => {
             let rep = decode_as_rep(&response.payload)?;
-            let session = decrypt_session_key(&rep.enc_part, &derive_key(config.password.as_bytes(), config.realm.as_bytes()))?;
+            let session = decrypt_session_key(
+                &rep.enc_part,
+                &derive_key(config.password.as_bytes(), config.realm.as_bytes()),
+            )?;
             Ok((rep.ticket, session))
         }
         KerbMsgType::Error => Err(CoreError::Message(decode_error(&response.payload)?.message)),
@@ -720,7 +745,9 @@ fn validate_ap_req(req: &KerbApReq, config: &KerbServiceConfig) -> CoreResult<Ke
         return Err(CoreError::Message("invalid authenticator".to_string()));
     }
     if req.mutual {
-        Ok(KerbApRep { timestamp: auth.timestamp })
+        Ok(KerbApRep {
+            timestamp: auth.timestamp,
+        })
     } else {
         Ok(KerbApRep { timestamp: now })
     }
@@ -1215,11 +1242,9 @@ mod tests {
         .unwrap();
         let (ticket, session) = client.request_service_ticket("http").unwrap();
         let ap_req = client.build_ap_req(ticket, session, true).unwrap();
-        let mut svc_transport = TcpTransport::connect(
-            &net::NetAddr::from_socket(svc_addr),
-            Timeouts::default(),
-        )
-        .unwrap();
+        let mut svc_transport =
+            TcpTransport::connect(&net::NetAddr::from_socket(svc_addr), Timeouts::default())
+                .unwrap();
         let frame = KerbFrame::new(KerbMsgType::ApReq, ap_req.encode());
         write_frame(&mut svc_transport, &frame).unwrap();
         let response = read_frame(&mut svc_transport).unwrap();

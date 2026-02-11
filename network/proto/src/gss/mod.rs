@@ -71,7 +71,8 @@ impl GssMessage {
         if idx + 4 > data.len() {
             return Err(CoreError::Parse("gss len".to_string()));
         }
-        let len = u32::from_be_bytes([data[idx], data[idx + 1], data[idx + 2], data[idx + 3]]) as usize;
+        let len =
+            u32::from_be_bytes([data[idx], data[idx + 1], data[idx + 2], data[idx + 3]]) as usize;
         idx += 4;
         if idx + len > data.len() {
             return Err(CoreError::Parse("gss payload".to_string()));
@@ -158,7 +159,9 @@ pub struct AsyncGssServer {
 
 impl AsyncGssServer {
     pub async fn bind(addr: SocketAddr, config: GssServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { listener, config })
     }
 
@@ -354,7 +357,10 @@ fn handle_gss_stream(stream: TcpStream, config: GssServerConfig) -> CoreResult<(
     }
 }
 
-async fn handle_gss_stream_async(stream: tokio::net::TcpStream, config: GssServerConfig) -> CoreResult<()> {
+async fn handle_gss_stream_async(
+    stream: tokio::net::TcpStream,
+    config: GssServerConfig,
+) -> CoreResult<()> {
     let mut transport = AsyncTcpTransport::from_stream(stream);
     let init = read_message_async(&mut transport).await?;
     if init.msg_type != GssMessageType::Init {
@@ -475,12 +481,17 @@ fn write_message<T: StreamTransport>(transport: &mut T, msg: &GssMessage) -> Cor
     transport.write_all(&msg.encode())
 }
 
-async fn write_message_async<T: AsyncStreamTransport>(transport: &mut T, msg: &GssMessage) -> CoreResult<()> {
+async fn write_message_async<T: AsyncStreamTransport>(
+    transport: &mut T,
+    msg: &GssMessage,
+) -> CoreResult<()> {
     transport.write_all(&msg.encode()).await
 }
 
 fn rand_id() -> u32 {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     (now.as_nanos() & 0xFFFF_FFFF) as u32
 }
 
@@ -503,7 +514,8 @@ mod tests {
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 
-        let mut client = GssClient::connect(&NetAddr::from_socket(addr), GssClientConfig::default()).unwrap();
+        let mut client =
+            GssClient::connect(&NetAddr::from_socket(addr), GssClientConfig::default()).unwrap();
         let resp = client.wrap(b"hello").unwrap();
         assert_eq!(resp, b"hello".to_vec());
 

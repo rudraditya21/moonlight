@@ -60,7 +60,8 @@ impl Socks5Address {
                 if *idx + 4 > data.len() {
                     return Err(CoreError::Parse("socks5 ipv4".to_string()));
                 }
-                let addr = Ipv4Addr::new(data[*idx], data[*idx + 1], data[*idx + 2], data[*idx + 3]);
+                let addr =
+                    Ipv4Addr::new(data[*idx], data[*idx + 1], data[*idx + 2], data[*idx + 3]);
                 *idx += 4;
                 Ok(Socks5Address::IpV4(addr))
             }
@@ -137,7 +138,11 @@ impl Socks5Client {
         config: Socks5ClientConfig,
     ) -> CoreResult<Self> {
         let mut transport = TcpTransport::connect(proxy, config.timeouts)?;
-        let methods = if config.username.is_some() { vec![0x00, 0x02] } else { vec![0x00] };
+        let methods = if config.username.is_some() {
+            vec![0x00, 0x02]
+        } else {
+            vec![0x00]
+        };
         let mut hello = Vec::with_capacity(2 + methods.len());
         hello.push(0x05);
         hello.push(methods.len() as u8);
@@ -178,7 +183,10 @@ impl Socks5Client {
             return Err(CoreError::Parse("socks5 response".to_string()));
         }
         if header[1] != 0x00 {
-            return Err(CoreError::Message(format!("socks5 connect failed: {}", header[1])));
+            return Err(CoreError::Message(format!(
+                "socks5 connect failed: {}",
+                header[1]
+            )));
         }
         let _ = read_address(&mut transport, header[3])?;
         let mut port_buf = [0u8; 2];
@@ -203,7 +211,11 @@ impl AsyncSocks5Client {
         config: Socks5ClientConfig,
     ) -> CoreResult<Self> {
         let mut transport = AsyncTcpTransport::connect(proxy, config.timeouts).await?;
-        let methods = if config.username.is_some() { vec![0x00, 0x02] } else { vec![0x00] };
+        let methods = if config.username.is_some() {
+            vec![0x00, 0x02]
+        } else {
+            vec![0x00]
+        };
         let mut hello = Vec::with_capacity(2 + methods.len());
         hello.push(0x05);
         hello.push(methods.len() as u8);
@@ -244,7 +256,10 @@ impl AsyncSocks5Client {
             return Err(CoreError::Parse("socks5 response".to_string()));
         }
         if header[1] != 0x00 {
-            return Err(CoreError::Message(format!("socks5 connect failed: {}", header[1])));
+            return Err(CoreError::Message(format!(
+                "socks5 connect failed: {}",
+                header[1]
+            )));
         }
         let _ = read_address_async(&mut transport, header[3]).await?;
         let mut port_buf = [0u8; 2];
@@ -306,7 +321,9 @@ pub struct AsyncSocks5Server {
 
 impl AsyncSocks5Server {
     pub async fn bind(addr: SocketAddr, config: Socks5ServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { listener, config })
     }
 
@@ -366,14 +383,22 @@ fn handle_socks5_stream(stream: TcpStream, config: Socks5ServerConfig) -> CoreRe
     let port = u16::from_be_bytes(port_buf);
 
     if command != Socks5Command::Connect as u8 {
-    send_reply(&mut transport, 0x07, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
-    return Ok(());
-}
+        send_reply(
+            &mut transport,
+            0x07,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        )?;
+        return Ok(());
+    }
 
     let remote = match connect_target(&address, port, timeouts.connect) {
         Ok(stream) => stream,
         Err(_) => {
-            send_reply(&mut transport, 0x05, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
+            send_reply(
+                &mut transport,
+                0x05,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            )?;
             return Ok(());
         }
     };
@@ -384,7 +409,10 @@ fn handle_socks5_stream(stream: TcpStream, config: Socks5ServerConfig) -> CoreRe
     Ok(())
 }
 
-async fn handle_socks5_stream_async(stream: tokio::net::TcpStream, config: Socks5ServerConfig) -> CoreResult<()> {
+async fn handle_socks5_stream_async(
+    stream: tokio::net::TcpStream,
+    config: Socks5ServerConfig,
+) -> CoreResult<()> {
     let mut transport = AsyncTcpTransport::from_stream(stream);
     let mut hello = [0u8; 2];
     transport.read_exact(&mut hello).await?;
@@ -429,14 +457,24 @@ async fn handle_socks5_stream_async(stream: tokio::net::TcpStream, config: Socks
     let port = u16::from_be_bytes(port_buf);
 
     if command != Socks5Command::Connect as u8 {
-        send_reply_async(&mut transport, 0x07, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await?;
+        send_reply_async(
+            &mut transport,
+            0x07,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        )
+        .await?;
         return Ok(());
     }
 
     let remote = match connect_target_async(&address, port).await {
         Ok(stream) => stream,
         Err(_) => {
-            send_reply_async(&mut transport, 0x05, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await?;
+            send_reply_async(
+                &mut transport,
+                0x05,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -448,7 +486,10 @@ async fn handle_socks5_stream_async(stream: tokio::net::TcpStream, config: Socks
     Ok(())
 }
 
-fn handle_userpass<T: StreamTransport>(transport: &mut T, users: &HashMap<String, String>) -> CoreResult<bool> {
+fn handle_userpass<T: StreamTransport>(
+    transport: &mut T,
+    users: &HashMap<String, String>,
+) -> CoreResult<bool> {
     let mut header = [0u8; 2];
     transport.read_exact(&mut header)?;
     if header[0] != 0x01 {
@@ -465,7 +506,10 @@ fn handle_userpass<T: StreamTransport>(transport: &mut T, users: &HashMap<String
     transport.read_exact(&mut pass)?;
     let username = String::from_utf8_lossy(&uname).to_string();
     let password = String::from_utf8_lossy(&pass).to_string();
-    let ok = users.get(&username).map(|p| p == &password).unwrap_or(false);
+    let ok = users
+        .get(&username)
+        .map(|p| p == &password)
+        .unwrap_or(false);
     let status = if ok { 0x00 } else { 0x01 };
     transport.write_all(&[0x01, status])?;
     Ok(ok)
@@ -491,7 +535,10 @@ async fn handle_userpass_async<T: AsyncStreamTransport>(
     transport.read_exact(&mut pass).await?;
     let username = String::from_utf8_lossy(&uname).to_string();
     let password = String::from_utf8_lossy(&pass).to_string();
-    let ok = users.get(&username).map(|p| p == &password).unwrap_or(false);
+    let ok = users
+        .get(&username)
+        .map(|p| p == &password)
+        .unwrap_or(false);
     let status = if ok { 0x00 } else { 0x01 };
     transport.write_all(&[0x01, status]).await?;
     Ok(ok)
@@ -554,7 +601,10 @@ fn connect_target(address: &Socks5Address, port: u16, timeout: Duration) -> Core
     Err(CoreError::Message("socks5 connect failed".to_string()))
 }
 
-async fn connect_target_async(address: &Socks5Address, port: u16) -> CoreResult<tokio::net::TcpStream> {
+async fn connect_target_async(
+    address: &Socks5Address,
+    port: u16,
+) -> CoreResult<tokio::net::TcpStream> {
     let addrs = address.to_socket_addrs(port)?;
     for addr in addrs {
         if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {

@@ -197,7 +197,8 @@ impl AvPair {
                         return Err(CoreError::Parse("invalid AV timestamp".to_string()));
                     }
                     AvPair::Timestamp(u64::from_le_bytes([
-                        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+                        value[0], value[1], value[2], value[3], value[4], value[5], value[6],
+                        value[7],
                     ]))
                 }
                 8 => AvPair::SingleHost(value.to_vec()),
@@ -255,7 +256,10 @@ impl NegotiateMessage {
         out.extend_from_slice(&TYPE_NEGOTIATE.to_le_bytes());
         out.extend_from_slice(&flags.to_le_bytes());
         out.extend_from_slice(&security_buffer(domain_bytes.len(), domain_offset));
-        out.extend_from_slice(&security_buffer(workstation_bytes.len(), workstation_offset));
+        out.extend_from_slice(&security_buffer(
+            workstation_bytes.len(),
+            workstation_offset,
+        ));
         if let Some(version) = self.version {
             out.extend_from_slice(&version.encode());
         }
@@ -311,14 +315,21 @@ impl ChallengeMessage {
         let base_len = 48 + if self.version.is_some() { 8 } else { 0 };
         let target_name_offset = base_len;
         let target_info_offset = base_len + target_name_bytes.len();
-        let mut out = Vec::with_capacity(base_len + target_name_bytes.len() + target_info_bytes.len());
+        let mut out =
+            Vec::with_capacity(base_len + target_name_bytes.len() + target_info_bytes.len());
         out.extend_from_slice(SIGNATURE);
         out.extend_from_slice(&TYPE_CHALLENGE.to_le_bytes());
-        out.extend_from_slice(&security_buffer(target_name_bytes.len(), target_name_offset));
+        out.extend_from_slice(&security_buffer(
+            target_name_bytes.len(),
+            target_name_offset,
+        ));
         out.extend_from_slice(&flags.to_le_bytes());
         out.extend_from_slice(&self.server_challenge);
         out.extend_from_slice(&[0u8; 8]);
-        out.extend_from_slice(&security_buffer(target_info_bytes.len(), target_info_offset));
+        out.extend_from_slice(&security_buffer(
+            target_info_bytes.len(),
+            target_info_offset,
+        ));
         if let Some(version) = self.version {
             out.extend_from_slice(&version.encode());
         }
@@ -399,7 +410,10 @@ impl AuthenticateMessage {
         out.extend_from_slice(&security_buffer(nt_bytes.len(), nt_offset));
         out.extend_from_slice(&security_buffer(domain_bytes.len(), domain_offset));
         out.extend_from_slice(&security_buffer(user_bytes.len(), user_offset));
-        out.extend_from_slice(&security_buffer(workstation_bytes.len(), workstation_offset));
+        out.extend_from_slice(&security_buffer(
+            workstation_bytes.len(),
+            workstation_offset,
+        ));
         out.extend_from_slice(&security_buffer(session_bytes.len(), session_offset));
         out.extend_from_slice(&flags.to_le_bytes());
         if let Some(version) = self.version {
@@ -418,7 +432,9 @@ impl AuthenticateMessage {
         }
         let message_type = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         if message_type != TYPE_AUTHENTICATE {
-            return Err(CoreError::Parse("invalid NTLM authenticate type".to_string()));
+            return Err(CoreError::Parse(
+                "invalid NTLM authenticate type".to_string(),
+            ));
         }
         let (lm_len, lm_offset) = read_security_buffer(&data[12..20])?;
         let (nt_len, nt_offset) = read_security_buffer(&data[20..28])?;
@@ -496,7 +512,9 @@ impl NtlmMessage {
         match message_type {
             TYPE_NEGOTIATE => Ok(NtlmMessage::Negotiate(NegotiateMessage::decode(data)?)),
             TYPE_CHALLENGE => Ok(NtlmMessage::Challenge(ChallengeMessage::decode(data)?)),
-            TYPE_AUTHENTICATE => Ok(NtlmMessage::Authenticate(AuthenticateMessage::decode(data)?)),
+            TYPE_AUTHENTICATE => Ok(NtlmMessage::Authenticate(AuthenticateMessage::decode(
+                data,
+            )?)),
             _ => Err(CoreError::Parse("invalid NTLM message type".to_string())),
         }
     }
@@ -676,47 +694,46 @@ impl NtlmClient {
             .config
             .client_challenge
             .unwrap_or_else(|| random_bytes_8());
-        let timestamp = self
-            .config
-            .timestamp
-            .unwrap_or_else(filetime_now);
+        let timestamp = self.config.timestamp.unwrap_or_else(filetime_now);
 
-        let (lm_response, nt_response, session_base_key) = if (flags
-            & NEGOTIATE_EXTENDED_SESSIONSECURITY)
-            != 0
-            || challenge.target_info.iter().any(|p| matches!(p, AvPair::Eol))
-            || challenge.target_info.len() > 0
-        {
-            let ntlmv2_hash = ntlmv2_hash(&nt_hash, &self.config.username, &self.config.domain);
-            let mut target_info = challenge.target_info.clone();
-            if !target_info.iter().any(|p| matches!(p, AvPair::Eol)) {
-                target_info.push(AvPair::Eol);
-            }
-            let blob = build_ntlmv2_blob(timestamp, client_challenge, &target_info);
-            let mut data = Vec::with_capacity(8 + blob.len());
-            data.extend_from_slice(&challenge.server_challenge);
-            data.extend_from_slice(&blob);
-            let nt_proof = hmac_md5(&ntlmv2_hash, &data);
-            let mut nt_response = Vec::with_capacity(16 + blob.len());
-            nt_response.extend_from_slice(&nt_proof);
-            nt_response.extend_from_slice(&blob);
-            let mut lm_data = Vec::with_capacity(16);
-            lm_data.extend_from_slice(&challenge.server_challenge);
-            lm_data.extend_from_slice(&client_challenge);
-            let lm_hash = hmac_md5(&ntlmv2_hash, &lm_data);
-            let mut lm_response = Vec::with_capacity(24);
-            lm_response.extend_from_slice(&lm_hash);
-            lm_response.extend_from_slice(&client_challenge);
-            let session_base_key = hmac_md5(&ntlmv2_hash, &nt_proof);
-            (lm_response, nt_response, session_base_key)
-        } else {
-            let nt_response = ntlm_v1_response(&nt_hash, &challenge.server_challenge);
-            let lm_hash = lm_hash_opt
-                .ok_or_else(|| CoreError::Message("NTLMv1 requires LM hash".to_string()))?;
-            let lm_response = lm_v1_response(&lm_hash, &challenge.server_challenge);
-            let session_base_key = md4_digest(&nt_hash);
-            (lm_response.to_vec(), nt_response.to_vec(), session_base_key)
-        };
+        let (lm_response, nt_response, session_base_key) =
+            if (flags & NEGOTIATE_EXTENDED_SESSIONSECURITY) != 0
+                || challenge
+                    .target_info
+                    .iter()
+                    .any(|p| matches!(p, AvPair::Eol))
+                || challenge.target_info.len() > 0
+            {
+                let ntlmv2_hash = ntlmv2_hash(&nt_hash, &self.config.username, &self.config.domain);
+                let mut target_info = challenge.target_info.clone();
+                if !target_info.iter().any(|p| matches!(p, AvPair::Eol)) {
+                    target_info.push(AvPair::Eol);
+                }
+                let blob = build_ntlmv2_blob(timestamp, client_challenge, &target_info);
+                let mut data = Vec::with_capacity(8 + blob.len());
+                data.extend_from_slice(&challenge.server_challenge);
+                data.extend_from_slice(&blob);
+                let nt_proof = hmac_md5(&ntlmv2_hash, &data);
+                let mut nt_response = Vec::with_capacity(16 + blob.len());
+                nt_response.extend_from_slice(&nt_proof);
+                nt_response.extend_from_slice(&blob);
+                let mut lm_data = Vec::with_capacity(16);
+                lm_data.extend_from_slice(&challenge.server_challenge);
+                lm_data.extend_from_slice(&client_challenge);
+                let lm_hash = hmac_md5(&ntlmv2_hash, &lm_data);
+                let mut lm_response = Vec::with_capacity(24);
+                lm_response.extend_from_slice(&lm_hash);
+                lm_response.extend_from_slice(&client_challenge);
+                let session_base_key = hmac_md5(&ntlmv2_hash, &nt_proof);
+                (lm_response, nt_response, session_base_key)
+            } else {
+                let nt_response = ntlm_v1_response(&nt_hash, &challenge.server_challenge);
+                let lm_hash = lm_hash_opt
+                    .ok_or_else(|| CoreError::Message("NTLMv1 requires LM hash".to_string()))?;
+                let lm_response = lm_v1_response(&lm_hash, &challenge.server_challenge);
+                let session_base_key = md4_digest(&nt_hash);
+                (lm_response.to_vec(), nt_response.to_vec(), session_base_key)
+            };
 
         let (exported_session_key, encrypted_session_key) = if (flags & NEGOTIATE_KEY_EXCH) != 0 {
             let mut random = [0u8; 16];
@@ -869,7 +886,8 @@ pub fn encode_http_token(message: &NtlmMessage) -> String {
 pub fn decode_http_token(header_value: &str) -> CoreResult<NtlmMessage> {
     let token = header_value.trim();
     let token = token.strip_prefix("NTLM").unwrap_or(token).trim();
-    let data = base64_decode(token).ok_or_else(|| CoreError::Parse("invalid base64".to_string()))?;
+    let data =
+        base64_decode(token).ok_or_else(|| CoreError::Parse("invalid base64".to_string()))?;
     NtlmMessage::decode(&data)
 }
 
@@ -945,10 +963,7 @@ fn decode_utf16le(bytes: &[u8]) -> CoreResult<String> {
 }
 
 fn utf16le_bytes(value: &str) -> Vec<u8> {
-    value
-        .encode_utf16()
-        .flat_map(|u| u.to_le_bytes())
-        .collect()
+    value.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
 }
 
 fn nt_hash(password: &str) -> [u8; 16] {
@@ -1034,10 +1049,22 @@ fn build_ntlmv2_blob(timestamp: u64, client_challenge: [u8; 8], target_info: &[A
 }
 
 fn derive_session_keys(exported_session_key: [u8; 16]) -> NtlmSession {
-    let signing_key_client = md5_magic(&exported_session_key, b"session key to client-to-server signing key magic constant");
-    let signing_key_server = md5_magic(&exported_session_key, b"session key to server-to-client signing key magic constant");
-    let sealing_key_client = md5_magic(&exported_session_key, b"session key to client-to-server sealing key magic constant");
-    let sealing_key_server = md5_magic(&exported_session_key, b"session key to server-to-client sealing key magic constant");
+    let signing_key_client = md5_magic(
+        &exported_session_key,
+        b"session key to client-to-server signing key magic constant",
+    );
+    let signing_key_server = md5_magic(
+        &exported_session_key,
+        b"session key to server-to-client signing key magic constant",
+    );
+    let sealing_key_client = md5_magic(
+        &exported_session_key,
+        b"session key to client-to-server sealing key magic constant",
+    );
+    let sealing_key_server = md5_magic(
+        &exported_session_key,
+        b"session key to server-to-client sealing key magic constant",
+    );
     NtlmSession {
         exported_session_key,
         signing_key_client,
@@ -1098,9 +1125,10 @@ fn random_bytes_8() -> [u8; 8] {
 fn filetime_now() -> u64 {
     const UNIX_TO_FILETIME: u64 = 11644473600;
     const HUNDRED_NANOSECONDS: u64 = 10_000_000;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    (now.as_secs() + UNIX_TO_FILETIME) * HUNDRED_NANOSECONDS
-        + (now.subsec_nanos() as u64 / 100)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    (now.as_secs() + UNIX_TO_FILETIME) * HUNDRED_NANOSECONDS + (now.subsec_nanos() as u64 / 100)
 }
 
 #[derive(Debug, Clone)]
@@ -1119,7 +1147,9 @@ impl Rc4 {
         let mut j = 0u8;
         for i in 0..256u16 {
             let idx = i as u8;
-            j = j.wrapping_add(s[idx as usize]).wrapping_add(key[i as usize % key.len()]);
+            j = j
+                .wrapping_add(s[idx as usize])
+                .wrapping_add(key[i as usize % key.len()]);
             s.swap(idx as usize, j as usize);
         }
         Self { s, i: 0, j: 0 }
@@ -1409,38 +1439,36 @@ fn permute(input: u64, table: &[u8], input_bits: u8) -> u64 {
 }
 
 const IP_TABLE: [u8; 64] = [
-    58, 50, 42, 34, 26, 18, 10, 2, 60, 52, 44, 36, 28, 20, 12, 4, 62, 54, 46, 38, 30, 22,
-    14, 6, 64, 56, 48, 40, 32, 24, 16, 8, 57, 49, 41, 33, 25, 17, 9, 1, 59, 51, 43, 35,
-    27, 19, 11, 3, 61, 53, 45, 37, 29, 21, 13, 5, 63, 55, 47, 39, 31, 23, 15, 7,
+    58, 50, 42, 34, 26, 18, 10, 2, 60, 52, 44, 36, 28, 20, 12, 4, 62, 54, 46, 38, 30, 22, 14, 6,
+    64, 56, 48, 40, 32, 24, 16, 8, 57, 49, 41, 33, 25, 17, 9, 1, 59, 51, 43, 35, 27, 19, 11, 3, 61,
+    53, 45, 37, 29, 21, 13, 5, 63, 55, 47, 39, 31, 23, 15, 7,
 ];
 
 const FP_TABLE: [u8; 64] = [
-    40, 8, 48, 16, 56, 24, 64, 32, 39, 7, 47, 15, 55, 23, 63, 31, 38, 6, 46, 14, 54, 22,
-    62, 30, 37, 5, 45, 13, 53, 21, 61, 29, 36, 4, 44, 12, 52, 20, 60, 28, 35, 3, 43, 11,
-    51, 19, 59, 27, 34, 2, 42, 10, 50, 18, 58, 26, 33, 1, 41, 9, 49, 17, 57, 25,
+    40, 8, 48, 16, 56, 24, 64, 32, 39, 7, 47, 15, 55, 23, 63, 31, 38, 6, 46, 14, 54, 22, 62, 30,
+    37, 5, 45, 13, 53, 21, 61, 29, 36, 4, 44, 12, 52, 20, 60, 28, 35, 3, 43, 11, 51, 19, 59, 27,
+    34, 2, 42, 10, 50, 18, 58, 26, 33, 1, 41, 9, 49, 17, 57, 25,
 ];
 
 const PC1_TABLE: [u8; 56] = [
-    57, 49, 41, 33, 25, 17, 9, 1, 58, 50, 42, 34, 26, 18, 10, 2, 59, 51, 43, 35, 27, 19,
-    11, 3, 60, 52, 44, 36, 63, 55, 47, 39, 31, 23, 15, 7, 62, 54, 46, 38, 30, 22, 14, 6,
-    61, 53, 45, 37, 29, 21, 13, 5, 28, 20, 12, 4,
+    57, 49, 41, 33, 25, 17, 9, 1, 58, 50, 42, 34, 26, 18, 10, 2, 59, 51, 43, 35, 27, 19, 11, 3, 60,
+    52, 44, 36, 63, 55, 47, 39, 31, 23, 15, 7, 62, 54, 46, 38, 30, 22, 14, 6, 61, 53, 45, 37, 29,
+    21, 13, 5, 28, 20, 12, 4,
 ];
 
 const PC2_TABLE: [u8; 48] = [
-    14, 17, 11, 24, 1, 5, 3, 28, 15, 6, 21, 10, 23, 19, 12, 4, 26, 8, 16, 7, 27, 20,
-    13, 2, 41, 52, 31, 37, 47, 55, 30, 40, 51, 45, 33, 48, 44, 49, 39, 56, 34, 53, 46,
-    42, 50, 36, 29, 32,
+    14, 17, 11, 24, 1, 5, 3, 28, 15, 6, 21, 10, 23, 19, 12, 4, 26, 8, 16, 7, 27, 20, 13, 2, 41, 52,
+    31, 37, 47, 55, 30, 40, 51, 45, 33, 48, 44, 49, 39, 56, 34, 53, 46, 42, 50, 36, 29, 32,
 ];
 
 const E_TABLE: [u8; 48] = [
-    32, 1, 2, 3, 4, 5, 4, 5, 6, 7, 8, 9, 8, 9, 10, 11, 12, 13, 12, 13, 14, 15, 16, 17,
-    16, 17, 18, 19, 20, 21, 20, 21, 22, 23, 24, 25, 24, 25, 26, 27, 28, 29, 28, 29, 30,
-    31, 32, 1,
+    32, 1, 2, 3, 4, 5, 4, 5, 6, 7, 8, 9, 8, 9, 10, 11, 12, 13, 12, 13, 14, 15, 16, 17, 16, 17, 18,
+    19, 20, 21, 20, 21, 22, 23, 24, 25, 24, 25, 26, 27, 28, 29, 28, 29, 30, 31, 32, 1,
 ];
 
 const P_TABLE: [u8; 32] = [
-    16, 7, 20, 21, 29, 12, 28, 17, 1, 15, 23, 26, 5, 18, 31, 10, 2, 8, 24, 14, 32, 27,
-    3, 9, 19, 13, 30, 6, 22, 11, 4, 25,
+    16, 7, 20, 21, 29, 12, 28, 17, 1, 15, 23, 26, 5, 18, 31, 10, 2, 8, 24, 14, 32, 27, 3, 9, 19,
+    13, 30, 6, 22, 11, 4, 25,
 ];
 
 const SHIFTS: [u32; 16] = [1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1];
@@ -1538,9 +1566,21 @@ fn base64_decode(data: &str) -> Option<Vec<u8>> {
     let mut i = 0;
     while i < bytes.len() {
         let c0 = bytes[i];
-        let c1 = if i + 1 < bytes.len() { bytes[i + 1] } else { b'=' };
-        let c2 = if i + 2 < bytes.len() { bytes[i + 2] } else { b'=' };
-        let c3 = if i + 3 < bytes.len() { bytes[i + 3] } else { b'=' };
+        let c1 = if i + 1 < bytes.len() {
+            bytes[i + 1]
+        } else {
+            b'='
+        };
+        let c2 = if i + 2 < bytes.len() {
+            bytes[i + 2]
+        } else {
+            b'='
+        };
+        let c3 = if i + 3 < bytes.len() {
+            bytes[i + 3]
+        } else {
+            b'='
+        };
         let v0 = val(c0)?;
         let v1 = val(c1)?;
         let v2 = if c2 == b'=' { 0 } else { val(c2)? };
@@ -1578,7 +1618,10 @@ mod tests {
             ("a", "bde52cb31de33e46245e05fbdbd6fb24"),
             ("abc", "a448017aaf21d8525fc10ae87aa6729d"),
             ("message digest", "d9130a8164549fe818874806e1c7014b"),
-            ("abcdefghijklmnopqrstuvwxyz", "d79e1c308aa5bbcdeea8ed63df412da9"),
+            (
+                "abcdefghijklmnopqrstuvwxyz",
+                "d79e1c308aa5bbcdeea8ed63df412da9",
+            ),
             (
                 "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
                 "043f8582f241db351ce627e153e7f0e4",
@@ -1590,7 +1633,10 @@ mod tests {
         ];
         for (input, expected) in cases {
             let digest = md4_digest(input.as_bytes());
-            let hex = digest.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+            let hex = digest
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>();
             assert_eq!(hex, expected);
         }
     }
@@ -1640,7 +1686,10 @@ mod tests {
             target_name: "TARGET".to_string(),
             flags: default_flags(),
             server_challenge: [1u8; 8],
-            target_info: vec![AvPair::DnsDomainName("example.com".to_string()), AvPair::Eol],
+            target_info: vec![
+                AvPair::DnsDomainName("example.com".to_string()),
+                AvPair::Eol,
+            ],
             version: Some(Version::windows_10()),
         };
         let encoded = msg.encode();

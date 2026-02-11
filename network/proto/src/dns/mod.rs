@@ -9,7 +9,9 @@ use net::NetAddr;
 use tokio::net::UdpSocket as TokioUdpSocket;
 
 use crate::framing::{Framer, LengthPrefixedFramer};
-use crate::http::{AsyncHttpClient, HttpClient, HttpMethod, HttpRequest, HttpResponse, HttpVersion};
+use crate::http::{
+    AsyncHttpClient, HttpClient, HttpMethod, HttpRequest, HttpResponse, HttpVersion,
+};
 use crate::http2::{Http2Request, Http2Response, Http2Server, Http2TlsServer};
 use crate::http3::{Http3Request, Http3Response, Http3Server};
 use crate::transport::{
@@ -129,10 +131,7 @@ pub struct DnsClientSubnet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsOptionValue {
     ClientSubnet(DnsClientSubnet),
-    Cookie {
-        client: Vec<u8>,
-        server: Vec<u8>,
-    },
+    Cookie { client: Vec<u8>, server: Vec<u8> },
     TcpKeepalive(Option<u16>),
     Padding(usize),
     Nsid(Vec<u8>),
@@ -166,7 +165,10 @@ impl DnsOption {
     }
 
     pub fn padding(len: usize) -> Self {
-        Self { code: 12, data: vec![0u8; len] }
+        Self {
+            code: 12,
+            data: vec![0u8; len],
+        }
     }
 
     pub fn tcp_keepalive(timeout: Option<u16>) -> Self {
@@ -178,23 +180,38 @@ impl DnsOption {
     }
 
     pub fn nsid() -> Self {
-        Self { code: 3, data: Vec::new() }
+        Self {
+            code: 3,
+            data: Vec::new(),
+        }
     }
 
     pub fn dau(algs: &[u8]) -> Self {
-        Self { code: 5, data: algs.to_vec() }
+        Self {
+            code: 5,
+            data: algs.to_vec(),
+        }
     }
 
     pub fn dhu(algs: &[u8]) -> Self {
-        Self { code: 6, data: algs.to_vec() }
+        Self {
+            code: 6,
+            data: algs.to_vec(),
+        }
     }
 
     pub fn n3u(algs: &[u8]) -> Self {
-        Self { code: 7, data: algs.to_vec() }
+        Self {
+            code: 7,
+            data: algs.to_vec(),
+        }
     }
 
     pub fn expire(seconds: u32) -> Self {
-        Self { code: 9, data: seconds.to_be_bytes().to_vec() }
+        Self {
+            code: 9,
+            data: seconds.to_be_bytes().to_vec(),
+        }
     }
 
     pub fn chain(data: Vec<u8>) -> Self {
@@ -248,7 +265,8 @@ impl DnsOption {
                 if self.data.len() != 4 {
                     return Err(CoreError::Parse("invalid expire option".to_string()));
                 }
-                let seconds = u32::from_be_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]);
+                let seconds =
+                    u32::from_be_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]);
                 Ok(DnsOptionValue::Expire(seconds))
             }
             10 => {
@@ -354,9 +372,17 @@ pub enum DnsRecordData {
     CNAME(String),
     NS(String),
     PTR(String),
-    MX { preference: u16, exchange: String },
+    MX {
+        preference: u16,
+        exchange: String,
+    },
     TXT(String),
-    SRV { priority: u16, weight: u16, port: u16, target: String },
+    SRV {
+        priority: u16,
+        weight: u16,
+        port: u16,
+        target: String,
+    },
     DNSKEY(DnsDnskey),
     DS(DnsDs),
     RRSIG(DnsRrsig),
@@ -483,7 +509,11 @@ impl DnsMessage {
             offset = next;
             let qtype = read_u16(bytes, &mut offset)?;
             let qclass = read_u16(bytes, &mut offset)?;
-            questions.push(DnsQuestion { name, qtype, qclass });
+            questions.push(DnsQuestion {
+                name,
+                qtype,
+                qclass,
+            });
         }
         let mut answers = Vec::with_capacity(ancount as usize);
         for _ in 0..ancount {
@@ -514,7 +544,11 @@ impl DnsMessage {
     }
 }
 
-fn encode_name(name: &str, buf: &mut Vec<u8>, compression: &mut HashMap<String, u16>) -> CoreResult<()> {
+fn encode_name(
+    name: &str,
+    buf: &mut Vec<u8>,
+    compression: &mut HashMap<String, u16>,
+) -> CoreResult<()> {
     if name.is_empty() {
         buf.push(0);
         return Ok(());
@@ -601,10 +635,13 @@ fn encode_rdata(
     match data {
         DnsRecordData::A(addr) => buf.extend_from_slice(&addr.octets()),
         DnsRecordData::AAAA(addr) => buf.extend_from_slice(&addr.octets()),
-        DnsRecordData::CNAME(name)
-        | DnsRecordData::NS(name)
-        | DnsRecordData::PTR(name) => encode_name(name, buf, compression)?,
-        DnsRecordData::MX { preference, exchange } => {
+        DnsRecordData::CNAME(name) | DnsRecordData::NS(name) | DnsRecordData::PTR(name) => {
+            encode_name(name, buf, compression)?
+        }
+        DnsRecordData::MX {
+            preference,
+            exchange,
+        } => {
             buf.extend_from_slice(&preference.to_be_bytes());
             encode_name(exchange, buf, compression)?;
         }
@@ -615,7 +652,12 @@ fn encode_rdata(
             buf.push(text.len() as u8);
             buf.extend_from_slice(text.as_bytes());
         }
-        DnsRecordData::SRV { priority, weight, port, target } => {
+        DnsRecordData::SRV {
+            priority,
+            weight,
+            port,
+            target,
+        } => {
             buf.extend_from_slice(&priority.to_be_bytes());
             buf.extend_from_slice(&weight.to_be_bytes());
             buf.extend_from_slice(&port.to_be_bytes());
@@ -720,7 +762,10 @@ fn decode_rdata(
             let preference = read_u16(msg, offset)?;
             let (exchange, next) = decode_name(msg, *offset)?;
             *offset = next;
-            DnsRecordData::MX { preference, exchange }
+            DnsRecordData::MX {
+                preference,
+                exchange,
+            }
         }
         16 => {
             if rdlen < 1 {
@@ -743,7 +788,12 @@ fn decode_rdata(
             let port = read_u16(msg, offset)?;
             let (target, next) = decode_name(msg, *offset)?;
             *offset = next;
-            DnsRecordData::SRV { priority, weight, port, target }
+            DnsRecordData::SRV {
+                priority,
+                weight,
+                port,
+                target,
+            }
         }
         48 => {
             let flags = read_u16(msg, offset)?;
@@ -884,7 +934,13 @@ fn decode_record(msg: &[u8], offset: &mut usize) -> CoreResult<DnsRecord> {
     let ttl = read_u32(msg, offset)?;
     let rdlen = read_u16(msg, offset)? as usize;
     let data = decode_rdata(msg, offset, rtype, rdlen, class, ttl)?;
-    Ok(DnsRecord { name, rtype, class, ttl, data })
+    Ok(DnsRecord {
+        name,
+        rtype,
+        class,
+        ttl,
+        data,
+    })
 }
 
 fn read_u16(msg: &[u8], offset: &mut usize) -> CoreResult<u16> {
@@ -986,12 +1042,21 @@ pub fn verify_rrsig_at(
     verify_signature(rrsig, dnskey, &signed)
 }
 
-pub fn verify_rrsig(owner: &str, rrset: &[DnsRecord], rrsig: &DnsRrsig, dnskey: &DnsDnskey) -> CoreResult<()> {
+pub fn verify_rrsig(
+    owner: &str,
+    rrset: &[DnsRecord],
+    rrsig: &DnsRrsig,
+    dnskey: &DnsDnskey,
+) -> CoreResult<()> {
     let now = corelib::time::now_secs() as u32;
     verify_rrsig_at(owner, rrset, rrsig, dnskey, now)
 }
 
-fn build_rrsig_signed_data(owner: &str, rrset: &[DnsRecord], rrsig: &DnsRrsig) -> CoreResult<Vec<u8>> {
+fn build_rrsig_signed_data(
+    owner: &str,
+    rrset: &[DnsRecord],
+    rrsig: &DnsRrsig,
+) -> CoreResult<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&rrsig.type_covered.to_be_bytes());
     out.push(rrsig.algorithm);
@@ -1031,12 +1096,13 @@ fn encode_rdata_canonical(data: &DnsRecordData, buf: &mut Vec<u8>) -> CoreResult
     match data {
         DnsRecordData::A(addr) => buf.extend_from_slice(&addr.octets()),
         DnsRecordData::AAAA(addr) => buf.extend_from_slice(&addr.octets()),
-        DnsRecordData::CNAME(name)
-        | DnsRecordData::NS(name)
-        | DnsRecordData::PTR(name) => {
+        DnsRecordData::CNAME(name) | DnsRecordData::NS(name) | DnsRecordData::PTR(name) => {
             encode_name_canonical(name, buf)?;
         }
-        DnsRecordData::MX { preference, exchange } => {
+        DnsRecordData::MX {
+            preference,
+            exchange,
+        } => {
             buf.extend_from_slice(&preference.to_be_bytes());
             encode_name_canonical(exchange, buf)?;
         }
@@ -1044,7 +1110,12 @@ fn encode_rdata_canonical(data: &DnsRecordData, buf: &mut Vec<u8>) -> CoreResult
             buf.push(text.len() as u8);
             buf.extend_from_slice(text.as_bytes());
         }
-        DnsRecordData::SRV { priority, weight, port, target } => {
+        DnsRecordData::SRV {
+            priority,
+            weight,
+            port,
+            target,
+        } => {
             buf.extend_from_slice(&priority.to_be_bytes());
             buf.extend_from_slice(&weight.to_be_bytes());
             buf.extend_from_slice(&port.to_be_bytes());
@@ -1133,17 +1204,38 @@ fn verify_signature(rrsig: &DnsRrsig, key: &DnsDnskey, data: &[u8]) -> CoreResul
             &rrsig.signature,
             data,
         ),
-        8 => verify_rsa(&ring::signature::RSA_PKCS1_2048_8192_SHA256, key, &rrsig.signature, data),
-        10 => verify_rsa(&ring::signature::RSA_PKCS1_2048_8192_SHA512, key, &rrsig.signature, data),
-        13 => verify_ecdsa(&ring::signature::ECDSA_P256_SHA256_FIXED, key, &rrsig.signature, data),
-        14 => verify_ecdsa(&ring::signature::ECDSA_P384_SHA384_FIXED, key, &rrsig.signature, data),
+        8 => verify_rsa(
+            &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+            key,
+            &rrsig.signature,
+            data,
+        ),
+        10 => verify_rsa(
+            &ring::signature::RSA_PKCS1_2048_8192_SHA512,
+            key,
+            &rrsig.signature,
+            data,
+        ),
+        13 => verify_ecdsa(
+            &ring::signature::ECDSA_P256_SHA256_FIXED,
+            key,
+            &rrsig.signature,
+            data,
+        ),
+        14 => verify_ecdsa(
+            &ring::signature::ECDSA_P384_SHA384_FIXED,
+            key,
+            &rrsig.signature,
+            data,
+        ),
         15 => verify_ed25519(key, &rrsig.signature, data),
         _ => Err(CoreError::Parse("unsupported dnssec algorithm".to_string())),
     }
 }
 
 fn verify_ed25519(key: &DnsDnskey, signature: &[u8], data: &[u8]) -> CoreResult<()> {
-    let verifier = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key.public_key);
+    let verifier =
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key.public_key);
     verifier
         .verify(data, signature)
         .map_err(|_| CoreError::Parse("ed25519 verify failed".to_string()))
@@ -1435,16 +1527,26 @@ pub struct MdnsClient {
 impl MdnsClient {
     pub fn bind_v4() -> CoreResult<Self> {
         let socket = UdpSocket::bind(("0.0.0.0", MDNS_PORT)).map_err(CoreError::Io)?;
-        socket.set_read_timeout(Some(Duration::from_secs(3))).map_err(CoreError::Io)?;
-        let mcast: Ipv4Addr = MDNS_IPV4.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
-        socket.join_multicast_v4(&mcast, &Ipv4Addr::UNSPECIFIED).map_err(CoreError::Io)?;
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .map_err(CoreError::Io)?;
+        let mcast: Ipv4Addr = MDNS_IPV4
+            .parse()
+            .map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        socket
+            .join_multicast_v4(&mcast, &Ipv4Addr::UNSPECIFIED)
+            .map_err(CoreError::Io)?;
         Ok(Self { socket })
     }
 
     pub fn bind_v6() -> CoreResult<Self> {
         let socket = UdpSocket::bind(("::", MDNS_PORT)).map_err(CoreError::Io)?;
-        socket.set_read_timeout(Some(Duration::from_secs(3))).map_err(CoreError::Io)?;
-        let mcast: Ipv6Addr = MDNS_IPV6.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .map_err(CoreError::Io)?;
+        let mcast: Ipv6Addr = MDNS_IPV6
+            .parse()
+            .map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
         socket.join_multicast_v6(&mcast, 0).map_err(CoreError::Io)?;
         Ok(Self { socket })
     }
@@ -1479,14 +1581,20 @@ pub struct MdnsServer {
 impl MdnsServer {
     pub fn bind_v4() -> CoreResult<Self> {
         let socket = UdpSocket::bind(("0.0.0.0", MDNS_PORT)).map_err(CoreError::Io)?;
-        let mcast: Ipv4Addr = MDNS_IPV4.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
-        socket.join_multicast_v4(&mcast, &Ipv4Addr::UNSPECIFIED).map_err(CoreError::Io)?;
+        let mcast: Ipv4Addr = MDNS_IPV4
+            .parse()
+            .map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        socket
+            .join_multicast_v4(&mcast, &Ipv4Addr::UNSPECIFIED)
+            .map_err(CoreError::Io)?;
         Ok(Self { socket })
     }
 
     pub fn bind_v6() -> CoreResult<Self> {
         let socket = UdpSocket::bind(("::", MDNS_PORT)).map_err(CoreError::Io)?;
-        let mcast: Ipv6Addr = MDNS_IPV6.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        let mcast: Ipv6Addr = MDNS_IPV6
+            .parse()
+            .map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
         socket.join_multicast_v6(&mcast, 0).map_err(CoreError::Io)?;
         Ok(Self { socket })
     }
@@ -1503,11 +1611,11 @@ impl MdnsServer {
             let handler = Arc::clone(&handler);
             let socket = self.socket.try_clone().map_err(CoreError::Io)?;
             thread::spawn(move || {
-                    if let Ok(req) = DnsMessage::decode(&buf) {
-                        if let Ok(resp) = handler(req).encode() {
-                            let _ = socket.send_to(&resp, peer);
-                        }
+                if let Ok(req) = DnsMessage::decode(&buf) {
+                    if let Ok(resp) = handler(req).encode() {
+                        let _ = socket.send_to(&resp, peer);
                     }
+                }
             });
         }
     }
@@ -1519,15 +1627,25 @@ pub struct AsyncMdnsClient {
 
 impl AsyncMdnsClient {
     pub async fn bind_v4() -> CoreResult<Self> {
-        let socket = TokioUdpSocket::bind(("0.0.0.0", MDNS_PORT)).await.map_err(CoreError::Io)?;
-        let mcast: Ipv4Addr = MDNS_IPV4.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
-        socket.join_multicast_v4(mcast, Ipv4Addr::UNSPECIFIED).map_err(CoreError::Io)?;
+        let socket = TokioUdpSocket::bind(("0.0.0.0", MDNS_PORT))
+            .await
+            .map_err(CoreError::Io)?;
+        let mcast: Ipv4Addr = MDNS_IPV4
+            .parse()
+            .map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        socket
+            .join_multicast_v4(mcast, Ipv4Addr::UNSPECIFIED)
+            .map_err(CoreError::Io)?;
         Ok(Self { socket })
     }
 
     pub async fn bind_v6() -> CoreResult<Self> {
-        let socket = TokioUdpSocket::bind(("::", MDNS_PORT)).await.map_err(CoreError::Io)?;
-        let mcast: Ipv6Addr = MDNS_IPV6.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        let socket = TokioUdpSocket::bind(("::", MDNS_PORT))
+            .await
+            .map_err(CoreError::Io)?;
+        let mcast: Ipv6Addr = MDNS_IPV6
+            .parse()
+            .map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
         socket.join_multicast_v6(&mcast, 0).map_err(CoreError::Io)?;
         Ok(Self { socket })
     }
@@ -1535,20 +1653,30 @@ impl AsyncMdnsClient {
     pub async fn send_query(&self, message: &DnsMessage) -> CoreResult<()> {
         let bytes = message.encode()?;
         let target: SocketAddr = format!("{}:{}", MDNS_IPV4, MDNS_PORT).parse().unwrap();
-        self.socket.send_to(&bytes, target).await.map_err(CoreError::Io)?;
+        self.socket
+            .send_to(&bytes, target)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(())
     }
 
     pub async fn send_query_v6(&self, message: &DnsMessage) -> CoreResult<()> {
         let bytes = message.encode()?;
         let target: SocketAddr = format!("[{}]:{}", MDNS_IPV6, MDNS_PORT).parse().unwrap();
-        self.socket.send_to(&bytes, target).await.map_err(CoreError::Io)?;
+        self.socket
+            .send_to(&bytes, target)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(())
     }
 
     pub async fn recv(&self, max_bytes: usize) -> CoreResult<(DnsMessage, SocketAddr)> {
         let mut buf = vec![0u8; max_bytes];
-        let (len, addr) = self.socket.recv_from(&mut buf).await.map_err(CoreError::Io)?;
+        let (len, addr) = self
+            .socket
+            .recv_from(&mut buf)
+            .await
+            .map_err(CoreError::Io)?;
         buf.truncate(len);
         let msg = DnsMessage::decode(&buf)?;
         Ok((msg, addr))
@@ -1561,17 +1689,31 @@ pub struct AsyncMdnsServer {
 
 impl AsyncMdnsServer {
     pub async fn bind_v4() -> CoreResult<Self> {
-        let socket = TokioUdpSocket::bind(("0.0.0.0", MDNS_PORT)).await.map_err(CoreError::Io)?;
-        let mcast: Ipv4Addr = MDNS_IPV4.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
-        socket.join_multicast_v4(mcast, Ipv4Addr::UNSPECIFIED).map_err(CoreError::Io)?;
-        Ok(Self { socket: Arc::new(socket) })
+        let socket = TokioUdpSocket::bind(("0.0.0.0", MDNS_PORT))
+            .await
+            .map_err(CoreError::Io)?;
+        let mcast: Ipv4Addr = MDNS_IPV4
+            .parse()
+            .map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        socket
+            .join_multicast_v4(mcast, Ipv4Addr::UNSPECIFIED)
+            .map_err(CoreError::Io)?;
+        Ok(Self {
+            socket: Arc::new(socket),
+        })
     }
 
     pub async fn bind_v6() -> CoreResult<Self> {
-        let socket = TokioUdpSocket::bind(("::", MDNS_PORT)).await.map_err(CoreError::Io)?;
-        let mcast: Ipv6Addr = MDNS_IPV6.parse().map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
+        let socket = TokioUdpSocket::bind(("::", MDNS_PORT))
+            .await
+            .map_err(CoreError::Io)?;
+        let mcast: Ipv6Addr = MDNS_IPV6
+            .parse()
+            .map_err(|_| CoreError::Parse("invalid mdns addr".to_string()))?;
         socket.join_multicast_v6(&mcast, 0).map_err(CoreError::Io)?;
-        Ok(Self { socket: Arc::new(socket) })
+        Ok(Self {
+            socket: Arc::new(socket),
+        })
     }
 
     pub async fn serve<F>(&self, handler: F) -> CoreResult<()>
@@ -1581,7 +1723,11 @@ impl AsyncMdnsServer {
         let handler = Arc::new(handler);
         let mut buf = vec![0u8; DNS_MAX_PACKET];
         loop {
-            let (len, peer) = self.socket.recv_from(&mut buf).await.map_err(CoreError::Io)?;
+            let (len, peer) = self
+                .socket
+                .recv_from(&mut buf)
+                .await
+                .map_err(CoreError::Io)?;
             let data = buf[..len].to_vec();
             let handler = Arc::clone(&handler);
             let socket = Arc::clone(&self.socket);
@@ -1652,8 +1798,8 @@ impl AsyncDnsClient {
         tls: &TlsClientConfig,
     ) -> CoreResult<DnsMessage> {
         let addr = NetAddr::from_socket(self.server);
-        let mut transport = AsyncTlsClientTransport::connect(&addr, server_name, tls, self.timeouts)
-            .await?;
+        let mut transport =
+            AsyncTlsClientTransport::connect(&addr, server_name, tls, self.timeouts).await?;
         let framer = LengthPrefixedFramer::new(2, self.max_packet)?;
         let bytes = message.encode()?;
         let framed = framer.frame(&bytes)?;
@@ -1866,7 +2012,9 @@ impl AsyncDoh2Client {
         req.body = message.encode()?;
         let addr = NetAddr::new(&self.url.host, self.url.port);
         let tls = TlsClientConfig::with_webpki_roots()?.with_alpn(&[b"h2"]);
-        let mut client = crate::http2::Http2Client::connect_tls(&addr, &self.url.host, &tls, self.timeouts).await?;
+        let mut client =
+            crate::http2::Http2Client::connect_tls(&addr, &self.url.host, &tls, self.timeouts)
+                .await?;
         let response = client.send(&req).await?;
         if response.status != 200 {
             return Err(CoreError::Parse("doh2 non-200 response".to_string()));
@@ -2022,7 +2170,13 @@ where
     F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
 {
     let method = http_method_str(&request.method);
-    match doh_handle_request(config, method, &request.path, &request.headers, &request.body) {
+    match doh_handle_request(
+        config,
+        method,
+        &request.path,
+        &request.headers,
+        &request.body,
+    ) {
         Ok(msg) => doh_success_http(config, handler, msg),
         Err(err) => doh_error_http(err),
     }
@@ -2036,7 +2190,13 @@ fn doh_http2_response<F>(
 where
     F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
 {
-    match doh_handle_request(config, &request.method, &request.path, &request.headers, &request.body) {
+    match doh_handle_request(
+        config,
+        &request.method,
+        &request.path,
+        &request.headers,
+        &request.body,
+    ) {
         Ok(msg) => doh_success_http2(config, handler, msg),
         Err(err) => doh_error_http2(err),
     }
@@ -2050,7 +2210,13 @@ fn doh_http3_response<F>(
 where
     F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
 {
-    match doh_handle_request(config, &request.method, &request.path, &request.headers, &request.body) {
+    match doh_handle_request(
+        config,
+        &request.method,
+        &request.path,
+        &request.headers,
+        &request.body,
+    ) {
         Ok(msg) => doh_success_http3(config, handler, msg),
         Err(err) => doh_error_http3(err),
     }
@@ -2086,7 +2252,10 @@ fn doh_handle_request(
             return Err(DohError::BadRequest("dns message too large".to_string()));
         }
         if let Some(ct) = header_value(headers, "content-type") {
-            if !ct.to_ascii_lowercase().starts_with("application/dns-message") {
+            if !ct
+                .to_ascii_lowercase()
+                .starts_with("application/dns-message")
+            {
                 return Err(DohError::BadRequest("invalid content-type".to_string()));
             }
         }
@@ -2315,7 +2484,10 @@ impl DnsServer {
         Self { udp_addr, tcp_addr }
     }
 
-    pub fn serve_udp<F>(&self, handler: F) -> CoreResult<()> where F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static {
+    pub fn serve_udp<F>(&self, handler: F) -> CoreResult<()>
+    where
+        F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+    {
         let socket = UdpTransport::bind(self.udp_addr)?;
         let handler = Arc::new(handler);
         loop {
@@ -2333,7 +2505,10 @@ impl DnsServer {
         }
     }
 
-    pub fn serve_tcp<F>(&self, handler: F) -> CoreResult<()> where F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static {
+    pub fn serve_tcp<F>(&self, handler: F) -> CoreResult<()>
+    where
+        F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
+    {
         let listener = TcpListener::bind(self.tcp_addr).map_err(CoreError::Io)?;
         let handler = Arc::new(handler);
         for stream in listener.incoming() {
@@ -2376,7 +2551,11 @@ impl AsyncDnsServer {
     where
         F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
     {
-        let socket = Arc::new(tokio::net::UdpSocket::bind(self.udp_addr).await.map_err(CoreError::Io)?);
+        let socket = Arc::new(
+            tokio::net::UdpSocket::bind(self.udp_addr)
+                .await
+                .map_err(CoreError::Io)?,
+        );
         let handler = Arc::new(handler);
         let mut buf = vec![0u8; DNS_MAX_PACKET];
         loop {
@@ -2398,7 +2577,9 @@ impl AsyncDnsServer {
     where
         F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
     {
-        let listener = tokio::net::TcpListener::bind(self.tcp_addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(self.tcp_addr)
+            .await
+            .map_err(CoreError::Io)?;
         let handler = Arc::new(handler);
         loop {
             let (stream, _) = listener.accept().await.map_err(CoreError::Io)?;
@@ -2413,7 +2594,9 @@ impl AsyncDnsServer {
     where
         F: Fn(DnsMessage) -> DnsMessage + Send + Sync + 'static,
     {
-        let listener = tokio::net::TcpListener::bind(self.tcp_addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(self.tcp_addr)
+            .await
+            .map_err(CoreError::Io)?;
         let acceptor = AsyncTlsServer::new(config);
         let handler = Arc::new(handler);
         loop {
@@ -2495,11 +2678,11 @@ fn handle_framed_stream<T: StreamTransport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::rand::SystemRandom;
     use ring::signature::KeyPair;
     use ring::signature::{
         EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING, ECDSA_P384_SHA384_FIXED_SIGNING,
     };
-    use ring::rand::SystemRandom;
 
     #[test]
     fn dns_roundtrip_query() {
@@ -2515,13 +2698,25 @@ mod tests {
         let response = DnsMessage {
             header: DnsHeader {
                 id: 0x2222,
-                flags: DnsFlags { qr: true, opcode: 0, aa: true, tc: false, rd: true, ra: true, rcode: 0 },
+                flags: DnsFlags {
+                    qr: true,
+                    opcode: 0,
+                    aa: true,
+                    tc: false,
+                    rd: true,
+                    ra: true,
+                    rcode: 0,
+                },
                 qdcount: 1,
                 ancount: 1,
                 nscount: 0,
                 arcount: 0,
             },
-            questions: vec![DnsQuestion { name: "example.com".to_string(), qtype: 1, qclass: 1 }],
+            questions: vec![DnsQuestion {
+                name: "example.com".to_string(),
+                qtype: 1,
+                qclass: 1,
+            }],
             answers: vec![DnsRecord {
                 name: "example.com".to_string(),
                 rtype: 1,
@@ -2658,7 +2853,12 @@ mod tests {
         const P384_PKCS8_BASE64: &str = "MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDC9yr5vPfIiqHkO8matLqZUbKLNkEuPQfMWRdkqeKaX4KoPuJ3otHrtKjZ13rchBxShZANiAAS3x/ceuzNMq2xf4HQFQEg0+aq+yvUt6wciIfsusu6OoY2wR456wWdTC6pDX/vi2ifZRb+TzfjOv0jOi5jHDSEMc2WGGDIxRaJ1e7ATN1INJqLTZYeXSUXbs5O5Qu9Ln7g=";
         let rng = SystemRandom::new();
 
-        let key_p256 = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &base64_decode(P256_PKCS8_BASE64).unwrap(), &rng).unwrap();
+        let key_p256 = EcdsaKeyPair::from_pkcs8(
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            &base64_decode(P256_PKCS8_BASE64).unwrap(),
+            &rng,
+        )
+        .unwrap();
         let pub_p256 = key_p256.public_key().as_ref();
         let dnskey_p256 = DnsDnskey {
             flags: 256,
@@ -2688,7 +2888,12 @@ mod tests {
         rrsig.signature = key_p256.sign(&rng, &signed).unwrap().as_ref().to_vec();
         verify_rrsig_at("example.com", &rrset, &rrsig, &dnskey_p256, 1_700_000_000).unwrap();
 
-        let key_p384 = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &base64_decode(P384_PKCS8_BASE64).unwrap(), &rng).unwrap();
+        let key_p384 = EcdsaKeyPair::from_pkcs8(
+            &ECDSA_P384_SHA384_FIXED_SIGNING,
+            &base64_decode(P384_PKCS8_BASE64).unwrap(),
+            &rng,
+        )
+        .unwrap();
         let pub_p384 = key_p384.public_key().as_ref();
         let dnskey_p384 = DnsDnskey {
             flags: 256,
@@ -2709,7 +2914,14 @@ mod tests {
         };
         let signed = build_rrsig_signed_data("example.com", &rrset, &rrsig384).unwrap();
         rrsig384.signature = key_p384.sign(&rng, &signed).unwrap().as_ref().to_vec();
-        verify_rrsig_at("example.com", &rrset, &rrsig384, &dnskey_p384, 1_700_000_000).unwrap();
+        verify_rrsig_at(
+            "example.com",
+            &rrset,
+            &rrsig384,
+            &dnskey_p384,
+            1_700_000_000,
+        )
+        .unwrap();
     }
 
     #[test]

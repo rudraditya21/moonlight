@@ -352,7 +352,9 @@ pub struct AsyncTdsServer {
 
 impl AsyncTdsServer {
     pub async fn bind(addr: SocketAddr, config: TdsServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         Ok(Self { listener, config })
     }
 
@@ -394,8 +396,16 @@ pub struct TdsClient {
 impl TdsClient {
     pub fn connect(addr: &net::NetAddr, config: TdsClientConfig) -> CoreResult<Self> {
         let mut transport = TcpTransport::connect(addr, config.timeouts)?;
-        let prelogin = PreloginInfo { version: 1, encryption: 0 };
-        write_packet(&mut transport, TdsMessageType::Prelogin, prelogin.encode(), 1)?;
+        let prelogin = PreloginInfo {
+            version: 1,
+            encryption: 0,
+        };
+        write_packet(
+            &mut transport,
+            TdsMessageType::Prelogin,
+            prelogin.encode(),
+            1,
+        )?;
         let _ = read_packet(&mut transport)?;
 
         let login = Login7 {
@@ -406,15 +416,27 @@ impl TdsClient {
         write_packet(&mut transport, TdsMessageType::Login7, login.encode(), 1)?;
         let resp = read_packet(&mut transport)?;
         let response = TdsResponse::decode(&resp.payload)?;
-        if response.tokens.iter().any(|t| matches!(t, TdsToken::Error(_))) {
+        if response
+            .tokens
+            .iter()
+            .any(|t| matches!(t, TdsToken::Error(_)))
+        {
             return Err(CoreError::Message("tds login failed".to_string()));
         }
-        Ok(Self { transport, packet_id: 1 })
+        Ok(Self {
+            transport,
+            packet_id: 1,
+        })
     }
 
     pub fn query(&mut self, sql: &str) -> CoreResult<TdsResponse> {
         let payload = sql.as_bytes().to_vec();
-        write_packet(&mut self.transport, TdsMessageType::SqlBatch, payload, self.packet_id)?;
+        write_packet(
+            &mut self.transport,
+            TdsMessageType::SqlBatch,
+            payload,
+            self.packet_id,
+        )?;
         self.packet_id = self.packet_id.wrapping_add(1).max(1);
         let resp = read_packet(&mut self.transport)?;
         TdsResponse::decode(&resp.payload)
@@ -429,8 +451,17 @@ pub struct AsyncTdsClient {
 impl AsyncTdsClient {
     pub async fn connect(addr: &net::NetAddr, config: TdsClientConfig) -> CoreResult<Self> {
         let mut transport = AsyncTcpTransport::connect(addr, config.timeouts).await?;
-        let prelogin = PreloginInfo { version: 1, encryption: 0 };
-        write_packet_async(&mut transport, TdsMessageType::Prelogin, prelogin.encode(), 1).await?;
+        let prelogin = PreloginInfo {
+            version: 1,
+            encryption: 0,
+        };
+        write_packet_async(
+            &mut transport,
+            TdsMessageType::Prelogin,
+            prelogin.encode(),
+            1,
+        )
+        .await?;
         let _ = read_packet_async(&mut transport).await?;
 
         let login = Login7 {
@@ -441,15 +472,28 @@ impl AsyncTdsClient {
         write_packet_async(&mut transport, TdsMessageType::Login7, login.encode(), 1).await?;
         let resp = read_packet_async(&mut transport).await?;
         let response = TdsResponse::decode(&resp.payload)?;
-        if response.tokens.iter().any(|t| matches!(t, TdsToken::Error(_))) {
+        if response
+            .tokens
+            .iter()
+            .any(|t| matches!(t, TdsToken::Error(_)))
+        {
             return Err(CoreError::Message("tds login failed".to_string()));
         }
-        Ok(Self { transport, packet_id: 1 })
+        Ok(Self {
+            transport,
+            packet_id: 1,
+        })
     }
 
     pub async fn query(&mut self, sql: &str) -> CoreResult<TdsResponse> {
         let payload = sql.as_bytes().to_vec();
-        write_packet_async(&mut self.transport, TdsMessageType::SqlBatch, payload, self.packet_id).await?;
+        write_packet_async(
+            &mut self.transport,
+            TdsMessageType::SqlBatch,
+            payload,
+            self.packet_id,
+        )
+        .await?;
         self.packet_id = self.packet_id.wrapping_add(1).max(1);
         let resp = read_packet_async(&mut self.transport).await?;
         TdsResponse::decode(&resp.payload)
@@ -471,17 +515,31 @@ fn handle_tds_stream(stream: TcpStream, config: TdsServerConfig) -> CoreResult<(
                     version: prelogin.version,
                     encryption: 0,
                 };
-                write_packet(&mut transport, TdsMessageType::Response, resp.encode(), packet.header.packet_id)?;
+                write_packet(
+                    &mut transport,
+                    TdsMessageType::Response,
+                    resp.encode(),
+                    packet.header.packet_id,
+                )?;
             }
             TdsMessageType::Login7 => {
                 let login = Login7::decode(&packet.payload)?;
                 if !config.users.is_empty() {
-                    let ok = config.users.get(&login.username).map(|p| p == &login.password).unwrap_or(false);
+                    let ok = config
+                        .users
+                        .get(&login.username)
+                        .map(|p| p == &login.password)
+                        .unwrap_or(false);
                     if !ok {
                         let resp = TdsResponse {
                             tokens: vec![TdsToken::Error("login failed".to_string())],
                         };
-                        write_packet(&mut transport, TdsMessageType::Response, resp.encode(), packet.header.packet_id)?;
+                        write_packet(
+                            &mut transport,
+                            TdsMessageType::Response,
+                            resp.encode(),
+                            packet.header.packet_id,
+                        )?;
                         return Ok(());
                     }
                 }
@@ -490,26 +548,44 @@ fn handle_tds_stream(stream: TcpStream, config: TdsServerConfig) -> CoreResult<(
                 let resp = TdsResponse {
                     tokens: vec![TdsToken::Done { row_count: 0 }],
                 };
-                write_packet(&mut transport, TdsMessageType::Response, resp.encode(), packet.header.packet_id)?;
+                write_packet(
+                    &mut transport,
+                    TdsMessageType::Response,
+                    resp.encode(),
+                    packet.header.packet_id,
+                )?;
             }
             TdsMessageType::SqlBatch => {
                 if !state.authenticated {
                     let resp = TdsResponse {
                         tokens: vec![TdsToken::Error("not authenticated".to_string())],
                     };
-                    write_packet(&mut transport, TdsMessageType::Response, resp.encode(), packet.header.packet_id)?;
+                    write_packet(
+                        &mut transport,
+                        TdsMessageType::Response,
+                        resp.encode(),
+                        packet.header.packet_id,
+                    )?;
                     continue;
                 }
                 let sql = String::from_utf8_lossy(&packet.payload).trim().to_string();
                 let response = execute_query(&sql, &state);
-                write_packet(&mut transport, TdsMessageType::Response, response.encode(), packet.header.packet_id)?;
+                write_packet(
+                    &mut transport,
+                    TdsMessageType::Response,
+                    response.encode(),
+                    packet.header.packet_id,
+                )?;
             }
             _ => {}
         }
     }
 }
 
-async fn handle_tds_stream_async(stream: tokio::net::TcpStream, config: TdsServerConfig) -> CoreResult<()> {
+async fn handle_tds_stream_async(
+    stream: tokio::net::TcpStream,
+    config: TdsServerConfig,
+) -> CoreResult<()> {
     let mut transport = AsyncTcpTransport::from_stream(stream);
     let mut state = TdsState {
         authenticated: false,
@@ -524,17 +600,33 @@ async fn handle_tds_stream_async(stream: tokio::net::TcpStream, config: TdsServe
                     version: prelogin.version,
                     encryption: 0,
                 };
-                write_packet_async(&mut transport, TdsMessageType::Response, resp.encode(), packet.header.packet_id).await?;
+                write_packet_async(
+                    &mut transport,
+                    TdsMessageType::Response,
+                    resp.encode(),
+                    packet.header.packet_id,
+                )
+                .await?;
             }
             TdsMessageType::Login7 => {
                 let login = Login7::decode(&packet.payload)?;
                 if !config.users.is_empty() {
-                    let ok = config.users.get(&login.username).map(|p| p == &login.password).unwrap_or(false);
+                    let ok = config
+                        .users
+                        .get(&login.username)
+                        .map(|p| p == &login.password)
+                        .unwrap_or(false);
                     if !ok {
                         let resp = TdsResponse {
                             tokens: vec![TdsToken::Error("login failed".to_string())],
                         };
-                        write_packet_async(&mut transport, TdsMessageType::Response, resp.encode(), packet.header.packet_id).await?;
+                        write_packet_async(
+                            &mut transport,
+                            TdsMessageType::Response,
+                            resp.encode(),
+                            packet.header.packet_id,
+                        )
+                        .await?;
                         return Ok(());
                     }
                 }
@@ -543,19 +635,37 @@ async fn handle_tds_stream_async(stream: tokio::net::TcpStream, config: TdsServe
                 let resp = TdsResponse {
                     tokens: vec![TdsToken::Done { row_count: 0 }],
                 };
-                write_packet_async(&mut transport, TdsMessageType::Response, resp.encode(), packet.header.packet_id).await?;
+                write_packet_async(
+                    &mut transport,
+                    TdsMessageType::Response,
+                    resp.encode(),
+                    packet.header.packet_id,
+                )
+                .await?;
             }
             TdsMessageType::SqlBatch => {
                 if !state.authenticated {
                     let resp = TdsResponse {
                         tokens: vec![TdsToken::Error("not authenticated".to_string())],
                     };
-                    write_packet_async(&mut transport, TdsMessageType::Response, resp.encode(), packet.header.packet_id).await?;
+                    write_packet_async(
+                        &mut transport,
+                        TdsMessageType::Response,
+                        resp.encode(),
+                        packet.header.packet_id,
+                    )
+                    .await?;
                     continue;
                 }
                 let sql = String::from_utf8_lossy(&packet.payload).trim().to_string();
                 let response = execute_query(&sql, &state);
-                write_packet_async(&mut transport, TdsMessageType::Response, response.encode(), packet.header.packet_id).await?;
+                write_packet_async(
+                    &mut transport,
+                    TdsMessageType::Response,
+                    response.encode(),
+                    packet.header.packet_id,
+                )
+                .await?;
             }
             _ => {}
         }
@@ -566,7 +676,10 @@ fn execute_query(sql: &str, state: &TdsState) -> TdsResponse {
     let lower = sql.to_lowercase();
     if lower.starts_with("select") {
         if lower.contains("@@version") {
-            return simple_row(vec!["version".to_string()], vec!["Moonlight TDS 0.1".as_bytes().to_vec()]);
+            return simple_row(
+                vec!["version".to_string()],
+                vec!["Moonlight TDS 0.1".as_bytes().to_vec()],
+            );
         }
         if lower.contains("1") {
             return simple_row(vec!["1".to_string()], vec![b"1".to_vec()]);
@@ -577,12 +690,18 @@ fn execute_query(sql: &str, state: &TdsState) -> TdsResponse {
                 return simple_row(vec!["value".to_string()], vec![value.as_bytes().to_vec()]);
             }
         }
-        return simple_row(vec!["database".to_string()], vec![state.database.as_bytes().to_vec()]);
+        return simple_row(
+            vec!["database".to_string()],
+            vec![state.database.as_bytes().to_vec()],
+        );
     }
     if lower.starts_with("use ") {
         let db = sql[4..].trim();
         return TdsResponse {
-            tokens: vec![TdsToken::Done { row_count: 0 }, TdsToken::Row(vec![Some(db.as_bytes().to_vec())])],
+            tokens: vec![
+                TdsToken::Done { row_count: 0 },
+                TdsToken::Row(vec![Some(db.as_bytes().to_vec())]),
+            ],
         };
     }
     TdsResponse {
@@ -636,7 +755,12 @@ async fn read_packet_async<T: AsyncStreamTransport>(transport: &mut T) -> CoreRe
     })
 }
 
-fn write_packet<T: StreamTransport>(transport: &mut T, msg_type: TdsMessageType, payload: Vec<u8>, packet_id: u8) -> CoreResult<()> {
+fn write_packet<T: StreamTransport>(
+    transport: &mut T,
+    msg_type: TdsMessageType,
+    payload: Vec<u8>,
+    packet_id: u8,
+) -> CoreResult<()> {
     let length = (payload.len() + 8) as u16;
     let header = TdsHeader {
         msg_type,
@@ -707,11 +831,9 @@ mod tests {
         let addr = server.local_addr().unwrap();
         let handle = thread::spawn(move || server.serve());
 
-        let mut client = TdsClient::connect(
-            &net::NetAddr::from_socket(addr),
-            TdsClientConfig::default(),
-        )
-        .unwrap();
+        let mut client =
+            TdsClient::connect(&net::NetAddr::from_socket(addr), TdsClientConfig::default())
+                .unwrap();
         let resp = client.query("SELECT 1").unwrap();
         assert!(!resp.tokens.is_empty());
 

@@ -204,8 +204,8 @@ impl AsyncMssqlServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
     use crate::test_util::fuzz_bytes;
+    use std::thread;
 
     #[test]
     fn mssql_query_roundtrip() {

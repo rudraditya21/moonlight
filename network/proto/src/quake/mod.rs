@@ -217,7 +217,9 @@ fn build_status_response(config: &QuakeServerConfig) -> Vec<u8> {
     out.extend_from_slice(encode_kv_pairs(&config.info).as_bytes());
     out.extend_from_slice(b"\n");
     for player in &config.players {
-        out.extend_from_slice(format!("{} {} \"{}\"\n", player.score, player.ping, player.name).as_bytes());
+        out.extend_from_slice(
+            format!("{} {} \"{}\"\n", player.score, player.ping, player.name).as_bytes(),
+        );
     }
     out
 }
@@ -290,8 +292,8 @@ fn parse_kv_pairs(text: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
     use crate::test_util::fuzz_bytes;
+    use std::thread;
 
     #[test]
     fn quake_info_status() {
@@ -302,7 +304,11 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             QuakeServerConfig {
                 info,
-                players: vec![QuakePlayer { score: 1, ping: 33, name: "bot".to_string() }],
+                players: vec![QuakePlayer {
+                    score: 1,
+                    ping: 33,
+                    name: "bot".to_string()
+                }],
                 ..QuakeServerConfig::default()
             },
         ));

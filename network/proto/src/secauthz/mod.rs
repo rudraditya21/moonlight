@@ -140,10 +140,7 @@ impl PolicyHandler {
 impl SecAuthzHandler for PolicyHandler {
     fn decide(&self, subject: &str, action: &str, resource: &str) -> SecAuthzDecision {
         for policy in &self.policies {
-            if policy.subject == subject
-                && policy.action == action
-                && policy.resource == resource
-            {
+            if policy.subject == subject && policy.action == action && policy.resource == resource {
                 return policy.decision.clone();
             }
         }
@@ -193,7 +190,9 @@ pub struct AsyncSecAuthzServer {
 
 impl AsyncSecAuthzServer {
     pub async fn bind(addr: SocketAddr, config: SecAuthzServerConfig) -> CoreResult<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(CoreError::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(CoreError::Io)?;
         let handler = Arc::new(PolicyHandler::new(config.policies.clone()));
         Ok(Self {
             listener,
@@ -299,7 +298,8 @@ fn handle_secauthz_stream(
         match frame.msg_type {
             SecAuthzMessageType::Authorize => {
                 let request = parse_authorize_payload(&frame.payload);
-                let subject = resolve_subject(&config.tokens, &request.subject, request.token.as_deref());
+                let subject =
+                    resolve_subject(&config.tokens, &request.subject, request.token.as_deref());
                 let decision = handler.decide(&subject, &request.action, &request.resource);
                 let response = build_decision_frame(decision, "ok");
                 write_frame(&mut transport, &response)?;
@@ -340,7 +340,8 @@ async fn handle_secauthz_stream_async(
         match frame.msg_type {
             SecAuthzMessageType::Authorize => {
                 let request = parse_authorize_payload(&frame.payload);
-                let subject = resolve_subject(&config.tokens, &request.subject, request.token.as_deref());
+                let subject =
+                    resolve_subject(&config.tokens, &request.subject, request.token.as_deref());
                 let decision = handler.decide(&subject, &request.action, &request.resource);
                 let response = build_decision_frame(decision, "ok");
                 write_frame_async(&mut transport, &response).await?;
@@ -374,7 +375,12 @@ struct AuthzRequest {
     token: Option<String>,
 }
 
-fn build_authorize_payload(subject: &str, action: &str, resource: &str, token: Option<&str>) -> Vec<u8> {
+fn build_authorize_payload(
+    subject: &str,
+    action: &str,
+    resource: &str,
+    token: Option<&str>,
+) -> Vec<u8> {
     let mut lines = Vec::new();
     lines.push(format!("subject={subject}"));
     lines.push(format!("action={action}"));
@@ -519,10 +525,12 @@ mod tests {
             let _ = server.serve();
         });
 
-        let mut client = SecAuthzClient::connect(&net::NetAddr::from_socket(addr), SecAuthzClientConfig::default()).unwrap();
-        let decision = client
-            .authorize("alice", "read", "vault", None)
-            .unwrap();
+        let mut client = SecAuthzClient::connect(
+            &net::NetAddr::from_socket(addr),
+            SecAuthzClientConfig::default(),
+        )
+        .unwrap();
+        let decision = client.authorize("alice", "read", "vault", None).unwrap();
         assert_eq!(decision, SecAuthzDecision::Permit);
     }
 }
