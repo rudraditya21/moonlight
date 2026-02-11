@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+ROOT=$(git rev-parse --show-toplevel)
+if [ -z "$ROOT" ]; then
+  echo "pre-commit: not in a git repo" >&2
+  exit 1
+fi
+
+cd "$ROOT"
+
+echo "pre-commit: running make fmt"
+make fmt
