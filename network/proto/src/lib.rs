@@ -19,6 +19,7 @@ pub mod ftp;
 pub mod dhcp;
 pub mod tftp;
 pub mod smb;
+pub mod sms;
 pub mod mdns;
 pub mod mms;
 pub mod mqtt;
@@ -152,6 +153,11 @@ pub use tftp::{
 pub use smb::{
     AsyncSmbClient, AsyncSmbServer, SmbClient, SmbClientConfig, SmbServer, SmbServerConfig,
     SmbShare,
+};
+pub use sms::{
+    AsyncSmsClient, AsyncSmsServer, InMemorySmsHandler, SmsBind, SmsClient, SmsClientConfig,
+    SmsCommand, SmsDeliver, SmsDeliveryStatus, SmsError, SmsFrame, SmsHandler, SmsMessage, SmsServer,
+    SmsServerConfig, SmsStatus, SmsSubmit, SMS_DEFAULT_PORT,
 };
 pub use adb::{
     AdbClient, AdbClientConfig, AdbCommand, AdbPacket, AdbServer, AdbServerConfig, AsyncAdbClient,
