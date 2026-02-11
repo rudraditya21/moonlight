@@ -15,7 +15,7 @@ impl Config {
         let prompt =
             std::env::var("MOONLIGHT_PROMPT").unwrap_or_else(|_| "moonlight> ".to_string());
         let module_path =
-            std::env::var("MOONLIGHT_MODULE_PATH").unwrap_or_else(|_| "module_store".to_string());
+            std::env::var("MOONLIGHT_MODULE_PATH").unwrap_or_else(|_| "registry".to_string());
         let cache_dir =
             std::env::var("MOONLIGHT_CACHE_DIR").unwrap_or_else(|_| ".moonlight".to_string());
 
