@@ -42,6 +42,11 @@ pub mod nuuo;
 pub mod pjl;
 pub mod proxy;
 pub mod quake;
+pub mod rfb;
+pub mod rmi;
+pub mod sasl;
+pub mod secauthz;
+pub mod sip;
 pub mod dns;
 pub mod framing;
 pub mod http;
@@ -232,6 +237,29 @@ pub use proxy::{
 pub use quake::{
     AsyncQuakeClient, AsyncQuakeServer, QuakeClient, QuakeClientConfig, QuakeInfo, QuakePlayer,
     QuakeQuery, QuakeServer, QuakeServerConfig, QuakeStatus, QUAKE_DEFAULT_PORT,
+};
+pub use rfb::{
+    AsyncRfbClient, AsyncRfbServer, RfbClient, RfbClientConfig, RfbClientMessage, RfbPixelFormat,
+    RfbRectangle, RfbSecurityType, RfbServer, RfbServerConfig, RfbServerInit, RfbServerMessage,
+    RFB_DEFAULT_PORT,
+};
+pub use rmi::{
+    AsyncRmiClient, AsyncRmiServer, EchoRmiHandler, RmiClient, RmiClientConfig, RmiFrame, RmiOp,
+    RmiServer, RmiServerConfig,
+};
+pub use sasl::{
+    AsyncSaslClient, AsyncSaslServer, SaslClient, SaslClientConfig, SaslFrame, SaslMessageType,
+    SaslServer, SaslServerConfig,
+};
+pub use secauthz::{
+    AsyncSecAuthzClient, AsyncSecAuthzServer, PolicyHandler, SecAuthzClient, SecAuthzClientConfig,
+    SecAuthzDecision, SecAuthzFrame, SecAuthzMessageType, SecAuthzPolicy, SecAuthzServer,
+    SecAuthzServerConfig,
+};
+pub use sip::{
+    AsyncSipTcpClient, AsyncSipTcpServer, AsyncSipUdpClient, AsyncSipUdpServer, SipClientConfig,
+    SipHeaders, SipMessage, SipMethod, SipRequest, SipResponse, SipTcpClient, SipTcpServer,
+    SipUdpClient, SipUdpServer, SIP_DEFAULT_PORT,
 };
 pub use dns::{
     AsyncDnsClient, AsyncDnsServer, AsyncDoh2Client, AsyncDoh3Client, AsyncDohClient,
