@@ -47,6 +47,7 @@ pub mod rmi;
 pub mod sasl;
 pub mod secauthz;
 pub mod sip;
+pub mod kerberos;
 pub mod dns;
 pub mod framing;
 pub mod http;
@@ -260,6 +261,12 @@ pub use sip::{
     AsyncSipTcpClient, AsyncSipTcpServer, AsyncSipUdpClient, AsyncSipUdpServer, SipClientConfig,
     SipHeaders, SipMessage, SipMethod, SipRequest, SipResponse, SipTcpClient, SipTcpServer,
     SipUdpClient, SipUdpServer, SIP_DEFAULT_PORT,
+};
+pub use kerberos::{
+    AsyncKerbClient, AsyncKerbKdcServer, AsyncKerbServiceServer, KerbApRep, KerbApReq, KerbAsRep,
+    KerbAsReq, KerbAuthenticator, KerbClient, KerbClientConfig, KerbClientState, KerbEncryptedTicket,
+    KerbError, KerbFrame, KerbKdcConfig, KerbKdcServer, KerbMsgType, KerbPrincipal, KerbServiceConfig,
+    KerbServiceServer, KerbTicket, KerbTgsRep, KerbTgsReq,
 };
 pub use dns::{
     AsyncDnsClient, AsyncDnsServer, AsyncDoh2Client, AsyncDoh3Client, AsyncDohClient,
