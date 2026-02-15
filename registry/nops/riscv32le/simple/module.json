@@ -1,0 +1,14 @@
+{
+  "name": "nops/riscv32le/simple",
+  "description": "Simple RISC-V 32-bit NOP generator",
+  "category": "nop",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": [
+    "riscv32le"
+  ],
+  "tags": [
+    "nop",
+    "riscv32le"
+  ]
+}

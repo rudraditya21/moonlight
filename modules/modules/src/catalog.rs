@@ -529,12 +529,13 @@ fn build_record(metadata: ModuleMetadata, manifest_path: &Path) -> ModuleRecord 
     }
 }
 
-const CATEGORY_COUNT: usize = 7;
+const CATEGORY_COUNT: usize = 8;
 const RANK_COUNT: usize = 8;
 const INDEX_MAGIC: &[u8; 4] = b"MLMI";
 const INDEX_VERSION_V1: u32 = 1;
 const INDEX_VERSION_V2: u32 = 2;
-const INDEX_VERSION: u32 = INDEX_VERSION_V2;
+const INDEX_VERSION_V3: u32 = 3;
+const INDEX_VERSION: u32 = INDEX_VERSION_V3;
 
 fn category_to_index(category: ModuleCategory) -> usize {
     match category {
@@ -543,8 +544,9 @@ fn category_to_index(category: ModuleCategory) -> usize {
         ModuleCategory::Payload => 2,
         ModuleCategory::Auxiliary => 3,
         ModuleCategory::Post => 4,
-        ModuleCategory::Evasion => 5,
-        ModuleCategory::Unknown => 6,
+        ModuleCategory::Nop => 5,
+        ModuleCategory::Evasion => 6,
+        ModuleCategory::Unknown => 7,
     }
 }
 
@@ -1184,7 +1186,8 @@ fn category_to_u8(category: &ModuleCategory) -> u8 {
         ModuleCategory::Payload => 3,
         ModuleCategory::Auxiliary => 4,
         ModuleCategory::Post => 5,
-        ModuleCategory::Evasion => 6,
+        ModuleCategory::Nop => 6,
+        ModuleCategory::Evasion => 7,
         ModuleCategory::Unknown => 0,
     }
 }
@@ -1196,7 +1199,8 @@ fn u8_to_category(value: u8) -> ModuleCategory {
         3 => ModuleCategory::Payload,
         4 => ModuleCategory::Auxiliary,
         5 => ModuleCategory::Post,
-        6 => ModuleCategory::Evasion,
+        6 => ModuleCategory::Nop,
+        7 => ModuleCategory::Evasion,
         _ => ModuleCategory::Unknown,
     }
 }

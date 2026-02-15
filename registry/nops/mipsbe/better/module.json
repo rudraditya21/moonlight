@@ -1,0 +1,14 @@
+{
+  "name": "nops/mipsbe/better",
+  "description": "Mixed MIPS (big endian) NOP generator",
+  "category": "nop",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": [
+    "mipsbe"
+  ],
+  "tags": [
+    "nop",
+    "mipsbe"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "name": "nops/cmd/generic",
+  "description": "Generic command NOP generator",
+  "category": "nop",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": [
+    "cmd"
+  ],
+  "tags": [
+    "nop",
+    "cmd"
+  ]
+}

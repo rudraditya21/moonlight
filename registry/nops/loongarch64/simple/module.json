@@ -1,0 +1,14 @@
+{
+  "name": "nops/loongarch64/simple",
+  "description": "Simple LoongArch64 NOP generator",
+  "category": "nop",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": [
+    "loongarch64"
+  ],
+  "tags": [
+    "nop",
+    "loongarch64"
+  ]
+}

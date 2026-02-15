@@ -5,6 +5,7 @@ pub enum ModuleCategory {
     Payload,
     Auxiliary,
     Post,
+    Nop,
     Evasion,
     Unknown,
 }
@@ -17,6 +18,7 @@ impl ModuleCategory {
             ModuleCategory::Payload => "payload",
             ModuleCategory::Auxiliary => "auxiliary",
             ModuleCategory::Post => "post",
+            ModuleCategory::Nop => "nop",
             ModuleCategory::Evasion => "evasion",
             ModuleCategory::Unknown => "unknown",
         }
@@ -29,6 +31,7 @@ impl ModuleCategory {
             "payload" | "payloads" => ModuleCategory::Payload,
             "auxiliary" | "aux" => ModuleCategory::Auxiliary,
             "post" => ModuleCategory::Post,
+            "nop" | "nops" => ModuleCategory::Nop,
             "evasion" => ModuleCategory::Evasion,
             _ => ModuleCategory::Unknown,
         }

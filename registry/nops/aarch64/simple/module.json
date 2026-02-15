@@ -1,0 +1,14 @@
+{
+  "name": "nops/aarch64/simple",
+  "description": "Simple AArch64 NOP generator",
+  "category": "nop",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": [
+    "aarch64"
+  ],
+  "tags": [
+    "nop",
+    "aarch64"
+  ]
+}

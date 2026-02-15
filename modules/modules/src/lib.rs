@@ -8,6 +8,7 @@ mod json;
 mod loader;
 mod manifest;
 mod metadata;
+mod nops;
 mod options;
 mod registry;
 
