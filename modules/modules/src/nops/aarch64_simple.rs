@@ -60,10 +60,7 @@ mod tests {
         let factory = NopAarch64SimpleFactory;
         let mut module = NopModule::new(factory.metadata().clone(), generate, 16);
         module.options_mut().set("LENGTH", "16").expect("set");
-        module
-            .options_mut()
-            .set("BADCHARS", "\\x1f")
-            .expect("set");
+        module.options_mut().set("BADCHARS", "\\x1f").expect("set");
         let result = module.run(&ModuleContext { session_id: 1 }).expect("run");
         assert!(!result.message.contains("\\x1f"));
     }

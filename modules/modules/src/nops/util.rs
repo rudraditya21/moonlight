@@ -58,8 +58,13 @@ impl Module for NopModule {
 
 pub fn build_nop_options(default_len: i64) -> ModuleOptions {
     ModuleOptions::new(vec![
-        ModuleOption::new("LENGTH", "NOP sled length in bytes", ModuleOptionKind::Integer, true)
-            .with_default(ModuleOptionValue::Integer(default_len)),
+        ModuleOption::new(
+            "LENGTH",
+            "NOP sled length in bytes",
+            ModuleOptionKind::Integer,
+            true,
+        )
+        .with_default(ModuleOptionValue::Integer(default_len)),
         ModuleOption::new(
             "BADCHARS",
             "Hex bytes to avoid (e.g. \\\\x00\\\\x0a or 00,0a)",
@@ -137,11 +142,7 @@ pub fn generate_sled_from_u32(
     Ok(out)
 }
 
-pub fn generate_fill(
-    length: usize,
-    badchars: &[u8],
-    fill: u8,
-) -> Result<Vec<u8>, ModuleError> {
+pub fn generate_fill(length: usize, badchars: &[u8], fill: u8) -> Result<Vec<u8>, ModuleError> {
     if length == 0 {
         return Err(ModuleError::Validation(
             "LENGTH must be greater than zero".to_string(),
@@ -199,12 +200,10 @@ fn parse_badchars_escaped(text: &str) -> Result<Vec<u8>, String> {
             }
             let next = bytes[i + 1];
             if next == b'x' || next == b'X' {
-                let hi = hex_val(bytes[i + 2]).ok_or_else(|| {
-                    "badchars escape must use hex digits".to_string()
-                })?;
-                let lo = hex_val(bytes[i + 3]).ok_or_else(|| {
-                    "badchars escape must use hex digits".to_string()
-                })?;
+                let hi = hex_val(bytes[i + 2])
+                    .ok_or_else(|| "badchars escape must use hex digits".to_string())?;
+                let lo = hex_val(bytes[i + 3])
+                    .ok_or_else(|| "badchars escape must use hex digits".to_string())?;
                 out.push((hi << 4) | lo);
                 i += 4;
                 continue;

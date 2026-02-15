@@ -79,10 +79,7 @@ mod tests {
         let factory = NopRiscv64leSimpleFactory;
         let mut module = NopModule::new(factory.metadata().clone(), generate, 8);
         module.options_mut().set("LENGTH", "8").expect("set");
-        module
-            .options_mut()
-            .set("BADCHARS", "\\x13")
-            .expect("set");
+        module.options_mut().set("BADCHARS", "\\x13").expect("set");
         let bytes = module.generate_bytes().expect("generate");
         assert!(!bytes.contains(&0x13));
     }

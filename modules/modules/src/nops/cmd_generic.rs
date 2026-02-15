@@ -52,10 +52,7 @@ mod tests {
         let factory = NopCmdGenericFactory;
         let mut module = NopModule::new(factory.metadata().clone(), generate, 8);
         module.options_mut().set("LENGTH", "8").expect("set");
-        module
-            .options_mut()
-            .set("BADCHARS", "\\x20")
-            .expect("set");
+        module.options_mut().set("BADCHARS", "\\x20").expect("set");
         let result = module.generate_bytes();
         assert!(result.is_err());
     }

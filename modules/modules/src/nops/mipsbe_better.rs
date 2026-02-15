@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use crate::base::{Module, ModuleFactory, ModuleError};
+use crate::base::{Module, ModuleError, ModuleFactory};
 use crate::metadata::{ModuleCategory, ModuleMetadata, ModuleRank};
 
 use super::util::{generate_sled_from_u32, Endian, NopModule};
@@ -98,10 +98,7 @@ mod tests {
         let factory = NopMipsbeBetterFactory;
         let mut module = NopModule::new(factory.metadata().clone(), generate, 8);
         module.options_mut().set("LENGTH", "8").expect("set");
-        module
-            .options_mut()
-            .set("BADCHARS", "\\xff")
-            .expect("set");
+        module.options_mut().set("BADCHARS", "\\xff").expect("set");
         let bytes = module.generate_bytes().expect("generate");
         assert!(!bytes.contains(&0xff));
     }
