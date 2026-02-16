@@ -289,4 +289,14 @@ mod tests {
         assert_eq!(bytes.len(), 8);
         assert!(!bytes.contains(&0x22));
     }
+
+    #[test]
+    fn parse_badchars_rejects_invalid() {
+        let err = parse_badchars("0g").expect_err("invalid hex");
+        assert!(err.contains("invalid"));
+        let err = parse_badchars("0").expect_err("odd length");
+        assert!(err.contains("even"));
+        let err = parse_badchars("\\x0").expect_err("incomplete escape");
+        assert!(err.contains("incomplete"));
+    }
 }
