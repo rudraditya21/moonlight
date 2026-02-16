@@ -66,9 +66,7 @@ fn nop_modules_run_default() {
     for name in nop_names() {
         let mut module = registry.create(name).expect("module");
         module.options_mut().set("LENGTH", "16").expect("set");
-        let result = module
-            .run(&ModuleContext { session_id: 1 })
-            .expect("run");
+        let result = module.run(&ModuleContext { session_id: 1 }).expect("run");
         assert!(result.success, "{name} should succeed");
         assert!(result.message.contains("nop bytes"), "{name} message");
         let bytes = parse_hex_bytes(&result.message);
@@ -98,9 +96,7 @@ fn nop_badchars_filtering() {
     for name in nop_names() {
         let mut module = registry.create(name).expect("module");
         module.options_mut().set("LENGTH", "16").expect("set");
-        let result = module
-            .run(&ModuleContext { session_id: 1 })
-            .expect("run");
+        let result = module.run(&ModuleContext { session_id: 1 }).expect("run");
         let bytes = parse_hex_bytes(&result.message);
         assert!(!bytes.is_empty(), "{name} output bytes");
         let pick = bytes[0];
@@ -116,8 +112,7 @@ fn nop_badchars_filtering() {
             Err(err) => {
                 let msg = err.to_string();
                 assert!(
-                    msg.contains("no NOPs available")
-                        || msg.contains("fill byte is excluded"),
+                    msg.contains("no NOPs available") || msg.contains("fill byte is excluded"),
                     "{name} unexpected error: {msg}"
                 );
             }
