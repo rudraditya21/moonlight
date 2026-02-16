@@ -188,10 +188,7 @@ fn h(x: u32, y: u32, z: u32) -> u32 {
 }
 
 fn round1(a: &mut u32, b: u32, c: u32, d: u32, x: u32, s: u32) {
-    *a = a
-        .wrapping_add(f(b, c, d))
-        .wrapping_add(x)
-        .rotate_left(s);
+    *a = a.wrapping_add(f(b, c, d)).wrapping_add(x).rotate_left(s);
 }
 
 fn round2(a: &mut u32, b: u32, c: u32, d: u32, x: u32, s: u32) {
