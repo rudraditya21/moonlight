@@ -1,7 +1,8 @@
 use crate::registry::ModuleRegistryBuilder;
 
 use crate::crypto::{
-    HashMd5Factory, HashSha1Factory, HashSha256Factory, HashSha384Factory, HashSha512Factory,
+    HashMd4Factory, HashMd5Factory, HashSha1Factory, HashSha256Factory, HashSha384Factory,
+    HashSha512Factory,
 };
 use crate::nops::{
     NopAarch64SimpleFactory, NopCmdGenericFactory, NopLoongarch64SimpleFactory,
@@ -9,6 +10,7 @@ use crate::nops::{
 };
 
 pub fn register_builtin_modules(builder: &mut ModuleRegistryBuilder) {
+    let _ = builder.register(Box::new(HashMd4Factory));
     let _ = builder.register(Box::new(HashMd5Factory));
     let _ = builder.register(Box::new(HashSha1Factory));
     let _ = builder.register(Box::new(HashSha256Factory));
