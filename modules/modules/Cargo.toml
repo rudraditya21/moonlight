@@ -9,6 +9,7 @@ phf = { path = "../../storage/phf" }
 libc = "0.2"
 md4 = { path = "../../crypt/md4" }
 md5 = { path = "../../crypt/md5" }
+sha224 = { path = "../../crypt/sha224" }
 sha1 = { path = "../../crypt/sha1" }
 sha256 = { path = "../../crypt/sha256" }
 sha384 = { path = "../../crypt/sha384" }

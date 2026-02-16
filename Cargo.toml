@@ -12,6 +12,7 @@ members = [
   "storage/phf",
   "crypt/md4",
   "crypt/md5",
+  "crypt/sha224",
   "crypt/sha1",
   "crypt/sha256",
   "crypt/sha384",

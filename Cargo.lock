@@ -311,6 +311,7 @@ dependencies = [
  "md5",
  "phf",
  "sha1",
+ "sha224",
  "sha256",
  "sha384",
  "sha512",
@@ -542,6 +543,10 @@ dependencies = [
 
 [[package]]
 name = "sha1"
+version = "0.1.0"
+
+[[package]]
+name = "sha224"
 version = "0.1.0"
 
 [[package]]

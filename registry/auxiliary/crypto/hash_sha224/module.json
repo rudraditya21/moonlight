@@ -1,0 +1,10 @@
+{
+  "name": "auxiliary/crypto/hash_sha224",
+  "description": "Compute or verify SHA-224 hashes",
+  "category": "auxiliary",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": ["cross"],
+  "tags": ["crypto", "hash", "sha224"],
+  "entrypoint": "module.rs"
+}
