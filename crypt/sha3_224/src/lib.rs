@@ -1,4 +1,3 @@
-
 const ROUNDS: [u64; 24] = [
     0x0000000000000001,
     0x0000000000008082,
@@ -154,11 +153,7 @@ fn keccak_f(state: &mut [u64; 25]) {
         // Theta
         let mut c = [0u64; 5];
         for x in 0..5 {
-            c[x] = state[x]
-                ^ state[x + 5]
-                ^ state[x + 10]
-                ^ state[x + 15]
-                ^ state[x + 20];
+            c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
         }
         let mut d = [0u64; 5];
         for x in 0..5 {
@@ -222,9 +217,18 @@ mod tests {
     #[test]
     fn sha3_vectors() {
         let cases = [
-            ("", "6b4e03423667dbb73b6e15454f0eb1abd4597f9a1b078e3f5b5a6bc7"),
-            ("abc", "e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf"),
-            ("message digest", "18768bb4c48eb7fc88e5ddb17efcf2964abd7798a39d86a4b4a1e4c8"),
+            (
+                "",
+                "6b4e03423667dbb73b6e15454f0eb1abd4597f9a1b078e3f5b5a6bc7",
+            ),
+            (
+                "abc",
+                "e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf",
+            ),
+            (
+                "message digest",
+                "18768bb4c48eb7fc88e5ddb17efcf2964abd7798a39d86a4b4a1e4c8",
+            ),
         ];
         for (input, expected) in cases {
             assert_eq!(digest_hex(input.as_bytes()), expected);

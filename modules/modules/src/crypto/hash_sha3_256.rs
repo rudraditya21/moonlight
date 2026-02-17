@@ -114,13 +114,19 @@ mod tests {
         module.options_mut().set("INPUT", "abc").expect("set");
         module
             .options_mut()
-            .set("HASH", "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532")
+            .set(
+                "HASH",
+                "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532",
+            )
             .expect("set");
         let result = module.run(&ModuleContext { session_id: 1 }).expect("run");
         assert!(result.message.contains("true"));
         module
             .options_mut()
-            .set("HASH", "0000000000000000000000000000000000000000000000000000000000000000")
+            .set(
+                "HASH",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
             .expect("set");
         let result = module.run(&ModuleContext { session_id: 1 }).expect("run");
         assert!(result.message.contains("false"));

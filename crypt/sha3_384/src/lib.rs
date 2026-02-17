@@ -1,4 +1,3 @@
-
 const ROUNDS: [u64; 24] = [
     0x0000000000000001,
     0x0000000000008082,
@@ -154,11 +153,7 @@ fn keccak_f(state: &mut [u64; 25]) {
         // Theta
         let mut c = [0u64; 5];
         for x in 0..5 {
-            c[x] = state[x]
-                ^ state[x + 5]
-                ^ state[x + 10]
-                ^ state[x + 15]
-                ^ state[x + 20];
+            c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
         }
         let mut d = [0u64; 5];
         for x in 0..5 {
