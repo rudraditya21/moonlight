@@ -58,7 +58,8 @@ impl<const OUT: usize> Blake2b<OUT> {
                 offset = needed;
                 if offset < data.len() {
                     self.increment_counter(128);
-                    self.compress(&self.buffer, false);
+                    let block = self.buffer;
+                    self.compress(&block, false);
                     self.buffer_len = 0;
                 } else {
                     return;
@@ -89,7 +90,8 @@ impl<const OUT: usize> Blake2b<OUT> {
         for i in self.buffer_len..128 {
             self.buffer[i] = 0;
         }
-        self.compress(&self.buffer, true);
+        let block = self.buffer;
+        self.compress(&block, true);
         let mut out = [0u8; OUT];
         let mut offset = 0;
         for word in &self.state {
