@@ -11,14 +11,15 @@ pub struct HashSha384Module {
 impl HashSha384Module {
     pub fn new() -> Self {
         let metadata = ModuleMetadata::new(
-            "auxiliary/crypto/hash_sha384",
-            "Compute or verify SHA384 hashes",
+            "auxiliary/crypto/hash_sha2_384",
+            "Compute or verify SHA2-384 hashes",
             ModuleCategory::Auxiliary,
             "moonlight",
         )
         .with_rank(ModuleRank::Normal)
         .with_tag("crypto")
         .with_tag("hash")
+        .with_tag("sha2-384")
         .with_platform("cross")
         .with_entrypoint("module.rs");
         let options = build_hash_options();
@@ -55,12 +56,12 @@ impl Module for HashSha384Module {
             .unwrap_or_default();
         let hash = sha384::digest_hex(input.as_bytes());
         if expected.is_empty() {
-            return Ok(ModuleResult::ok(&format!("sha384: {}", hash)));
+            return Ok(ModuleResult::ok(&format!("sha2-384: {}", hash)));
         }
         let expected = normalize_expected_hex(&expected, 96).map_err(ModuleError::Execution)?;
         let ok = expected == hash;
         Ok(ModuleResult::ok(&format!(
-            "sha384 match: {}",
+            "sha2-384 match: {}",
             if ok { "true" } else { "false" }
         )))
     }
@@ -74,14 +75,15 @@ impl ModuleFactory for HashSha384Factory {
         static META: OnceLock<ModuleMetadata> = OnceLock::new();
         META.get_or_init(|| {
             ModuleMetadata::new(
-                "auxiliary/crypto/hash_sha384",
-                "Compute or verify SHA384 hashes",
+                "auxiliary/crypto/hash_sha2_384",
+                "Compute or verify SHA2-384 hashes",
                 ModuleCategory::Auxiliary,
                 "moonlight",
             )
             .with_rank(ModuleRank::Normal)
             .with_tag("crypto")
             .with_tag("hash")
+            .with_tag("sha2-384")
             .with_platform("cross")
             .with_entrypoint("module.rs")
         })

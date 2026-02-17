@@ -11,14 +11,15 @@ pub struct HashSha224Module {
 impl HashSha224Module {
     pub fn new() -> Self {
         let metadata = ModuleMetadata::new(
-            "auxiliary/crypto/hash_sha224",
-            "Compute or verify SHA-224 hashes",
+            "auxiliary/crypto/hash_sha2_224",
+            "Compute or verify SHA2-224 hashes",
             ModuleCategory::Auxiliary,
             "moonlight",
         )
         .with_rank(ModuleRank::Normal)
         .with_tag("crypto")
         .with_tag("hash")
+        .with_tag("sha2-224")
         .with_platform("cross")
         .with_entrypoint("module.rs");
         let options = build_hash_options();
@@ -55,12 +56,12 @@ impl Module for HashSha224Module {
             .unwrap_or_default();
         let hash = sha224::digest_hex(input.as_bytes());
         if expected.is_empty() {
-            return Ok(ModuleResult::ok(&format!("sha224: {}", hash)));
+            return Ok(ModuleResult::ok(&format!("sha2-224: {}", hash)));
         }
         let expected = normalize_expected_hex(&expected, 56).map_err(ModuleError::Execution)?;
         let ok = expected == hash;
         Ok(ModuleResult::ok(&format!(
-            "sha224 match: {}",
+            "sha2-224 match: {}",
             if ok { "true" } else { "false" }
         )))
     }
@@ -74,14 +75,15 @@ impl ModuleFactory for HashSha224Factory {
         static META: OnceLock<ModuleMetadata> = OnceLock::new();
         META.get_or_init(|| {
             ModuleMetadata::new(
-                "auxiliary/crypto/hash_sha224",
-                "Compute or verify SHA-224 hashes",
+                "auxiliary/crypto/hash_sha2_224",
+                "Compute or verify SHA2-224 hashes",
                 ModuleCategory::Auxiliary,
                 "moonlight",
             )
             .with_rank(ModuleRank::Normal)
             .with_tag("crypto")
             .with_tag("hash")
+            .with_tag("sha2-224")
             .with_platform("cross")
             .with_entrypoint("module.rs")
         })
@@ -112,13 +114,19 @@ mod tests {
         module.options_mut().set("INPUT", "abc").expect("set");
         module
             .options_mut()
-            .set("HASH", "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7")
+            .set(
+                "HASH",
+                "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7",
+            )
             .expect("set");
         let result = module.run(&ModuleContext { session_id: 1 }).expect("run");
         assert!(result.message.contains("true"));
         module
             .options_mut()
-            .set("HASH", "00000000000000000000000000000000000000000000000000000000")
+            .set(
+                "HASH",
+                "00000000000000000000000000000000000000000000000000000000",
+            )
             .expect("set");
         let result = module.run(&ModuleContext { session_id: 1 }).expect("run");
         assert!(result.message.contains("false"));

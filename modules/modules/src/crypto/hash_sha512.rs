@@ -11,14 +11,15 @@ pub struct HashSha512Module {
 impl HashSha512Module {
     pub fn new() -> Self {
         let metadata = ModuleMetadata::new(
-            "auxiliary/crypto/hash_sha512",
-            "Compute or verify SHA512 hashes",
+            "auxiliary/crypto/hash_sha2_512",
+            "Compute or verify SHA2-512 hashes",
             ModuleCategory::Auxiliary,
             "moonlight",
         )
         .with_rank(ModuleRank::Normal)
         .with_tag("crypto")
         .with_tag("hash")
+        .with_tag("sha2-512")
         .with_platform("cross")
         .with_entrypoint("module.rs");
         let options = build_hash_options();
@@ -55,12 +56,12 @@ impl Module for HashSha512Module {
             .unwrap_or_default();
         let hash = sha512::digest_hex(input.as_bytes());
         if expected.is_empty() {
-            return Ok(ModuleResult::ok(&format!("sha512: {}", hash)));
+            return Ok(ModuleResult::ok(&format!("sha2-512: {}", hash)));
         }
         let expected = normalize_expected_hex(&expected, 128).map_err(ModuleError::Execution)?;
         let ok = expected == hash;
         Ok(ModuleResult::ok(&format!(
-            "sha512 match: {}",
+            "sha2-512 match: {}",
             if ok { "true" } else { "false" }
         )))
     }
@@ -74,14 +75,15 @@ impl ModuleFactory for HashSha512Factory {
         static META: OnceLock<ModuleMetadata> = OnceLock::new();
         META.get_or_init(|| {
             ModuleMetadata::new(
-                "auxiliary/crypto/hash_sha512",
-                "Compute or verify SHA512 hashes",
+                "auxiliary/crypto/hash_sha2_512",
+                "Compute or verify SHA2-512 hashes",
                 ModuleCategory::Auxiliary,
                 "moonlight",
             )
             .with_rank(ModuleRank::Normal)
             .with_tag("crypto")
             .with_tag("hash")
+            .with_tag("sha2-512")
             .with_platform("cross")
             .with_entrypoint("module.rs")
         })

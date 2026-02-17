@@ -1,0 +1,10 @@
+{
+  "name": "auxiliary/crypto/hash_sha2_512",
+  "description": "Compute or verify SHA2-512 hashes",
+  "category": "auxiliary",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": ["cross"],
+  "tags": ["crypto", "hash", "sha2-512", "sha512"],
+  "entrypoint": "module.rs"
+}

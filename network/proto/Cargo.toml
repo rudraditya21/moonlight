@@ -19,8 +19,8 @@ ring = "0.17"
 aes = "0.8"
 ctr = "0.9"
 sha1 = { path = "../../crypt/sha1" }
-sha256 = { path = "../../crypt/sha256" }
-sha384 = { path = "../../crypt/sha384" }
+sha256 = { path = "../../crypt/sha2_256" }
+sha384 = { path = "../../crypt/sha2_384" }
 md5 = { path = "../../crypt/md5" }
 
 [dev-dependencies]
