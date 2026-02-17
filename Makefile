@@ -2,7 +2,7 @@ SHELL := /bin/sh
 CARGO := cargo
 FMT := rustfmt
 
-.PHONY: all build run test perf fmt fmt-check clippy hooks clean help
+.PHONY: all build run test perf fmt fmt-check clippy clean help
 
 all: build
 
@@ -41,9 +41,6 @@ fmt-check:
 clippy:
 	$(CARGO) clippy -- -D warnings
 
-hooks:
-	git config core.hooksPath .githooks
-	@echo "Git hooks enabled (core.hooksPath=.githooks)"
 
 clean:
 	$(CARGO) clean
@@ -58,5 +55,4 @@ help:
 	@echo "  fmt        Format code (rustfmt)"
 	@echo "  fmt-check  Check formatting"
 	@echo "  clippy     Run clippy (warnings as errors)"
-	@echo "  hooks      Enable shared git hooks"
 	@echo "  clean      Clean build artifacts"

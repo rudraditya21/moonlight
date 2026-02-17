@@ -1,9 +1,9 @@
 use crate::registry::ModuleRegistryBuilder;
 
 use crate::crypto::{
-    HashMd4Factory, HashMd5Factory, HashSha1Factory, HashSha224Factory, HashSha256Factory,
-    HashSha384Factory, HashSha3_224Factory, HashSha3_256Factory, HashSha3_384Factory,
-    HashSha3_512Factory, HashSha512Factory, HashRipemd160Factory, HashRipemd320Factory,
+    HashMd4Factory, HashMd5Factory, HashRipemd160Factory, HashRipemd320Factory, HashSha1Factory,
+    HashSha224Factory, HashSha256Factory, HashSha384Factory, HashSha3_224Factory,
+    HashSha3_256Factory, HashSha3_384Factory, HashSha3_512Factory, HashSha512Factory,
 };
 use crate::nops::{
     NopAarch64SimpleFactory, NopCmdGenericFactory, NopLoongarch64SimpleFactory,
