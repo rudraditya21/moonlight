@@ -345,6 +345,7 @@ dependencies = [
  "md4",
  "md5",
  "phf",
+ "proto",
  "ripemd160",
  "ripemd320",
  "sha1",

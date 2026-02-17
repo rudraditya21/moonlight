@@ -3,6 +3,7 @@ mod builtins;
 mod cache;
 mod catalog;
 mod crypto;
+mod exploit;
 mod hash;
 mod json;
 mod loader;

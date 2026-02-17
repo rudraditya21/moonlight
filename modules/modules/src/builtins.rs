@@ -7,6 +7,7 @@ use crate::crypto::{
     HashSha256Factory, HashSha384Factory, HashSha3_224Factory, HashSha3_256Factory,
     HashSha3_384Factory, HashSha3_512Factory, HashSha512Factory,
 };
+use crate::exploit::linux::telnet::GnuInetutilsTelnetdAuthBypassFactory;
 use crate::nops::{
     NopAarch64SimpleFactory, NopCmdGenericFactory, NopLoongarch64SimpleFactory,
     NopMipsbeBetterFactory, NopRiscv32leSimpleFactory, NopRiscv64leSimpleFactory,
@@ -39,4 +40,5 @@ pub fn register_builtin_modules(builder: &mut ModuleRegistryBuilder) {
     let _ = builder.register(Box::new(NopMipsbeBetterFactory));
     let _ = builder.register(Box::new(NopRiscv32leSimpleFactory));
     let _ = builder.register(Box::new(NopRiscv64leSimpleFactory));
+    let _ = builder.register(Box::new(GnuInetutilsTelnetdAuthBypassFactory));
 }
