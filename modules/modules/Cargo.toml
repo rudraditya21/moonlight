@@ -17,3 +17,6 @@ sha512 = { path = "../../crypt/sha2_512" }
 sha3_224 = { path = "../../crypt/sha3_224" }
 sha3_256 = { path = "../../crypt/sha3_256" }
 sha3_384 = { path = "../../crypt/sha3_384" }
+sha3_512 = { path = "../../crypt/sha3_512" }
+ripemd160 = { path = "../../crypt/ripemd160" }
+ripemd320 = { path = "../../crypt/ripemd320" }

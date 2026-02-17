@@ -7,7 +7,10 @@ mod hash_sha384;
 mod hash_sha3_224;
 mod hash_sha3_256;
 mod hash_sha3_384;
+mod hash_sha3_512;
 mod hash_sha512;
+mod hash_ripemd160;
+mod hash_ripemd320;
 mod util;
 
 pub use hash_md4::HashMd4Factory;
@@ -19,4 +22,7 @@ pub use hash_sha384::HashSha384Factory;
 pub use hash_sha3_224::HashSha3_224Factory;
 pub use hash_sha3_256::HashSha3_256Factory;
 pub use hash_sha3_384::HashSha3_384Factory;
+pub use hash_sha3_512::HashSha3_512Factory;
 pub use hash_sha512::HashSha512Factory;
+pub use hash_ripemd160::HashRipemd160Factory;
+pub use hash_ripemd320::HashRipemd320Factory;

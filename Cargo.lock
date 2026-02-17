@@ -310,6 +310,8 @@ dependencies = [
  "md4",
  "md5",
  "phf",
+ "ripemd160",
+ "ripemd320",
  "sha1",
  "sha224",
  "sha256",
@@ -317,6 +319,7 @@ dependencies = [
  "sha3_224",
  "sha3_256",
  "sha3_384",
+ "sha3_512",
  "sha512",
 ]
 
@@ -482,6 +485,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ripemd160"
+version = "0.1.0"
+
+[[package]]
+name = "ripemd320"
+version = "0.1.0"
+
+[[package]]
 name = "rustls"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -570,6 +581,10 @@ version = "0.1.0"
 
 [[package]]
 name = "sha3_384"
+version = "0.1.0"
+
+[[package]]
+name = "sha3_512"
 version = "0.1.0"
 
 [[package]]

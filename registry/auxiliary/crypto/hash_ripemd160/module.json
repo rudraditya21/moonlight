@@ -1,0 +1,10 @@
+{
+  "name": "auxiliary/crypto/hash_ripemd160",
+  "description": "Compute or verify RIPEMD-160 hashes",
+  "category": "auxiliary",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": ["cross"],
+  "tags": ["crypto", "hash", "ripemd-160"],
+  "entrypoint": "module.rs"
+}
