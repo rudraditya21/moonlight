@@ -1,7 +1,8 @@
 use crate::registry::ModuleRegistryBuilder;
 
 use crate::crypto::{
-    HashBlake2b256Factory, HashBlake2b512Factory, HashBlake2s256Factory, HashMd4Factory,
+    HashBlake2b256Factory, HashBlake2b512Factory, HashBlake2s256Factory, HashKeccak224Factory,
+    HashKeccak256Factory, HashKeccak384Factory, HashKeccak512Factory, HashMd4Factory,
     HashMd5Factory, HashRipemd160Factory, HashRipemd320Factory, HashSha1Factory, HashSha224Factory,
     HashSha256Factory, HashSha384Factory, HashSha3_224Factory, HashSha3_256Factory,
     HashSha3_384Factory, HashSha3_512Factory, HashSha512Factory,
@@ -17,6 +18,10 @@ pub fn register_builtin_modules(builder: &mut ModuleRegistryBuilder) {
     let _ = builder.register(Box::new(HashBlake2b256Factory));
     let _ = builder.register(Box::new(HashBlake2b512Factory));
     let _ = builder.register(Box::new(HashBlake2s256Factory));
+    let _ = builder.register(Box::new(HashKeccak224Factory));
+    let _ = builder.register(Box::new(HashKeccak256Factory));
+    let _ = builder.register(Box::new(HashKeccak384Factory));
+    let _ = builder.register(Box::new(HashKeccak512Factory));
     let _ = builder.register(Box::new(HashSha3_224Factory));
     let _ = builder.register(Box::new(HashSha3_256Factory));
     let _ = builder.register(Box::new(HashSha3_384Factory));

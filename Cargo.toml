@@ -26,6 +26,10 @@ members = [
   "crypt/blake2b_256",
   "crypt/blake2b_512",
   "crypt/blake2s_256",
+  "crypt/keccak_224",
+  "crypt/keccak_256",
+  "crypt/keccak_384",
+  "crypt/keccak_512",
   "network/net",
   "network/proto",
 ]

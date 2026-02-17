@@ -1,0 +1,10 @@
+{
+  "name": "auxiliary/crypto/hash_keccak_512",
+  "description": "Compute or verify Keccak-512 hashes",
+  "category": "auxiliary",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": ["cross"],
+  "tags": ["crypto", "hash", "keccak-512"],
+  "entrypoint": "module.rs"
+}
