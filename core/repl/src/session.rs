@@ -230,17 +230,7 @@ impl Repl {
                     self.palette
                         .info(&format!("Options for {}:", module.metadata().name))
                 );
-                for opt in module.options().iter() {
-                    let value = opt.value_as_string();
-                    let required = if opt.required { "yes" } else { "no" };
-                    println!(
-                        "  {:<16} {:<8} {:<6} {}",
-                        opt.name,
-                        opt.kind_string(),
-                        required,
-                        value
-                    );
-                }
+                print_options_table(module.options());
             }
             _ => println!(
                 "{}",
@@ -470,16 +460,7 @@ impl Repl {
         if let Some(options) = options {
             println!();
             println!("{}", self.palette.info("Options"));
-            for opt in options.iter() {
-                let required = if opt.required { "yes" } else { "no" };
-                println!(
-                    "  {:<16} {:<8} {:<6} {}",
-                    opt.name,
-                    opt.kind_string(),
-                    required,
-                    opt.value_as_string()
-                );
-            }
+            print_options_table(options);
         }
     }
 
@@ -664,5 +645,86 @@ fn print_aligned_owned_rows(rows: &[(String, &str)]) {
     let max_width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
     for (name, desc) in rows {
         println!("{name:<width$} - {desc}", width = max_width);
+    }
+}
+
+fn print_options_table(options: &modules::ModuleOptions) {
+    let headers = ["Name", "Value", "Type", "Required", "Default"];
+    let mut rows: Vec<[String; 5]> = Vec::new();
+    let mut widths = [
+        headers[0].len(),
+        headers[1].len(),
+        headers[2].len(),
+        headers[3].len(),
+        headers[4].len(),
+    ];
+
+    for opt in options.iter() {
+        let value = opt
+            .value
+            .as_ref()
+            .map(|v| v.as_string())
+            .unwrap_or_default();
+        let default = opt
+            .default
+            .as_ref()
+            .map(|v| v.as_string())
+            .unwrap_or_default();
+        let kind = opt.kind_string().to_string();
+        let required = if opt.required { "yes" } else { "no" }.to_string();
+        let row = [
+            opt.name.clone(),
+            value,
+            kind,
+            required,
+            default,
+        ];
+        for (idx, col) in row.iter().enumerate() {
+            widths[idx] = widths[idx].max(col.len());
+        }
+        rows.push(row);
+    }
+
+    println!(
+        "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}",
+        headers[0],
+        headers[1],
+        headers[2],
+        headers[3],
+        headers[4],
+        w0 = widths[0],
+        w1 = widths[1],
+        w2 = widths[2],
+        w3 = widths[3],
+        w4 = widths[4]
+    );
+    println!(
+        "{:-<w0$}  {:-<w1$}  {:-<w2$}  {:-<w3$}  {:-<w4$}",
+        "",
+        "",
+        "",
+        "",
+        "",
+        w0 = widths[0],
+        w1 = widths[1],
+        w2 = widths[2],
+        w3 = widths[3],
+        w4 = widths[4]
+    );
+
+    for row in rows {
+        println!(
+            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}",
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3],
+            w4 = widths[4]
+        );
     }
 }
