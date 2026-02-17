@@ -17,6 +17,9 @@ members = [
   "crypt/sha2_256",
   "crypt/sha2_384",
   "crypt/sha2_512",
+  "crypt/sha3_224",
+  "crypt/sha3_256",
+  "crypt/sha3_384",
   "network/net",
   "network/proto",
 ]

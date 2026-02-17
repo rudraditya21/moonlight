@@ -672,13 +672,7 @@ fn print_options_table(options: &modules::ModuleOptions) {
             .unwrap_or_default();
         let kind = opt.kind_string().to_string();
         let required = if opt.required { "yes" } else { "no" }.to_string();
-        let row = [
-            opt.name.clone(),
-            value,
-            kind,
-            required,
-            default,
-        ];
+        let row = [opt.name.clone(), value, kind, required, default];
         for (idx, col) in row.iter().enumerate() {
             widths[idx] = widths[idx].max(col.len());
         }

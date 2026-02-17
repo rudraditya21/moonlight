@@ -314,6 +314,9 @@ dependencies = [
  "sha224",
  "sha256",
  "sha384",
+ "sha3_224",
+ "sha3_256",
+ "sha3_384",
  "sha512",
 ]
 
@@ -555,6 +558,18 @@ version = "0.1.0"
 
 [[package]]
 name = "sha384"
+version = "0.1.0"
+
+[[package]]
+name = "sha3_224"
+version = "0.1.0"
+
+[[package]]
+name = "sha3_256"
+version = "0.1.0"
+
+[[package]]
+name = "sha3_384"
 version = "0.1.0"
 
 [[package]]
