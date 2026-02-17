@@ -155,21 +155,27 @@ impl Ripemd320 {
             dr = cr.rotate_left(10);
             cr = br;
             br = t;
+
+            match i {
+                15 => core::mem::swap(&mut bl, &mut br),
+                31 => core::mem::swap(&mut dl, &mut dr),
+                47 => core::mem::swap(&mut al, &mut ar),
+                63 => core::mem::swap(&mut cl, &mut cr),
+                79 => core::mem::swap(&mut el, &mut er),
+                _ => {}
+            }
         }
 
-        let t = self.state[1].wrapping_add(cl).wrapping_add(dr);
-        self.state[1] = self.state[2].wrapping_add(dl).wrapping_add(er);
-        self.state[2] = self.state[3].wrapping_add(el).wrapping_add(ar);
-        self.state[3] = self.state[4].wrapping_add(al).wrapping_add(br);
-        self.state[4] = self.state[0].wrapping_add(bl).wrapping_add(cr);
-        self.state[0] = t;
-
-        let t = self.state[6].wrapping_add(cr).wrapping_add(dl);
-        self.state[6] = self.state[7].wrapping_add(dr).wrapping_add(el);
-        self.state[7] = self.state[8].wrapping_add(er).wrapping_add(al);
-        self.state[8] = self.state[9].wrapping_add(ar).wrapping_add(bl);
-        self.state[9] = self.state[5].wrapping_add(br).wrapping_add(cl);
-        self.state[5] = t;
+        self.state[0] = self.state[0].wrapping_add(al);
+        self.state[1] = self.state[1].wrapping_add(bl);
+        self.state[2] = self.state[2].wrapping_add(cl);
+        self.state[3] = self.state[3].wrapping_add(dl);
+        self.state[4] = self.state[4].wrapping_add(el);
+        self.state[5] = self.state[5].wrapping_add(ar);
+        self.state[6] = self.state[6].wrapping_add(br);
+        self.state[7] = self.state[7].wrapping_add(cr);
+        self.state[8] = self.state[8].wrapping_add(dr);
+        self.state[9] = self.state[9].wrapping_add(er);
     }
 }
 
