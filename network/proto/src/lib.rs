@@ -51,6 +51,7 @@ pub mod ssh;
 pub mod state;
 pub mod steam;
 pub mod sunrpc;
+pub mod telnet;
 pub mod tftp;
 pub mod thrift;
 pub mod transport;
@@ -271,6 +272,15 @@ pub use sunrpc::{
     AsyncRpcClient, AsyncRpcServer, AsyncRpcUdpServer, PortmapRegistry, PortmapService, RpcAuth,
     RpcCall, RpcClient, RpcClientConfig, RpcReply, RpcServer, RpcServerConfig, RpcService,
     RpcServiceResult, RpcUdpServer,
+};
+pub use telnet::{
+    build_new_environ_is, build_new_environ_send, build_new_environ_user_is,
+    default_client_negotiation_reply, default_server_negotiation_reply, AnsiStripper,
+    AsyncTelnetClient, AsyncTelnetServer, EchoSuppressor, TelnetClient, TelnetClientConfig,
+    TelnetEvent, TelnetNegotiationCommand, TelnetOutputFilter, TelnetParser, TelnetServer,
+    TelnetServerConfig, AYT, DO, DONT, GA, IAC, NEW_ENVIRON, NEW_ENVIRON_ESC, NEW_ENVIRON_INFO,
+    NEW_ENVIRON_IS, NEW_ENVIRON_SEND, NEW_ENVIRON_USERVAR, NEW_ENVIRON_VALUE, NEW_ENVIRON_VAR, SB,
+    SE, TELNET_DEFAULT_PORT, WILL, WONT,
 };
 pub use tftp::{
     AsyncTftpClient, AsyncTftpServer, InMemoryTftpBackend, TftpBackend, TftpClient,
