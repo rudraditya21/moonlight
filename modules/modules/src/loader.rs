@@ -138,6 +138,7 @@ impl Module for DynModule {
         Ok(ModuleResult {
             success: result.success != 0,
             message,
+            session: None,
         })
     }
 }

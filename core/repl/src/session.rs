@@ -10,6 +10,7 @@ use crate::ansi::Palette;
 use crate::history::History;
 use crate::line::{read_line, Completer, CompletionResult};
 use crate::parser::tokenize;
+use crate::sessions::SessionManager;
 
 #[derive(Debug)]
 pub enum ReplError {
@@ -37,6 +38,7 @@ pub struct Repl {
     history: History,
     active: Option<Box<dyn Module>>,
     session_id: Id,
+    sessions: SessionManager,
     palette: Palette,
 }
 
@@ -49,6 +51,7 @@ impl Repl {
             history: History::new(500),
             active: None,
             session_id: Id::next(),
+            sessions: SessionManager::new(),
             palette: Palette::new(),
         }
     }
@@ -82,6 +85,9 @@ impl Repl {
                 break;
             }
         }
+        if let Err(err) = self.sessions.close_all() {
+            eprintln!("session cleanup failed: {err}");
+        }
         Ok(())
     }
 
@@ -98,6 +104,8 @@ impl Repl {
             "get" => self.cmd_get(tokens),
             "run" => self.cmd_run(),
             "info" => self.cmd_info(tokens),
+            "sessions" => self.cmd_sessions(tokens),
+            "interact" => self.cmd_interact(tokens),
             _ => println!(
                 "{}",
                 self.palette
@@ -118,6 +126,10 @@ impl Repl {
         println!("  set <opt> <value>    Set module option");
         println!("  get <opt>            Get module option");
         println!("  run                  Execute module");
+        println!("  sessions             List sessions");
+        println!("  sessions -k <id>     Close a session");
+        println!("  sessions -K          Close all sessions");
+        println!("  interact <id>        Interact with a session");
         println!("  history              Show command history");
         println!("  exit|quit            Exit the console");
     }
@@ -382,8 +394,19 @@ impl Repl {
         let ctx = ModuleContext {
             session_id: self.session_id.0,
         };
+        let module_name = module.metadata().name.clone();
         match module.run(&ctx) {
-            Ok(result) => {
+            Ok(mut result) => {
+                if let Some(session) = result.take_session() {
+                    let kind = session.kind().to_string();
+                    let target = session.target();
+                    let id = self.sessions.register(module_name, session);
+                    println!(
+                        "{}",
+                        self.palette
+                            .success(&format!("Session {id} opened ({kind} -> {target})"))
+                    );
+                }
                 if result.success {
                     println!(
                         "{}",
@@ -398,6 +421,210 @@ impl Repl {
                 }
             }
             Err(err) => println!("{}", self.palette.error(&format!("Module error: {err}"))),
+        }
+    }
+
+    fn cmd_sessions(&mut self, tokens: &[String]) {
+        self.sessions.reap_closed();
+        if tokens.len() == 1 {
+            let snapshots = self.sessions.snapshots();
+            if snapshots.is_empty() {
+                println!("{}", self.palette.warning("No active sessions."));
+                return;
+            }
+            let headers = ["Id", "State", "Type", "Target", "Module"];
+            let mut rows = Vec::with_capacity(snapshots.len());
+            let mut widths = [
+                headers[0].len(),
+                headers[1].len(),
+                headers[2].len(),
+                headers[3].len(),
+                headers[4].len(),
+            ];
+            for snap in snapshots {
+                let state = if snap.is_open { "open" } else { "closed" }.to_string();
+                let row = [
+                    snap.id.to_string(),
+                    state,
+                    snap.kind,
+                    snap.target,
+                    snap.module_name,
+                ];
+                for (idx, col) in row.iter().enumerate() {
+                    widths[idx] = widths[idx].max(col.len());
+                }
+                rows.push(row);
+            }
+            println!(
+                "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}",
+                headers[0],
+                headers[1],
+                headers[2],
+                headers[3],
+                headers[4],
+                w0 = widths[0],
+                w1 = widths[1],
+                w2 = widths[2],
+                w3 = widths[3],
+                w4 = widths[4]
+            );
+            println!(
+                "{:-<w0$}  {:-<w1$}  {:-<w2$}  {:-<w3$}  {:-<w4$}",
+                "",
+                "",
+                "",
+                "",
+                "",
+                w0 = widths[0],
+                w1 = widths[1],
+                w2 = widths[2],
+                w3 = widths[3],
+                w4 = widths[4]
+            );
+            for row in rows {
+                println!(
+                    "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}",
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                    row[4],
+                    w0 = widths[0],
+                    w1 = widths[1],
+                    w2 = widths[2],
+                    w3 = widths[3],
+                    w4 = widths[4]
+                );
+            }
+            return;
+        }
+
+        match tokens[1].as_str() {
+            "-k" | "--kill" => {
+                let Some(id_raw) = tokens.get(2) else {
+                    println!("{}", self.palette.warning("Usage: sessions -k <id>"));
+                    return;
+                };
+                let Ok(id) = id_raw.parse::<u32>() else {
+                    println!("{}", self.palette.error("Session id must be an integer."));
+                    return;
+                };
+                match self.sessions.close_and_remove(id) {
+                    Ok(true) => {
+                        println!("{}", self.palette.success(&format!("Session {id} closed.")))
+                    }
+                    Ok(false) => println!(
+                        "{}",
+                        self.palette.error(&format!("Session {id} not found."))
+                    ),
+                    Err(err) => println!(
+                        "{}",
+                        self.palette
+                            .error(&format!("Failed to close session {id}: {err}"))
+                    ),
+                }
+            }
+            "-K" | "--kill-all" => match self.sessions.close_all() {
+                Ok(count) => println!(
+                    "{}",
+                    self.palette.success(&format!("Closed {count} session(s)."))
+                ),
+                Err(err) => println!(
+                    "{}",
+                    self.palette
+                        .error(&format!("Failed to close sessions: {err}"))
+                ),
+            },
+            _ => println!(
+                "{}",
+                self.palette
+                    .warning("Usage: sessions | sessions -k <id> | sessions -K")
+            ),
+        }
+    }
+
+    fn cmd_interact(&mut self, tokens: &[String]) {
+        if tokens.len() < 2 {
+            println!("{}", self.palette.warning("Usage: interact <id>"));
+            return;
+        }
+        let Ok(id) = tokens[1].parse::<u32>() else {
+            println!("{}", self.palette.error("Session id must be an integer."));
+            return;
+        };
+        if self.sessions.get_mut(id).is_none() {
+            println!(
+                "{}",
+                self.palette.error(&format!("Session {id} not found."))
+            );
+            return;
+        }
+        if let Err(err) = self.interact_session(id) {
+            println!("{}", self.palette.error(&format!("Interact error: {err}")));
+        }
+    }
+
+    fn interact_session(&mut self, id: u32) -> Result<(), ReplError> {
+        loop {
+            let Some(session) = self.sessions.get_mut(id) else {
+                println!("{}", self.palette.warning(&format!("Session {id} closed.")));
+                return Ok(());
+            };
+            if !session.is_open() {
+                println!(
+                    "{}",
+                    self.palette.warning(&format!("Session {id} is not open."))
+                );
+                let _ = self.sessions.close_and_remove(id);
+                return Ok(());
+            }
+            let pending = session
+                .read()
+                .map_err(|e| ReplError::Io(format!("session read failed: {e}")))?;
+            if !pending.is_empty() {
+                print!("{}", String::from_utf8_lossy(&pending));
+            }
+            let prompt = format!("session({id})> ");
+            let completer = ReplCompleter { repl: self };
+            let line = read_line(&prompt, &completer, self.history.entries())
+                .map_err(|e| ReplError::Io(e.to_string()))?;
+            let Some(line) = line else {
+                return Ok(());
+            };
+            let line = line.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            self.history.add(format!("session({id}) {line}"));
+            let lowered = line.to_ascii_lowercase();
+            if lowered == "background" || lowered == "bg" {
+                println!(
+                    "{}",
+                    self.palette.info(&format!("Backgrounded session {id}."))
+                );
+                return Ok(());
+            }
+            if lowered == "exit" || lowered == "quit" {
+                self.sessions
+                    .close_and_remove(id)
+                    .map_err(|e| ReplError::Io(format!("session close failed: {e}")))?;
+                println!("{}", self.palette.success(&format!("Session {id} closed.")));
+                return Ok(());
+            }
+            let Some(session) = self.sessions.get_mut(id) else {
+                return Ok(());
+            };
+            let mut payload = line.as_bytes().to_vec();
+            payload.push(b'\n');
+            session
+                .write(&payload)
+                .map_err(|e| ReplError::Io(format!("session write failed: {e}")))?;
+            let response = session
+                .read()
+                .map_err(|e| ReplError::Io(format!("session read failed: {e}")))?;
+            if !response.is_empty() {
+                print!("{}", String::from_utf8_lossy(&response));
+            }
         }
     }
 
@@ -563,6 +790,24 @@ impl Repl {
                 "search" => {
                     candidates = search_flag_candidates(current);
                 }
+                "interact" => {
+                    if token_index == 1 {
+                        candidates = session_id_candidates(self, current);
+                    }
+                }
+                "sessions" => {
+                    if token_index == 1 {
+                        candidates = ["-k", "--kill", "-K", "--kill-all"]
+                            .iter()
+                            .filter(|v| v.starts_with(current))
+                            .map(|v| v.to_string())
+                            .collect();
+                    } else if token_index == 2 {
+                        if matches!(tokens.get(1), Some(&"-k") | Some(&"--kill")) {
+                            candidates = session_id_candidates(self, current);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -574,7 +819,8 @@ impl Repl {
 
 fn command_candidates(prefix: &str) -> Vec<String> {
     let commands = [
-        "help", "show", "use", "search", "set", "get", "run", "history", "info", "exit", "quit",
+        "help", "show", "use", "search", "set", "get", "run", "sessions", "interact", "history",
+        "info", "exit", "quit",
     ];
     commands
         .iter()
@@ -609,6 +855,15 @@ fn option_candidates(repl: &Repl, prefix: &str) -> Vec<String> {
         .iter()
         .map(|opt| opt.name.clone())
         .filter(|name| name.starts_with(prefix))
+        .collect()
+}
+
+fn session_id_candidates(repl: &Repl, prefix: &str) -> Vec<String> {
+    repl.sessions
+        .snapshots()
+        .into_iter()
+        .map(|snap| snap.id.to_string())
+        .filter(|id| id.starts_with(prefix))
         .collect()
 }
 

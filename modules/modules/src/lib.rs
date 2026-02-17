@@ -12,7 +12,9 @@ mod nops;
 mod options;
 mod registry;
 
-pub use base::{Module, ModuleBase, ModuleContext, ModuleError, ModuleFactory, ModuleResult};
+pub use base::{
+    Module, ModuleBase, ModuleContext, ModuleError, ModuleFactory, ModuleResult, ModuleSession,
+};
 pub use builtins::register_builtin_modules;
 pub use catalog::{ModuleCatalog, ModuleRecord, SearchQuery};
 pub use loader::load_dyn_module;
