@@ -23,6 +23,9 @@ members = [
   "crypt/sha3_512",
   "crypt/ripemd160",
   "crypt/ripemd320",
+  "crypt/blake2b_256",
+  "crypt/blake2b_512",
+  "crypt/blake2s_256",
   "network/net",
   "network/proto",
 ]

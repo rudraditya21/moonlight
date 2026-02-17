@@ -1,0 +1,10 @@
+{
+  "name": "auxiliary/crypto/hash_blake2b_512",
+  "description": "Compute or verify BLAKE2b-512 hashes",
+  "category": "auxiliary",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": ["cross"],
+  "tags": ["crypto", "hash", "blake2b-512"],
+  "entrypoint": "module.rs"
+}

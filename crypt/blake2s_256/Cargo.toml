@@ -1,0 +1,6 @@
+[package]
+name = "blake2s_256"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]

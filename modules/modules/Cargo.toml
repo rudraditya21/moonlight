@@ -20,3 +20,6 @@ sha3_384 = { path = "../../crypt/sha3_384" }
 sha3_512 = { path = "../../crypt/sha3_512" }
 ripemd160 = { path = "../../crypt/ripemd160" }
 ripemd320 = { path = "../../crypt/ripemd320" }
+blake2b_256 = { path = "../../crypt/blake2b_256" }
+blake2b_512 = { path = "../../crypt/blake2b_512" }
+blake2s_256 = { path = "../../crypt/blake2s_256" }

@@ -1,3 +1,6 @@
+mod hash_blake2b_256;
+mod hash_blake2b_512;
+mod hash_blake2s_256;
 mod hash_md4;
 mod hash_md5;
 mod hash_ripemd160;
@@ -13,6 +16,9 @@ mod hash_sha3_512;
 mod hash_sha512;
 mod util;
 
+pub use hash_blake2b_256::HashBlake2b256Factory;
+pub use hash_blake2b_512::HashBlake2b512Factory;
+pub use hash_blake2s_256::HashBlake2s256Factory;
 pub use hash_md4::HashMd4Factory;
 pub use hash_md5::HashMd5Factory;
 pub use hash_ripemd160::HashRipemd160Factory;
