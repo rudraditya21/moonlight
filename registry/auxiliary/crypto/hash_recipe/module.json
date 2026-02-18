@@ -1,0 +1,10 @@
+{
+  "name": "auxiliary/crypto/hash_recipe",
+  "description": "Compute or verify composable hash recipes",
+  "category": "auxiliary",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": ["cross"],
+  "tags": ["crypto", "hash", "recipe"],
+  "entrypoint": "module.rs"
+}
