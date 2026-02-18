@@ -30,6 +30,8 @@ members = [
   "crypt/keccak_256",
   "crypt/keccak_384",
   "crypt/keccak_512",
+  "crypt/half_md5",
+  "crypt/md6_256",
   "network/net",
   "network/proto",
 ]

@@ -28,3 +28,5 @@ keccak_224 = { path = "../../crypt/keccak_224" }
 keccak_256 = { path = "../../crypt/keccak_256" }
 keccak_384 = { path = "../../crypt/keccak_384" }
 keccak_512 = { path = "../../crypt/keccak_512" }
+half_md5 = { path = "../../crypt/half_md5" }
+md6_256 = { path = "../../crypt/md6_256" }

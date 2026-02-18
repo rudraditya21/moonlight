@@ -1,0 +1,10 @@
+{
+  "name": "auxiliary/crypto/hash_md6_256",
+  "description": "Compute or verify MD6-256 hashes",
+  "category": "auxiliary",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": ["cross"],
+  "tags": ["crypto", "hash", "md6-256"],
+  "entrypoint": "module.rs"
+}

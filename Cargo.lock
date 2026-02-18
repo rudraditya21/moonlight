@@ -218,6 +218,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "half_md5"
+version = "0.1.0"
+dependencies = [
+ "md5",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -310,6 +317,10 @@ name = "md5"
 version = "0.1.0"
 
 [[package]]
+name = "md6_256"
+version = "0.1.0"
+
+[[package]]
 name = "memoffset"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -337,6 +348,7 @@ dependencies = [
  "blake2b_512",
  "blake2s_256",
  "corelib",
+ "half_md5",
  "keccak_224",
  "keccak_256",
  "keccak_384",
@@ -344,6 +356,7 @@ dependencies = [
  "libc",
  "md4",
  "md5",
+ "md6_256",
  "phf",
  "proto",
  "ripemd160",

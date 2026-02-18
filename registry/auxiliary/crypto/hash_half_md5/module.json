@@ -1,0 +1,10 @@
+{
+  "name": "auxiliary/crypto/hash_half_md5",
+  "description": "Compute or verify Half MD5 hashes",
+  "category": "auxiliary",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": ["cross"],
+  "tags": ["crypto", "hash", "half-md5"],
+  "entrypoint": "module.rs"
+}
