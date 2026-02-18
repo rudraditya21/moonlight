@@ -32,6 +32,10 @@ members = [
   "crypt/keccak_512",
   "crypt/half_md5",
   "crypt/md6_256",
+  "crypt/siphash",
+  "crypt/crc32",
+  "crypt/crc32c",
+  "crypt/crc64_jones",
   "network/net",
   "network/proto",
 ]

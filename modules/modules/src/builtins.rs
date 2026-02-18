@@ -1,12 +1,13 @@
 use crate::registry::ModuleRegistryBuilder;
 
 use crate::crypto::{
-    HashBlake2b256Factory, HashBlake2b512Factory, HashBlake2s256Factory, HashHalfMd5Factory,
-    HashKeccak224Factory, HashKeccak256Factory, HashKeccak384Factory, HashKeccak512Factory,
-    HashMd4Factory, HashMd5Factory, HashMd6_256Factory, HashRecipeFactory, HashRipemd160Factory,
+    HashBlake2b256Factory, HashBlake2b512Factory, HashBlake2s256Factory, HashCrc32Factory,
+    HashCrc32cFactory, HashCrc64JonesFactory, HashHalfMd5Factory, HashKeccak224Factory,
+    HashKeccak256Factory, HashKeccak384Factory, HashKeccak512Factory, HashMd4Factory,
+    HashMd5Factory, HashMd6_256Factory, HashRecipeFactory, HashRipemd160Factory,
     HashRipemd320Factory, HashSha1Factory, HashSha224Factory, HashSha256Factory, HashSha384Factory,
     HashSha3_224Factory, HashSha3_256Factory, HashSha3_384Factory, HashSha3_512Factory,
-    HashSha512Factory,
+    HashSha512Factory, HashSipHashFactory,
 };
 use crate::exploit::linux::telnet::GnuInetutilsTelnetdAuthBypassFactory;
 use crate::nops::{
@@ -17,6 +18,10 @@ use crate::nops::{
 pub fn register_builtin_modules(builder: &mut ModuleRegistryBuilder) {
     let _ = builder.register(Box::new(HashMd4Factory));
     let _ = builder.register(Box::new(HashMd5Factory));
+    let _ = builder.register(Box::new(HashSipHashFactory));
+    let _ = builder.register(Box::new(HashCrc32Factory));
+    let _ = builder.register(Box::new(HashCrc32cFactory));
+    let _ = builder.register(Box::new(HashCrc64JonesFactory));
     let _ = builder.register(Box::new(HashRecipeFactory));
     let _ = builder.register(Box::new(HashHalfMd5Factory));
     let _ = builder.register(Box::new(HashMd6_256Factory));

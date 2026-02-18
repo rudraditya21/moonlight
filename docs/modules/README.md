@@ -13,6 +13,12 @@ This directory contains operator-focused documentation for Moonlight modules.
   See `docs/modules/auxiliary/crypto/hash_blake2b_512.md`.
 - `auxiliary/crypto/hash_blake2s_256`  
   See `docs/modules/auxiliary/crypto/hash_blake2s_256.md`.
+- `auxiliary/crypto/hash_crc32`  
+  See `docs/modules/auxiliary/crypto/hash_crc32.md`.
+- `auxiliary/crypto/hash_crc32c`  
+  See `docs/modules/auxiliary/crypto/hash_crc32c.md`.
+- `auxiliary/crypto/hash_crc64_jones`  
+  See `docs/modules/auxiliary/crypto/hash_crc64_jones.md`.
 - `auxiliary/crypto/hash_half_md5`  
   See `docs/modules/auxiliary/crypto/hash_half_md5.md`.
 - `auxiliary/crypto/hash_keccak_224`  
@@ -53,3 +59,5 @@ This directory contains operator-focused documentation for Moonlight modules.
   See `docs/modules/auxiliary/crypto/hash_sha3_384.md`.
 - `auxiliary/crypto/hash_sha3_512`  
   See `docs/modules/auxiliary/crypto/hash_sha3_512.md`.
+- `auxiliary/crypto/hash_siphash`  
+  See `docs/modules/auxiliary/crypto/hash_siphash.md`.

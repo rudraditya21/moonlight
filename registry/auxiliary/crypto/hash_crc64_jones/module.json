@@ -1,0 +1,10 @@
+{
+  "name": "auxiliary/crypto/hash_crc64_jones",
+  "description": "Compute or verify CRC64-Jones checksums",
+  "category": "auxiliary",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": ["cross"],
+  "tags": ["crypto", "hash", "crc64-jones"],
+  "entrypoint": "module.rs"
+}

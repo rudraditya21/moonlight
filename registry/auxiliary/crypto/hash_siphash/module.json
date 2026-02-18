@@ -1,0 +1,10 @@
+{
+  "name": "auxiliary/crypto/hash_siphash",
+  "description": "Compute or verify SipHash-2-4 digests",
+  "category": "auxiliary",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": ["cross"],
+  "tags": ["crypto", "hash", "siphash"],
+  "entrypoint": "module.rs"
+}

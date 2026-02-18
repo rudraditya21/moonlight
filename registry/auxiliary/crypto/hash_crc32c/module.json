@@ -1,0 +1,10 @@
+{
+  "name": "auxiliary/crypto/hash_crc32c",
+  "description": "Compute or verify CRC32C checksums",
+  "category": "auxiliary",
+  "rank": "normal",
+  "author": "moonlight",
+  "platforms": ["cross"],
+  "tags": ["crypto", "hash", "crc32c"],
+  "entrypoint": "module.rs"
+}
