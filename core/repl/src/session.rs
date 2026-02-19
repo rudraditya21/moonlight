@@ -1,13 +1,19 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
 
 use corelib::ids::Id;
 use corelib::policy::{
     Capability, DecisionKind, ModuleContext as PolicyModuleContext, PolicyEngine, PolicyRequest,
 };
+use corelib::release::{
+    CompatibilityCase, CompatibilityMatrix, DocumentationGate, DocumentationGateSuite,
+    MigrationPlan, MigrationPolicy, ReleaseChecklistTemplate, ReleaseCompatibilityPolicy,
+    RollbackRegistry, VersionWindow, VersionedControlState,
+};
+use corelib::time::now_secs;
 use modules::{
-    load_dyn_module, Module, ModuleCatalog, ModuleCategory, ModuleContext, ModuleRank,
-    ModuleRegistry, SearchQuery,
+    load_dyn_module, Module, ModuleCatalog, ModuleCategory, ModuleCompatibilityPolicy,
+    ModuleContext, ModuleRank, ModuleRegistry, SearchQuery,
 };
 
 use crate::ansi::Palette;
@@ -46,11 +52,64 @@ pub struct Repl {
     sessions: SessionManager,
     policy: PolicyEngine,
     output_mode: OutputMode,
+    release_compat_policy: ReleaseCompatibilityPolicy,
+    release_migration_policy: MigrationPolicy,
+    release_state: VersionedControlState,
+    release_rollback: RollbackRegistry,
+    release_doc_gates: DocumentationGateSuite,
+    release_checklist: ReleaseChecklistTemplate,
     palette: Palette,
 }
 
 impl Repl {
     pub fn new(prompt: String, registry: ModuleRegistry, catalog: Option<ModuleCatalog>) -> Self {
+        let module_compat = ModuleCompatibilityPolicy::catalog_default();
+        let release_compat_policy = ReleaseCompatibilityPolicy::new(
+            VersionWindow::new(
+                module_compat.min_manifest_version,
+                module_compat.max_manifest_version,
+            )
+            .expect("fixed module manifest range"),
+            VersionWindow::new(
+                module_compat.min_module_api_version,
+                module_compat.max_module_api_version,
+            )
+            .expect("fixed module API range"),
+            VersionWindow::new(1, 3).expect("fixed control-state range"),
+            vec!["human".to_string(), "json".to_string()],
+            vec!["builtin".to_string(), "dynlib".to_string()],
+        )
+        .expect("fixed release compatibility policy");
+
+        let release_migration_policy = MigrationPolicy::default_control_plane();
+        let release_state =
+            VersionedControlState::new(release_migration_policy.supported_min_version)
+                .expect("default schema version");
+        let release_doc_gates = DocumentationGateSuite::new(vec![
+            DocumentationGate::new(
+                "module-usage",
+                "docs/guide/modules.md",
+                vec![
+                    "module authoring guide".to_string(),
+                    "repl usage".to_string(),
+                ],
+            )
+            .expect("module docs gate"),
+            DocumentationGate::new(
+                "release-usage",
+                "docs/guide/release_operations.md",
+                vec![
+                    "release operations guide".to_string(),
+                    "release command usage".to_string(),
+                    "migration workflow".to_string(),
+                    "rollback workflow".to_string(),
+                    "documentation completeness gates".to_string(),
+                ],
+            )
+            .expect("release docs gate"),
+        ])
+        .expect("release docs suite");
+
         Repl {
             prompt_base: normalize_prompt(&prompt),
             registry,
@@ -61,6 +120,12 @@ impl Repl {
             sessions: SessionManager::new(),
             policy: PolicyEngine::new(),
             output_mode: OutputMode::Human,
+            release_compat_policy,
+            release_migration_policy,
+            release_state,
+            release_rollback: RollbackRegistry::default(),
+            release_doc_gates,
+            release_checklist: ReleaseChecklistTemplate::default_control_plane(),
             palette: Palette::new(),
         }
     }
@@ -156,6 +221,7 @@ impl Repl {
             "run" => self.cmd_run(tokens),
             "output" => self.cmd_output(tokens),
             "policy" => self.cmd_policy(tokens),
+            "release" => self.cmd_release(tokens),
             "info" => self.cmd_info(tokens),
             "sessions" => self.cmd_sessions(tokens),
             "interact" => self.cmd_interact(tokens),
@@ -189,6 +255,11 @@ impl Repl {
         println!("  policy               Show guardrail policy and capabilities");
         println!("  policy enable <cap>  Enable a capability (exploit_execution, payload_execution, evasion_execution, public_targets, wide_target_scope, bulk_session_control)");
         println!("  policy disable <cap> Disable a capability");
+        println!("  release              Show release state and usage");
+        println!("  release check        Run release readiness checks");
+        println!("  release matrix       Run compatibility matrix tests");
+        println!("  release migrate ...  Plan/apply schema migrations");
+        println!("  release rollback ... Manage rollback snapshots");
         println!("  sessions             List sessions");
         println!("  sessions -k <id>     Close a session");
         println!("  sessions -K          Close all sessions");
@@ -1086,6 +1157,616 @@ impl Repl {
         }
     }
 
+    fn cmd_release(&mut self, tokens: &[String]) {
+        if tokens.len() == 1 {
+            self.emit_response(
+                CommandResponse::ok("release", "release discipline state")
+                    .with_field("schema_version", self.release_state.schema_version)
+                    .with_field(
+                        "latest_version",
+                        self.release_migration_policy.latest_version,
+                    )
+                    .with_field(
+                        "rollback_snapshots",
+                        self.release_rollback.list_snapshots().len(),
+                    ),
+            );
+            if !self.output_mode.is_json() {
+                println!("Usage:");
+                println!("  release check");
+                println!("  release matrix");
+                println!("  release migrate plan <from> <to>");
+                println!("  release migrate apply <to>");
+                println!("  release rollback snapshot <label>");
+                println!("  release rollback list");
+                println!("  release rollback apply <snapshot_id>");
+                println!("  release rollback prune <keep_latest>");
+            }
+            return;
+        }
+
+        match tokens[1].to_ascii_lowercase().as_str() {
+            "check" => self.cmd_release_check(),
+            "matrix" => self.cmd_release_matrix(),
+            "migrate" => self.cmd_release_migrate(tokens),
+            "rollback" => self.cmd_release_rollback(tokens),
+            _ => self.emit_error("release", CliCode::Usage, &release_usage_string()),
+        }
+    }
+
+    fn cmd_release_check(&mut self) {
+        let matrix_report = self
+            .build_release_matrix()
+            .evaluate(&self.release_compat_policy);
+        let docs_root = match std::env::current_dir() {
+            Ok(path) => path,
+            Err(err) => {
+                self.emit_error(
+                    "release",
+                    CliCode::Io,
+                    &format!("failed to resolve workspace root: {err}"),
+                );
+                return;
+            }
+        };
+        let docs_report = match self.release_doc_gates.evaluate(&docs_root) {
+            Ok(report) => report,
+            Err(err) => {
+                self.emit_error(
+                    "release",
+                    CliCode::Execution,
+                    &format!("documentation gate evaluation failed: {err}"),
+                );
+                return;
+            }
+        };
+
+        let migration_path_ok = self
+            .release_migration_policy
+            .plan(
+                self.release_state.schema_version,
+                self.release_migration_policy.latest_version,
+            )
+            .is_ok();
+        let rollback_snapshot_ok = self.release_rollback.has_snapshots();
+        let docs_usage_ok = docs_report
+            .results
+            .iter()
+            .find(|result| result.name == "release-usage")
+            .map(|result| result.passed)
+            .unwrap_or(false);
+
+        let mut checklist_status = BTreeMap::new();
+        checklist_status.insert(
+            "compatibility_matrix".to_string(),
+            matrix_report.tests_passed,
+        );
+        checklist_status.insert("migration_path".to_string(), migration_path_ok);
+        checklist_status.insert("rollback_snapshot".to_string(), rollback_snapshot_ok);
+        checklist_status.insert("documentation_gates".to_string(), docs_report.all_passed);
+        checklist_status.insert("usage_notes".to_string(), docs_usage_ok);
+
+        let checklist_report = self.release_checklist.evaluate(&checklist_status);
+        self.emit_response(
+            CommandResponse::ok("release", "release readiness evaluated")
+                .with_field("ready", checklist_report.ready)
+                .with_field("compatibility_ok", matrix_report.tests_passed)
+                .with_field("docs_ok", docs_report.all_passed)
+                .with_field("migration_path_ok", migration_path_ok)
+                .with_field("rollback_snapshot_ok", rollback_snapshot_ok),
+        );
+
+        if self.output_mode.is_json() || checklist_report.ready {
+            return;
+        }
+
+        println!("Blocking checklist items:");
+        for failure in checklist_report.failures {
+            println!("  - {}: {}", failure.key, failure.description);
+        }
+    }
+
+    fn cmd_release_matrix(&mut self) {
+        let report = self
+            .build_release_matrix()
+            .evaluate(&self.release_compat_policy);
+        self.emit_response(
+            CommandResponse::ok("release", "compatibility matrix evaluated")
+                .with_field("total_cases", report.total_cases)
+                .with_field("passed_cases", report.passed_cases)
+                .with_field("failed_cases", report.failed_cases)
+                .with_field("tests_passed", report.tests_passed),
+        );
+        if self.output_mode.is_json() {
+            return;
+        }
+
+        if report.results.is_empty() {
+            println!("No compatibility cases configured.");
+            return;
+        }
+
+        let headers = ["Case", "Expected", "Actual", "Pass", "Details"];
+        let mut rows = Vec::with_capacity(report.results.len());
+        let mut widths = [
+            headers[0].len(),
+            headers[1].len(),
+            headers[2].len(),
+            headers[3].len(),
+            headers[4].len(),
+        ];
+        for result in report.results {
+            let details = if result.failures.is_empty() {
+                "-".to_string()
+            } else {
+                result.failures.join("; ")
+            };
+            let row = [
+                result.case_name,
+                bool_word(result.expected_compatible),
+                bool_word(result.actual_compatible),
+                bool_word(result.test_passed),
+                details,
+            ];
+            for (idx, col) in row.iter().enumerate() {
+                widths[idx] = widths[idx].max(col.len());
+            }
+            rows.push(row);
+        }
+
+        println!(
+            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}",
+            headers[0],
+            headers[1],
+            headers[2],
+            headers[3],
+            headers[4],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3],
+            w4 = widths[4]
+        );
+        println!(
+            "{:-<w0$}  {:-<w1$}  {:-<w2$}  {:-<w3$}  {:-<w4$}",
+            "",
+            "",
+            "",
+            "",
+            "",
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3],
+            w4 = widths[4]
+        );
+        for row in rows {
+            println!(
+                "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}",
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                w0 = widths[0],
+                w1 = widths[1],
+                w2 = widths[2],
+                w3 = widths[3],
+                w4 = widths[4]
+            );
+        }
+    }
+
+    fn cmd_release_migrate(&mut self, tokens: &[String]) {
+        if tokens.len() < 3 {
+            self.emit_error("release", CliCode::Usage, &release_usage_string());
+            return;
+        }
+
+        match tokens[2].to_ascii_lowercase().as_str() {
+            "plan" => {
+                let (from_version, to_version) = if tokens.len() == 5 {
+                    let Ok(from) = tokens[3].parse::<u32>() else {
+                        self.emit_error(
+                            "release",
+                            CliCode::Validation,
+                            "from version must be an integer",
+                        );
+                        return;
+                    };
+                    let Ok(to) = tokens[4].parse::<u32>() else {
+                        self.emit_error(
+                            "release",
+                            CliCode::Validation,
+                            "to version must be an integer",
+                        );
+                        return;
+                    };
+                    (from, to)
+                } else if tokens.len() == 4 {
+                    let Ok(to) = tokens[3].parse::<u32>() else {
+                        self.emit_error(
+                            "release",
+                            CliCode::Validation,
+                            "to version must be an integer",
+                        );
+                        return;
+                    };
+                    (self.release_state.schema_version, to)
+                } else {
+                    self.emit_error(
+                        "release",
+                        CliCode::Usage,
+                        "usage: release migrate plan <from> <to> | release migrate plan <to>",
+                    );
+                    return;
+                };
+
+                match self.release_migration_policy.plan(from_version, to_version) {
+                    Ok(plan) => self.emit_migration_plan(&plan),
+                    Err(err) => {
+                        self.emit_error("release", CliCode::Execution, &err.to_string());
+                    }
+                }
+            }
+            "apply" => {
+                if tokens.len() != 4 {
+                    self.emit_error(
+                        "release",
+                        CliCode::Usage,
+                        "usage: release migrate apply <to>",
+                    );
+                    return;
+                }
+                let Ok(target_version) = tokens[3].parse::<u32>() else {
+                    self.emit_error(
+                        "release",
+                        CliCode::Validation,
+                        "target version must be an integer",
+                    );
+                    return;
+                };
+
+                let from_version = self.release_state.schema_version;
+                let plan = match self
+                    .release_migration_policy
+                    .plan(from_version, target_version)
+                {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        self.emit_error("release", CliCode::Execution, &err.to_string());
+                        return;
+                    }
+                };
+
+                let snapshot = match self.release_rollback.create_snapshot(
+                    &format!("pre-migrate-v{}-to-v{}", from_version, target_version),
+                    self.release_state.schema_version,
+                    &self.release_state.snapshot_payload(),
+                    now_secs(),
+                ) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        self.emit_error(
+                            "release",
+                            CliCode::Execution,
+                            &format!("failed to create rollback snapshot: {err}"),
+                        );
+                        return;
+                    }
+                };
+
+                match self.release_state.apply_migration_plan(&plan, now_secs()) {
+                    Ok(report) => self.emit_response(
+                        CommandResponse::ok("release", "migration applied")
+                            .with_field("from_version", report.from_version)
+                            .with_field("to_version", report.to_version)
+                            .with_field("applied_steps", report.applied_steps)
+                            .with_field("requires_backup", report.requires_backup)
+                            .with_field("rollback_snapshot_id", snapshot.id),
+                    ),
+                    Err(err) => self.emit_error(
+                        "release",
+                        CliCode::Execution,
+                        &format!("migration apply failed: {err}"),
+                    ),
+                }
+            }
+            _ => self.emit_error("release", CliCode::Usage, &release_usage_string()),
+        }
+    }
+
+    fn cmd_release_rollback(&mut self, tokens: &[String]) {
+        if tokens.len() < 3 {
+            self.emit_error("release", CliCode::Usage, &release_usage_string());
+            return;
+        }
+
+        match tokens[2].to_ascii_lowercase().as_str() {
+            "snapshot" => {
+                if tokens.len() < 4 {
+                    self.emit_error(
+                        "release",
+                        CliCode::Usage,
+                        "usage: release rollback snapshot <label>",
+                    );
+                    return;
+                }
+                let label = tokens[3..].join(" ");
+                match self.release_rollback.create_snapshot(
+                    &label,
+                    self.release_state.schema_version,
+                    &self.release_state.snapshot_payload(),
+                    now_secs(),
+                ) {
+                    Ok(snapshot) => self.emit_response(
+                        CommandResponse::ok("release", "rollback snapshot created")
+                            .with_field("snapshot_id", snapshot.id)
+                            .with_field("schema_version", snapshot.schema_version)
+                            .with_field("label", snapshot.label),
+                    ),
+                    Err(err) => self.emit_error("release", CliCode::Execution, &err.to_string()),
+                }
+            }
+            "list" => {
+                let snapshots = self.release_rollback.list_snapshots();
+                if snapshots.is_empty() {
+                    self.emit_ok("release", "no rollback snapshots available");
+                    return;
+                }
+                self.emit_response(
+                    CommandResponse::ok("release", "rollback snapshots listed")
+                        .with_field("count", snapshots.len()),
+                );
+                if self.output_mode.is_json() {
+                    return;
+                }
+
+                let headers = ["Id", "Schema", "CapturedAt", "Checksum", "Label"];
+                let mut widths = [
+                    headers[0].len(),
+                    headers[1].len(),
+                    headers[2].len(),
+                    headers[3].len(),
+                    headers[4].len(),
+                ];
+                let mut rows = Vec::with_capacity(snapshots.len());
+                for snapshot in snapshots {
+                    let row = [
+                        snapshot.id.to_string(),
+                        snapshot.schema_version.to_string(),
+                        snapshot.captured_at.to_string(),
+                        snapshot.checksum.to_string(),
+                        snapshot.label,
+                    ];
+                    for (idx, col) in row.iter().enumerate() {
+                        widths[idx] = widths[idx].max(col.len());
+                    }
+                    rows.push(row);
+                }
+                println!(
+                    "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}",
+                    headers[0],
+                    headers[1],
+                    headers[2],
+                    headers[3],
+                    headers[4],
+                    w0 = widths[0],
+                    w1 = widths[1],
+                    w2 = widths[2],
+                    w3 = widths[3],
+                    w4 = widths[4]
+                );
+                println!(
+                    "{:-<w0$}  {:-<w1$}  {:-<w2$}  {:-<w3$}  {:-<w4$}",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    w0 = widths[0],
+                    w1 = widths[1],
+                    w2 = widths[2],
+                    w3 = widths[3],
+                    w4 = widths[4]
+                );
+                for row in rows {
+                    println!(
+                        "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}",
+                        row[0],
+                        row[1],
+                        row[2],
+                        row[3],
+                        row[4],
+                        w0 = widths[0],
+                        w1 = widths[1],
+                        w2 = widths[2],
+                        w3 = widths[3],
+                        w4 = widths[4]
+                    );
+                }
+            }
+            "apply" => {
+                if tokens.len() != 4 {
+                    self.emit_error(
+                        "release",
+                        CliCode::Usage,
+                        "usage: release rollback apply <snapshot_id>",
+                    );
+                    return;
+                }
+                let Ok(snapshot_id) = tokens[3].parse::<u64>() else {
+                    self.emit_error(
+                        "release",
+                        CliCode::Validation,
+                        "snapshot_id must be an integer",
+                    );
+                    return;
+                };
+
+                match self.release_rollback.restore(snapshot_id) {
+                    Ok(restore) => {
+                        self.release_state
+                            .apply_rollback_restore(&restore, now_secs());
+                        self.emit_response(
+                            CommandResponse::ok("release", "rollback restore applied")
+                                .with_field("snapshot_id", restore.snapshot_id)
+                                .with_field("schema_version", restore.schema_version)
+                                .with_field("label", restore.label),
+                        );
+                    }
+                    Err(err) => self.emit_error("release", CliCode::Execution, &err.to_string()),
+                }
+            }
+            "prune" => {
+                if tokens.len() != 4 {
+                    self.emit_error(
+                        "release",
+                        CliCode::Usage,
+                        "usage: release rollback prune <keep_latest>",
+                    );
+                    return;
+                }
+                let Ok(keep_latest) = tokens[3].parse::<usize>() else {
+                    self.emit_error(
+                        "release",
+                        CliCode::Validation,
+                        "keep_latest must be an integer",
+                    );
+                    return;
+                };
+                let removed = self.release_rollback.prune_keep_latest(keep_latest);
+                self.emit_response(
+                    CommandResponse::ok("release", "rollback snapshots pruned")
+                        .with_field("removed", removed)
+                        .with_field("remaining", self.release_rollback.list_snapshots().len()),
+                );
+            }
+            _ => self.emit_error("release", CliCode::Usage, &release_usage_string()),
+        }
+    }
+
+    fn build_release_matrix(&self) -> CompatibilityMatrix {
+        let manifest_min = self.release_compat_policy.module_manifest_versions.min;
+        let manifest_max = self.release_compat_policy.module_manifest_versions.max;
+        let api_min = self.release_compat_policy.module_api_versions.min;
+        let api_max = self.release_compat_policy.module_api_versions.max;
+        let control_min = self.release_compat_policy.control_state_versions.min;
+        let control_max = self.release_compat_policy.control_state_versions.max;
+        let current_control = self.release_state.schema_version;
+
+        CompatibilityMatrix::new(vec![
+            CompatibilityCase::new(
+                "builtin-current-human",
+                "builtin",
+                manifest_min,
+                api_min,
+                current_control,
+                "human",
+                true,
+            )
+            .expect("compat-case"),
+            CompatibilityCase::new(
+                "dynlib-current-json",
+                "dynlib",
+                manifest_max,
+                api_max,
+                current_control,
+                "json",
+                true,
+            )
+            .expect("compat-case"),
+            CompatibilityCase::new(
+                "manifest-too-low",
+                "builtin",
+                manifest_min.saturating_sub(1),
+                api_min,
+                current_control,
+                "human",
+                false,
+            )
+            .expect("compat-case"),
+            CompatibilityCase::new(
+                "api-too-high",
+                "builtin",
+                manifest_max,
+                api_max.saturating_add(1),
+                current_control,
+                "human",
+                false,
+            )
+            .expect("compat-case"),
+            CompatibilityCase::new(
+                "unsupported-runtime",
+                "wasm",
+                manifest_min,
+                api_min,
+                current_control,
+                "human",
+                false,
+            )
+            .expect("compat-case"),
+            CompatibilityCase::new(
+                "unsupported-output",
+                "builtin",
+                manifest_min,
+                api_min,
+                current_control,
+                "xml",
+                false,
+            )
+            .expect("compat-case"),
+            CompatibilityCase::new(
+                "control-state-too-high",
+                "builtin",
+                manifest_min,
+                api_min,
+                control_max.saturating_add(1),
+                "human",
+                false,
+            )
+            .expect("compat-case"),
+            CompatibilityCase::new(
+                "control-state-too-low",
+                "builtin",
+                manifest_min,
+                api_min,
+                control_min.saturating_sub(1),
+                "human",
+                false,
+            )
+            .expect("compat-case"),
+        ])
+        .expect("release compatibility matrix")
+    }
+
+    fn emit_migration_plan(&self, plan: &MigrationPlan) {
+        self.emit_response(
+            CommandResponse::ok("release", "migration plan generated")
+                .with_field("from_version", plan.start_version)
+                .with_field("to_version", plan.target_version)
+                .with_field("steps", plan.steps.len())
+                .with_field("requires_backup", plan.requires_backup),
+        );
+        if self.output_mode.is_json() || plan.steps.is_empty() {
+            return;
+        }
+
+        println!("Planned migration steps:");
+        for (idx, step) in plan.steps.iter().enumerate() {
+            println!(
+                "  {}. {} -> {} [{}|{}|backup={}] {}",
+                idx + 1,
+                step.from_version,
+                step.to_version,
+                step.direction.as_str(),
+                step.impact.as_str(),
+                step.requires_backup,
+                step.description
+            );
+        }
+    }
+
     fn cmd_interact(&mut self, tokens: &[String]) {
         if tokens.len() < 2 {
             self.emit_error("interact", CliCode::Usage, "usage: interact <id>");
@@ -1511,6 +2192,63 @@ impl Repl {
                         candidates = capability_candidates(current);
                     }
                 }
+                "release" => {
+                    if token_index == 1 {
+                        candidates = ["check", "matrix", "migrate", "rollback"]
+                            .iter()
+                            .filter(|v| v.starts_with(current))
+                            .map(|v| v.to_string())
+                            .collect();
+                    } else if token_index == 2 {
+                        if matches!(tokens.get(1), Some(&"migrate")) {
+                            candidates = ["plan", "apply"]
+                                .iter()
+                                .filter(|v| v.starts_with(current))
+                                .map(|v| v.to_string())
+                                .collect();
+                        } else if matches!(tokens.get(1), Some(&"rollback")) {
+                            candidates = ["snapshot", "list", "apply", "prune"]
+                                .iter()
+                                .filter(|v| v.starts_with(current))
+                                .map(|v| v.to_string())
+                                .collect();
+                        }
+                    } else if token_index == 3 {
+                        if matches!(tokens.get(1), Some(&"migrate"))
+                            && matches!(tokens.get(2), Some(&"plan") | Some(&"apply"))
+                        {
+                            let current_version = self.release_state.schema_version.to_string();
+                            let latest_version =
+                                self.release_migration_policy.latest_version.to_string();
+                            candidates = vec![current_version, latest_version]
+                                .into_iter()
+                                .filter(|v| v.starts_with(current))
+                                .collect();
+                        } else if matches!(tokens.get(1), Some(&"rollback"))
+                            && matches!(tokens.get(2), Some(&"apply"))
+                        {
+                            candidates = release_snapshot_id_candidates(self, current);
+                        } else if matches!(tokens.get(1), Some(&"rollback"))
+                            && matches!(tokens.get(2), Some(&"prune"))
+                        {
+                            candidates = ["1", "3", "5"]
+                                .iter()
+                                .filter(|v| v.starts_with(current))
+                                .map(|v| v.to_string())
+                                .collect();
+                        }
+                    } else if token_index == 4
+                        && matches!(tokens.get(1), Some(&"migrate"))
+                        && matches!(tokens.get(2), Some(&"plan"))
+                    {
+                        let latest_version =
+                            self.release_migration_policy.latest_version.to_string();
+                        candidates = vec![latest_version]
+                            .into_iter()
+                            .filter(|v| v.starts_with(current))
+                            .collect();
+                    }
+                }
                 "interact" => {
                     if token_index == 1 {
                         candidates = session_id_candidates(self, current);
@@ -1573,7 +2311,7 @@ impl Repl {
 fn command_candidates(prefix: &str) -> Vec<String> {
     let commands = [
         "help", "show", "use", "search", "set", "get", "setg", "getg", "run", "output", "policy",
-        "sessions", "interact", "history", "info", "exit", "quit",
+        "release", "sessions", "interact", "history", "info", "exit", "quit",
     ];
     commands
         .iter()
@@ -1643,6 +2381,15 @@ fn session_id_candidates(repl: &Repl, prefix: &str) -> Vec<String> {
         .collect()
 }
 
+fn release_snapshot_id_candidates(repl: &Repl, prefix: &str) -> Vec<String> {
+    repl.release_rollback
+        .list_snapshots()
+        .into_iter()
+        .map(|snapshot| snapshot.id.to_string())
+        .filter(|id| id.starts_with(prefix))
+        .collect()
+}
+
 fn search_flag_candidates(prefix: &str) -> Vec<String> {
     let flags = [
         "--category",
@@ -1657,6 +2404,18 @@ fn search_flag_candidates(prefix: &str) -> Vec<String> {
         .filter(|flag| flag.starts_with(prefix))
         .map(|flag| flag.to_string())
         .collect()
+}
+
+fn bool_word(value: bool) -> String {
+    if value {
+        "yes".to_string()
+    } else {
+        "no".to_string()
+    }
+}
+
+fn release_usage_string() -> String {
+    "usage: release check | release matrix | release migrate plan <from> <to> | release migrate apply <to> | release rollback snapshot <label> | release rollback list | release rollback apply <snapshot_id> | release rollback prune <keep_latest>".to_string()
 }
 
 fn print_aligned_rows(rows: &[(&str, &str)]) {

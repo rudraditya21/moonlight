@@ -51,6 +51,7 @@ make clippy
 
 - Protocol reference: `docs/proto/`
 - Module authoring guide: `docs/guide/modules.md`
+- Release operations guide: `docs/guide/release_operations.md`
 
 ## License
 

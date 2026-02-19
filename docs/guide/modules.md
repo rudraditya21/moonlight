@@ -112,6 +112,24 @@ moonlight> set OPTION value
 moonlight> run
 ```
 
+Global operator settings:
+
+```
+moonlight> setg output_mode json
+moonlight> setg session_max_pending_bytes 65536
+moonlight> setg session_drain_bytes 4096
+moonlight> getg output_mode
+```
+
+Release-discipline commands:
+
+```
+moonlight> release check
+moonlight> release matrix
+moonlight> release migrate plan <from-version> <to-version>
+moonlight> release rollback snapshot <label>
+```
+
 The prompt reflects the active module when one is selected:
 
 ```

@@ -7,6 +7,7 @@ pub mod observability;
 pub mod orchestrator;
 pub mod performance;
 pub mod policy;
+pub mod release;
 pub mod reliability;
 pub mod time;
 
