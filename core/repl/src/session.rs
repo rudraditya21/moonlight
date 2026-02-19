@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use corelib::ids::Id;
 use corelib::policy::{
@@ -1814,13 +1816,7 @@ impl Repl {
                     );
                     return Ok(());
                 }
-                self.sessions
-                    .poll(id)
-                    .map_err(|e| ReplError::Io(format!("session read failed: {e}")))?;
-                let pending = self
-                    .sessions
-                    .read_buffered(id)
-                    .map_err(|e| ReplError::Io(format!("session read failed: {e}")))?;
+                let pending = self.collect_session_output_with_grace(id, 80, 30)?;
                 self.emit_session_output(id, &pending);
                 let prompt = format!("session({id})> ");
                 let completer = ReplCompleter { repl: self };
@@ -1861,13 +1857,7 @@ impl Repl {
                 self.sessions
                     .write(id, &payload)
                     .map_err(|e| ReplError::Io(format!("session write failed: {e}")))?;
-                self.sessions
-                    .poll(id)
-                    .map_err(|e| ReplError::Io(format!("session read failed: {e}")))?;
-                let response = self
-                    .sessions
-                    .read_buffered(id)
-                    .map_err(|e| ReplError::Io(format!("session read failed: {e}")))?;
+                let response = self.collect_session_output_with_grace(id, 350, 50)?;
                 self.emit_session_output(id, &response);
             }
         })();
@@ -1877,6 +1867,44 @@ impl Repl {
         }
 
         result
+    }
+
+    fn collect_session_output_with_grace(
+        &mut self,
+        id: u32,
+        wait_timeout_ms: u64,
+        idle_quiet_ms: u64,
+    ) -> Result<Vec<u8>, ReplError> {
+        let timeout = Duration::from_millis(wait_timeout_ms.max(1));
+        let quiet = Duration::from_millis(idle_quiet_ms.max(1));
+        let started = Instant::now();
+        let mut last_data_at = Instant::now();
+        let mut collected = Vec::new();
+
+        loop {
+            self.sessions
+                .poll(id)
+                .map_err(|e| ReplError::Io(format!("session read failed: {e}")))?;
+            let chunk = self
+                .sessions
+                .read_buffered(id)
+                .map_err(|e| ReplError::Io(format!("session read failed: {e}")))?;
+            if !chunk.is_empty() {
+                last_data_at = Instant::now();
+                collected.extend_from_slice(&chunk);
+            }
+
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                break;
+            }
+            if !collected.is_empty() && last_data_at.elapsed() >= quiet {
+                break;
+            }
+            thread::sleep(Duration::from_millis(15));
+        }
+
+        Ok(collected)
     }
 
     fn cmd_info(&self, tokens: &[String]) {
