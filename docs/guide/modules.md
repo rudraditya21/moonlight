@@ -28,15 +28,23 @@ The manifest is used for indexing, search, and loading.
 ## Manifest Format
 `module.json` is parsed by `ModuleManifest::parse_str` and supports:
 
+- `manifest_version` (integer, required) — current value: `1`
+- `module_api_version` (integer, required) — current value: `1`
+- `runtime` (string, required) — `builtin` or `dynlib`
 - `name` (string, required) — full module path, e.g. `nops/riscv32le/simple`
 - `description` (string, required)
-- `category` (string, optional) — `auxiliary`, `payload`, `exploit`, `post`, `evasion`, `nop`, etc.
-- `rank` (string, optional) — `manual`, `low`, `average`, `normal`, `good`, `great`, `excellent`
-- `author` (string, optional)
-- `platforms` (array of strings, optional)
-- `tags` (array of strings, optional)
-- `entrypoint` (string, optional) — filename or dynlib name to load
+- `category` (string, required) — `auxiliary`, `payload`, `exploit`, `post`, `evasion`, `nop`, etc.
+- `rank` (string, required) — `manual`, `low`, `average`, `normal`, `good`, `great`, `excellent`
+- `author` (string, required)
+- `platforms` (array of strings, required)
+- `tags` (array of strings, required)
+- `entrypoint` (string, required) — filename or dynlib name to load
 - `references` (array of objects, optional) — `{ "kind": "cve", "value": "2024-0001" }`
+
+Strict behavior:
+- Unknown top-level fields are rejected.
+- Category must match the module path prefix.
+- `dynlib` modules must be compatible with the supported module API policy.
 
 ## Built‑in Modules (Rust)
 Built‑in modules implement the `Module` trait and are registered in `modules/modules/src/builtins.rs`.

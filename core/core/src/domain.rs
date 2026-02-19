@@ -1033,7 +1033,15 @@ impl Finding {
         details: &str,
         severity: FindingSeverity,
     ) -> Result<Self, DomainError> {
-        Self::new_at(run_id, task_id, session_id, title, details, severity, now_secs())
+        Self::new_at(
+            run_id,
+            task_id,
+            session_id,
+            title,
+            details,
+            severity,
+            now_secs(),
+        )
     }
 
     pub fn new_at(
@@ -1206,8 +1214,8 @@ mod tests {
         let now = 10;
         let workspace_id = WorkspaceId::next();
         let module_version_id = ModuleVersionId::next();
-        let mut run = Run::new_at(workspace_id, module_version_id, None, "operator", now)
-            .expect("run");
+        let mut run =
+            Run::new_at(workspace_id, module_version_id, None, "operator", now).expect("run");
 
         assert_eq!(run.state, RunState::Queued);
         run.transition_state(RunState::Running, now + 1)

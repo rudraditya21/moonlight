@@ -44,6 +44,9 @@ pub extern "C" fn moonlight_module_v1() -> *const ModuleApiV1 {
 
 extern "C" fn get_metadata_json() -> *const c_char {
     let json = r#"{
+  "manifest_version": 1,
+  "module_api_version": 1,
+  "runtime": "dynlib",
   "name": "auxiliary/test/dynlib_echo",
   "description": "Dynlib echo test module",
   "category": "auxiliary",

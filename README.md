@@ -51,7 +51,6 @@ make clippy
 
 - Protocol reference: `docs/proto/`
 - Module authoring guide: `docs/guide/modules.md`
-- Control-plane architecture: `docs/architecture/`
 
 ## License
 

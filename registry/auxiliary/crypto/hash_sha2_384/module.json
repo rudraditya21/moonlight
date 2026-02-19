@@ -1,10 +1,20 @@
 {
+  "manifest_version": 1,
+  "module_api_version": 1,
+  "runtime": "builtin",
   "name": "auxiliary/crypto/hash_sha2_384",
   "description": "Compute or verify SHA2-384 hashes",
   "category": "auxiliary",
   "rank": "normal",
   "author": "moonlight",
-  "platforms": ["cross"],
-  "tags": ["crypto", "hash", "sha2-384", "sha384"],
+  "platforms": [
+    "cross"
+  ],
+  "tags": [
+    "crypto",
+    "hash",
+    "sha2-384",
+    "sha384"
+  ],
   "entrypoint": "module.rs"
 }

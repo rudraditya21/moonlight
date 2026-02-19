@@ -1,10 +1,19 @@
 {
+  "manifest_version": 1,
+  "module_api_version": 1,
+  "runtime": "builtin",
   "name": "auxiliary/crypto/hash_ripemd320",
   "description": "Compute or verify RIPEMD-320 hashes",
   "category": "auxiliary",
   "rank": "normal",
   "author": "moonlight",
-  "platforms": ["cross"],
-  "tags": ["crypto", "hash", "ripemd-320"],
+  "platforms": [
+    "cross"
+  ],
+  "tags": [
+    "crypto",
+    "hash",
+    "ripemd-320"
+  ],
   "entrypoint": "module.rs"
 }

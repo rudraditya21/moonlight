@@ -1,5 +1,5 @@
-pub mod error;
 pub mod domain;
+pub mod error;
 pub mod ids;
 pub mod log;
 pub mod time;

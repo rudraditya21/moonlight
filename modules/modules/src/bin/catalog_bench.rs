@@ -17,7 +17,7 @@ fn main() {
         std::fs::create_dir_all(&dir).expect("create module dir");
         let tag = format!("tag{}", i % 100);
         let content = format!(
-            "{{\n  \"name\": \"auxiliary/crypto/mod_{i}\",\n  \"description\": \"Module {i}\",\n  \"category\": \"auxiliary\",\n  \"rank\": \"normal\",\n  \"author\": \"bench\",\n  \"platforms\": [\"cross\"],\n  \"tags\": [\"crypto\", \"{tag}\"],\n  \"entrypoint\": \"module.rs\"\n}}"
+            "{{\n  \"manifest_version\": 1,\n  \"module_api_version\": 1,\n  \"runtime\": \"builtin\",\n  \"name\": \"auxiliary/crypto/mod_{i}\",\n  \"description\": \"Module {i}\",\n  \"category\": \"auxiliary\",\n  \"rank\": \"normal\",\n  \"author\": \"bench\",\n  \"platforms\": [\"cross\"],\n  \"tags\": [\"crypto\", \"{tag}\"],\n  \"entrypoint\": \"module.rs\"\n}}"
         );
         std::fs::write(dir.join("module.json"), content).expect("write manifest");
     }
