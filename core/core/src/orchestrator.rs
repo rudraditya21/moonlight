@@ -1,16 +1,18 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::domain::{
-    DomainError, ModuleVersionId, Run, RunId, RunState, TargetId, Task, TaskId, TaskState,
-    WorkspaceId,
+    CorrelationId, DomainError, EventId, ModuleVersionId, Run, RunId, RunState, SessionId,
+    TargetId, Task, TaskId, TaskState, WorkspaceId,
 };
 use crate::ids::Id;
 use crate::time::now_secs;
 
 const SNAPSHOT_HEADER: &str = "moonlight-orchestrator:v1";
+const AUDIT_HEADER: &str = "moonlight-audit:v1";
 
 #[derive(Debug)]
 pub enum OrchestratorError {
@@ -245,6 +247,161 @@ pub trait SnapshotStore {
     fn save_snapshot(&mut self, snapshot: &str) -> Result<(), OrchestratorError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEvent {
+    pub id: EventId,
+    pub correlation_id: CorrelationId,
+    pub occurred_at: u64,
+    pub payload: AuditEventPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditEventPayload {
+    Run(RunEvent),
+    Task(TaskEvent),
+    Session(SessionEvent),
+    Module(ModuleEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunEvent {
+    Submitted {
+        run_id: RunId,
+        workspace_id: WorkspaceId,
+        module_version_id: ModuleVersionId,
+        target_id: Option<TargetId>,
+        requested_by: String,
+    },
+    StateChanged {
+        run_id: RunId,
+        from: RunState,
+        to: RunState,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskEvent {
+    Created {
+        run_id: RunId,
+        task_id: TaskId,
+        name: String,
+        max_attempts: u32,
+        timeout_ms: u64,
+        idempotency_key: String,
+    },
+    Started {
+        run_id: RunId,
+        task_id: TaskId,
+        attempt: u32,
+    },
+    Retried {
+        run_id: RunId,
+        task_id: TaskId,
+        attempt: u32,
+        reason: String,
+    },
+    Succeeded {
+        run_id: RunId,
+        task_id: TaskId,
+        message: Option<String>,
+        deduplicated_from: Option<TaskId>,
+    },
+    Failed {
+        run_id: RunId,
+        task_id: TaskId,
+        reason: String,
+    },
+    Canceled {
+        run_id: RunId,
+        task_id: TaskId,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEvent {
+    Opened {
+        session_id: SessionId,
+        run_id: Option<RunId>,
+        session_type: String,
+        target: String,
+    },
+    Attached {
+        session_id: SessionId,
+        operator: String,
+    },
+    Detached {
+        session_id: SessionId,
+        operator: String,
+    },
+    Backgrounded {
+        session_id: SessionId,
+    },
+    Closed {
+        session_id: SessionId,
+        reason: Option<String>,
+    },
+    Reaped {
+        session_id: SessionId,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleEvent {
+    Discovered {
+        module_path: String,
+        module_version_id: Option<ModuleVersionId>,
+    },
+    Validated {
+        module_path: String,
+        api_version: String,
+    },
+    ValidationFailed {
+        module_path: String,
+        reason: String,
+    },
+    Executed {
+        module_path: String,
+        run_id: RunId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconstructedRun {
+    pub run_id: RunId,
+    pub correlation_id: CorrelationId,
+    pub workspace_id: WorkspaceId,
+    pub module_version_id: ModuleVersionId,
+    pub target_id: Option<TargetId>,
+    pub requested_by: String,
+    pub state: RunState,
+    pub created_at: u64,
+    pub started_at: Option<u64>,
+    pub finished_at: Option<u64>,
+    pub error: Option<String>,
+    pub tasks: BTreeMap<TaskId, ReconstructedTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconstructedTask {
+    pub task_id: TaskId,
+    pub name: String,
+    pub state: TaskState,
+    pub attempt_count: u32,
+    pub max_attempts: u32,
+    pub timeout_ms: u64,
+    pub idempotency_key: String,
+    pub error: Option<String>,
+    pub deduplicated_from: Option<TaskId>,
+}
+
+pub trait AuditLogStore {
+    fn load_events(&mut self) -> Result<Vec<AuditEvent>, OrchestratorError>;
+    fn append_event(&mut self, event: &AuditEvent) -> Result<(), OrchestratorError>;
+}
+
 #[derive(Debug, Clone)]
 pub struct InMemorySnapshotStore {
     shared: Arc<Mutex<Option<String>>>,
@@ -318,6 +475,103 @@ impl SnapshotStore for FileSnapshotStore {
         std::fs::write(&tmp_path, snapshot)
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
         std::fs::rename(&tmp_path, &self.path)
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InMemoryAuditLogStore {
+    shared: Arc<Mutex<Vec<AuditEvent>>>,
+}
+
+impl Default for InMemoryAuditLogStore {
+    fn default() -> Self {
+        Self {
+            shared: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl InMemoryAuditLogStore {
+    pub fn from_shared(shared: Arc<Mutex<Vec<AuditEvent>>>) -> Self {
+        Self { shared }
+    }
+
+    pub fn shared(&self) -> Arc<Mutex<Vec<AuditEvent>>> {
+        Arc::clone(&self.shared)
+    }
+}
+
+impl AuditLogStore for InMemoryAuditLogStore {
+    fn load_events(&mut self) -> Result<Vec<AuditEvent>, OrchestratorError> {
+        self.shared
+            .lock()
+            .map_err(|_| OrchestratorError::Storage("audit lock poisoned".to_string()))
+            .map(|events| events.clone())
+    }
+
+    fn append_event(&mut self, event: &AuditEvent) -> Result<(), OrchestratorError> {
+        let mut guard = self
+            .shared
+            .lock()
+            .map_err(|_| OrchestratorError::Storage("audit lock poisoned".to_string()))?;
+        guard.push(event.clone());
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FileAuditLogStore {
+    path: PathBuf,
+}
+
+impl FileAuditLogStore {
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
+    }
+
+    fn ensure_header(&self, file: &mut std::fs::File) -> Result<(), OrchestratorError> {
+        if file
+            .metadata()
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?
+            .len()
+            == 0
+        {
+            file.write_all(AUDIT_HEADER.as_bytes())
+                .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+            file.write_all(b"\n")
+                .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+impl AuditLogStore for FileAuditLogStore {
+    fn load_events(&mut self) -> Result<Vec<AuditEvent>, OrchestratorError> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let raw = std::fs::read_to_string(&self.path)
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        decode_audit_log(&raw)
+    }
+
+    fn append_event(&mut self, event: &AuditEvent) -> Result<(), OrchestratorError> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        self.ensure_header(&mut file)?;
+        file.write_all(encode_audit_event(event).as_bytes())
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        file.write_all(b"\n")
             .map_err(|e| OrchestratorError::Storage(e.to_string()))
     }
 }
@@ -580,6 +834,27 @@ impl<S: SnapshotStore> ExecutionOrchestrator<S> {
 
     pub fn idempotency_record(&self, key: &str) -> Option<&IdempotencyRecord> {
         self.idempotency.get(key)
+    }
+
+    fn peek_next_dispatchable_task(&self) -> Option<TaskId> {
+        for task_id in &self.queue {
+            let Some(task) = self.tasks.get(task_id) else {
+                continue;
+            };
+            if task.task.state != TaskState::Queued {
+                continue;
+            }
+            let run_state = self
+                .runs
+                .get(&task.task.run_id)
+                .map(|run| run.run.state)
+                .unwrap_or(RunState::Failed);
+            if run_state.is_terminal() {
+                continue;
+            }
+            return Some(*task_id);
+        }
+        None
     }
 
     fn pop_next_dispatchable_task(&mut self) -> Option<TaskId> {
@@ -946,6 +1221,415 @@ impl<S: SnapshotStore> ExecutionOrchestrator<S> {
     }
 }
 
+pub struct ObservableExecutionOrchestrator<S: SnapshotStore, A: AuditLogStore> {
+    inner: ExecutionOrchestrator<S>,
+    audit_store: A,
+    run_correlations: BTreeMap<RunId, CorrelationId>,
+}
+
+impl<S: SnapshotStore, A: AuditLogStore> ObservableExecutionOrchestrator<S, A> {
+    pub fn new(store: S, mut audit_store: A) -> Result<Self, OrchestratorError> {
+        let inner = ExecutionOrchestrator::new(store)?;
+        let mut run_correlations = BTreeMap::new();
+        for event in audit_store.load_events()? {
+            if let Some(run_id) = event_run_id(&event.payload) {
+                run_correlations
+                    .entry(run_id)
+                    .or_insert(event.correlation_id);
+            }
+        }
+        for run_id in inner.runs.keys() {
+            run_correlations
+                .entry(*run_id)
+                .or_insert_with(CorrelationId::next);
+        }
+        Ok(Self {
+            inner,
+            audit_store,
+            run_correlations,
+        })
+    }
+
+    pub fn submit_with_planner<P: RunPlanner>(
+        &mut self,
+        request: RunRequest,
+        planner: &P,
+    ) -> Result<RunId, OrchestratorError> {
+        let plan = planner.plan(&request)?;
+        self.submit_run(request, plan)
+    }
+
+    pub fn submit_run(
+        &mut self,
+        request: RunRequest,
+        plan: RunPlan,
+    ) -> Result<RunId, OrchestratorError> {
+        let workspace_id = request.workspace_id;
+        let module_version_id = request.module_version_id;
+        let target_id = request.target_id;
+        let requested_by = request.requested_by.clone();
+        let run_id = self.inner.submit_run(request, plan)?;
+        let correlation_id = CorrelationId::next();
+        self.run_correlations.insert(run_id, correlation_id);
+        self.append_event(
+            correlation_id,
+            AuditEventPayload::Run(RunEvent::Submitted {
+                run_id,
+                workspace_id,
+                module_version_id,
+                target_id,
+                requested_by,
+            }),
+        )?;
+
+        let Some(task_ids) = self.inner.run_task_ids(run_id) else {
+            return Err(OrchestratorError::NotFound(format!("run {}", run_id.0 .0)));
+        };
+        for task_id in task_ids {
+            let task = self
+                .inner
+                .tasks
+                .get(&task_id)
+                .ok_or_else(|| OrchestratorError::NotFound(format!("task {}", task_id.0 .0)))?;
+            self.append_event(
+                correlation_id,
+                AuditEventPayload::Task(TaskEvent::Created {
+                    run_id,
+                    task_id,
+                    name: task.task.name.clone(),
+                    max_attempts: task.task.max_attempts,
+                    timeout_ms: task.timeout_ms,
+                    idempotency_key: task.idempotency_key.clone(),
+                }),
+            )?;
+        }
+        Ok(run_id)
+    }
+
+    pub fn dispatch_next<E: TaskExecutor>(
+        &mut self,
+        executor: &mut E,
+    ) -> Result<DispatchOutcome, OrchestratorError> {
+        let preview_task_id = self.inner.peek_next_dispatchable_task();
+        let preview_run_state = preview_task_id
+            .and_then(|task_id| self.inner.tasks.get(&task_id))
+            .and_then(|scheduled| self.inner.run_state(scheduled.task.run_id));
+
+        let outcome = self.inner.dispatch_next(executor)?;
+        if let Some(run_id) = outcome_run_id(&outcome) {
+            let correlation_id = self.correlation_for_run_or_create(run_id);
+            if let Some(task_id) = outcome_task_id(&outcome) {
+                match &outcome {
+                    DispatchOutcome::Succeeded { .. }
+                    | DispatchOutcome::Requeued { .. }
+                    | DispatchOutcome::Failed { .. }
+                    | DispatchOutcome::Deduplicated { .. } => {
+                        let attempt = self.inner.task_attempt_count(task_id).ok_or_else(|| {
+                            OrchestratorError::NotFound(format!("task {}", task_id.0 .0))
+                        })?;
+                        self.append_event(
+                            correlation_id,
+                            AuditEventPayload::Task(TaskEvent::Started {
+                                run_id,
+                                task_id,
+                                attempt,
+                            }),
+                        )?;
+                    }
+                    _ => {}
+                }
+
+                match &outcome {
+                    DispatchOutcome::Succeeded { .. } => {
+                        let message = self
+                            .inner
+                            .tasks
+                            .get(&task_id)
+                            .and_then(|task| self.inner.idempotency.get(&task.idempotency_key))
+                            .map(|record| record.message.clone());
+                        self.append_event(
+                            correlation_id,
+                            AuditEventPayload::Task(TaskEvent::Succeeded {
+                                run_id,
+                                task_id,
+                                message,
+                                deduplicated_from: None,
+                            }),
+                        )?;
+                    }
+                    DispatchOutcome::Requeued { reason, .. } => {
+                        let attempt = self.inner.task_attempt_count(task_id).ok_or_else(|| {
+                            OrchestratorError::NotFound(format!("task {}", task_id.0 .0))
+                        })?;
+                        self.append_event(
+                            correlation_id,
+                            AuditEventPayload::Task(TaskEvent::Retried {
+                                run_id,
+                                task_id,
+                                attempt,
+                                reason: reason.clone(),
+                            }),
+                        )?;
+                    }
+                    DispatchOutcome::Failed { reason, .. } => {
+                        self.append_event(
+                            correlation_id,
+                            AuditEventPayload::Task(TaskEvent::Failed {
+                                run_id,
+                                task_id,
+                                reason: reason.clone(),
+                            }),
+                        )?;
+                    }
+                    DispatchOutcome::Canceled { .. } => {
+                        self.append_event(
+                            correlation_id,
+                            AuditEventPayload::Task(TaskEvent::Canceled {
+                                run_id,
+                                task_id,
+                                reason: Some("task canceled".to_string()),
+                            }),
+                        )?;
+                    }
+                    DispatchOutcome::Deduplicated { source_task_id, .. } => {
+                        self.append_event(
+                            correlation_id,
+                            AuditEventPayload::Task(TaskEvent::Succeeded {
+                                run_id,
+                                task_id,
+                                message: Some("deduplicated by idempotency key".to_string()),
+                                deduplicated_from: Some(*source_task_id),
+                            }),
+                        )?;
+                    }
+                    DispatchOutcome::Idle => {}
+                }
+            }
+
+            if let Some(before) = preview_run_state {
+                let after = self
+                    .inner
+                    .run_state(run_id)
+                    .ok_or_else(|| OrchestratorError::NotFound(format!("run {}", run_id.0 .0)))?;
+                self.emit_run_state_delta(run_id, correlation_id, before, after, &outcome)?;
+            }
+        }
+        Ok(outcome)
+    }
+
+    pub fn cancel_run(&mut self, run_id: RunId) -> Result<bool, OrchestratorError> {
+        let before = self.inner.run_state(run_id);
+        let changed = self.inner.cancel_run(run_id)?;
+        if !changed {
+            return Ok(false);
+        }
+        let correlation_id = self.correlation_for_run_or_create(run_id);
+        if let Some(from) = before {
+            self.append_event(
+                correlation_id,
+                AuditEventPayload::Run(RunEvent::StateChanged {
+                    run_id,
+                    from,
+                    to: RunState::Canceled,
+                    reason: Some("operator requested cancellation".to_string()),
+                }),
+            )?;
+        }
+        if let Some(task_ids) = self.inner.run_task_ids(run_id) {
+            for task_id in task_ids {
+                if self.inner.task_state(task_id) == Some(TaskState::Canceled) {
+                    self.append_event(
+                        correlation_id,
+                        AuditEventPayload::Task(TaskEvent::Canceled {
+                            run_id,
+                            task_id,
+                            reason: Some("run canceled".to_string()),
+                        }),
+                    )?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn cancel_task(&mut self, task_id: TaskId) -> Result<bool, OrchestratorError> {
+        let run_id = self.inner.task_run_id(task_id)?;
+        let run_before = self.inner.run_state(run_id);
+        let changed = self.inner.cancel_task(task_id)?;
+        if !changed {
+            return Ok(false);
+        }
+        let correlation_id = self.correlation_for_run_or_create(run_id);
+        self.append_event(
+            correlation_id,
+            AuditEventPayload::Task(TaskEvent::Canceled {
+                run_id,
+                task_id,
+                reason: Some("operator requested task cancellation".to_string()),
+            }),
+        )?;
+        let run_after = self
+            .inner
+            .run_state(run_id)
+            .ok_or_else(|| OrchestratorError::NotFound(format!("run {}", run_id.0 .0)))?;
+        if let Some(before) = run_before {
+            if before != run_after {
+                self.append_event(
+                    correlation_id,
+                    AuditEventPayload::Run(RunEvent::StateChanged {
+                        run_id,
+                        from: before,
+                        to: run_after,
+                        reason: Some("task cancellation changed run state".to_string()),
+                    }),
+                )?;
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn record_session_event(
+        &mut self,
+        event: SessionEvent,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<CorrelationId, OrchestratorError> {
+        let effective = match (&event, correlation_id) {
+            (
+                SessionEvent::Opened {
+                    run_id: Some(run_id),
+                    ..
+                },
+                None,
+            ) => self.correlation_for_run_or_create(*run_id),
+            (_, Some(value)) => value,
+            _ => CorrelationId::next(),
+        };
+        self.append_event(effective, AuditEventPayload::Session(event))?;
+        Ok(effective)
+    }
+
+    pub fn record_module_event(
+        &mut self,
+        event: ModuleEvent,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<CorrelationId, OrchestratorError> {
+        let effective = match (&event, correlation_id) {
+            (ModuleEvent::Executed { run_id, .. }, None) => {
+                self.correlation_for_run_or_create(*run_id)
+            }
+            (_, Some(value)) => value,
+            _ => CorrelationId::next(),
+        };
+        self.append_event(effective, AuditEventPayload::Module(event))?;
+        Ok(effective)
+    }
+
+    pub fn load_audit_events(&mut self) -> Result<Vec<AuditEvent>, OrchestratorError> {
+        self.audit_store.load_events()
+    }
+
+    pub fn correlation_id_for_run(&self, run_id: RunId) -> Option<CorrelationId> {
+        self.run_correlations.get(&run_id).copied()
+    }
+
+    pub fn reconstruct_run_from_history(
+        &mut self,
+        run_id: RunId,
+    ) -> Result<Option<ReconstructedRun>, OrchestratorError> {
+        let events = self.audit_store.load_events()?;
+        Ok(reconstruct_run_from_events(&events, run_id))
+    }
+
+    pub fn run_state(&self, run_id: RunId) -> Option<RunState> {
+        self.inner.run_state(run_id)
+    }
+
+    pub fn task_state(&self, task_id: TaskId) -> Option<TaskState> {
+        self.inner.task_state(task_id)
+    }
+
+    pub fn task_attempt_count(&self, task_id: TaskId) -> Option<u32> {
+        self.inner.task_attempt_count(task_id)
+    }
+
+    pub fn run_task_ids(&self, run_id: RunId) -> Option<Vec<TaskId>> {
+        self.inner.run_task_ids(run_id)
+    }
+
+    pub fn pending_tasks(&self) -> usize {
+        self.inner.pending_tasks()
+    }
+
+    pub fn idempotency_record(&self, key: &str) -> Option<&IdempotencyRecord> {
+        self.inner.idempotency_record(key)
+    }
+
+    fn correlation_for_run_or_create(&mut self, run_id: RunId) -> CorrelationId {
+        *self
+            .run_correlations
+            .entry(run_id)
+            .or_insert_with(CorrelationId::next)
+    }
+
+    fn append_event(
+        &mut self,
+        correlation_id: CorrelationId,
+        payload: AuditEventPayload,
+    ) -> Result<(), OrchestratorError> {
+        self.audit_store.append_event(&AuditEvent {
+            id: EventId::next(),
+            correlation_id,
+            occurred_at: now_secs(),
+            payload,
+        })
+    }
+
+    fn emit_run_state_delta(
+        &mut self,
+        run_id: RunId,
+        correlation_id: CorrelationId,
+        before: RunState,
+        after: RunState,
+        outcome: &DispatchOutcome,
+    ) -> Result<(), OrchestratorError> {
+        if before == after {
+            return Ok(());
+        }
+
+        if before == RunState::Queued && after.is_terminal() {
+            self.append_event(
+                correlation_id,
+                AuditEventPayload::Run(RunEvent::StateChanged {
+                    run_id,
+                    from: RunState::Queued,
+                    to: RunState::Running,
+                    reason: None,
+                }),
+            )?;
+            self.append_event(
+                correlation_id,
+                AuditEventPayload::Run(RunEvent::StateChanged {
+                    run_id,
+                    from: RunState::Running,
+                    to: after,
+                    reason: outcome_reason(outcome),
+                }),
+            )?;
+            return Ok(());
+        }
+
+        self.append_event(
+            correlation_id,
+            AuditEventPayload::Run(RunEvent::StateChanged {
+                run_id,
+                from: before,
+                to: after,
+                reason: outcome_reason(outcome),
+            }),
+        )
+    }
+}
+
 fn encode_snapshot(snapshot: &ExecutionSnapshot) -> String {
     let mut out = String::new();
     out.push_str(SNAPSHOT_HEADER);
@@ -1168,6 +1852,678 @@ fn decode_snapshot(input: &str) -> Result<ExecutionSnapshot, OrchestratorError> 
         queue,
         idempotency,
     })
+}
+
+fn encode_audit_event(event: &AuditEvent) -> String {
+    let mut parts = vec![
+        "event".to_string(),
+        event.id.0 .0.to_string(),
+        event.correlation_id.0 .0.to_string(),
+        event.occurred_at.to_string(),
+    ];
+
+    match &event.payload {
+        AuditEventPayload::Run(RunEvent::Submitted {
+            run_id,
+            workspace_id,
+            module_version_id,
+            target_id,
+            requested_by,
+        }) => {
+            parts.push("run_submitted".to_string());
+            parts.push(run_id.0 .0.to_string());
+            parts.push(workspace_id.0 .0.to_string());
+            parts.push(module_version_id.0 .0.to_string());
+            parts.push(encode_opt_u64(target_id.map(|id| id.0 .0)));
+            parts.push(encode_hex(requested_by));
+        }
+        AuditEventPayload::Run(RunEvent::StateChanged {
+            run_id,
+            from,
+            to,
+            reason,
+        }) => {
+            parts.push("run_state_changed".to_string());
+            parts.push(run_id.0 .0.to_string());
+            parts.push(run_state_to_str(*from).to_string());
+            parts.push(run_state_to_str(*to).to_string());
+            parts.push(encode_opt_string(reason.as_deref()));
+        }
+        AuditEventPayload::Task(TaskEvent::Created {
+            run_id,
+            task_id,
+            name,
+            max_attempts,
+            timeout_ms,
+            idempotency_key,
+        }) => {
+            parts.push("task_created".to_string());
+            parts.push(run_id.0 .0.to_string());
+            parts.push(task_id.0 .0.to_string());
+            parts.push(encode_hex(name));
+            parts.push(max_attempts.to_string());
+            parts.push(timeout_ms.to_string());
+            parts.push(encode_hex(idempotency_key));
+        }
+        AuditEventPayload::Task(TaskEvent::Started {
+            run_id,
+            task_id,
+            attempt,
+        }) => {
+            parts.push("task_started".to_string());
+            parts.push(run_id.0 .0.to_string());
+            parts.push(task_id.0 .0.to_string());
+            parts.push(attempt.to_string());
+        }
+        AuditEventPayload::Task(TaskEvent::Retried {
+            run_id,
+            task_id,
+            attempt,
+            reason,
+        }) => {
+            parts.push("task_retried".to_string());
+            parts.push(run_id.0 .0.to_string());
+            parts.push(task_id.0 .0.to_string());
+            parts.push(attempt.to_string());
+            parts.push(encode_hex(reason));
+        }
+        AuditEventPayload::Task(TaskEvent::Succeeded {
+            run_id,
+            task_id,
+            message,
+            deduplicated_from,
+        }) => {
+            parts.push("task_succeeded".to_string());
+            parts.push(run_id.0 .0.to_string());
+            parts.push(task_id.0 .0.to_string());
+            parts.push(encode_opt_string(message.as_deref()));
+            parts.push(encode_opt_u64(deduplicated_from.map(|id| id.0 .0)));
+        }
+        AuditEventPayload::Task(TaskEvent::Failed {
+            run_id,
+            task_id,
+            reason,
+        }) => {
+            parts.push("task_failed".to_string());
+            parts.push(run_id.0 .0.to_string());
+            parts.push(task_id.0 .0.to_string());
+            parts.push(encode_hex(reason));
+        }
+        AuditEventPayload::Task(TaskEvent::Canceled {
+            run_id,
+            task_id,
+            reason,
+        }) => {
+            parts.push("task_canceled".to_string());
+            parts.push(run_id.0 .0.to_string());
+            parts.push(task_id.0 .0.to_string());
+            parts.push(encode_opt_string(reason.as_deref()));
+        }
+        AuditEventPayload::Session(SessionEvent::Opened {
+            session_id,
+            run_id,
+            session_type,
+            target,
+        }) => {
+            parts.push("session_opened".to_string());
+            parts.push(session_id.0 .0.to_string());
+            parts.push(encode_opt_u64(run_id.map(|id| id.0 .0)));
+            parts.push(encode_hex(session_type));
+            parts.push(encode_hex(target));
+        }
+        AuditEventPayload::Session(SessionEvent::Attached {
+            session_id,
+            operator,
+        }) => {
+            parts.push("session_attached".to_string());
+            parts.push(session_id.0 .0.to_string());
+            parts.push(encode_hex(operator));
+        }
+        AuditEventPayload::Session(SessionEvent::Detached {
+            session_id,
+            operator,
+        }) => {
+            parts.push("session_detached".to_string());
+            parts.push(session_id.0 .0.to_string());
+            parts.push(encode_hex(operator));
+        }
+        AuditEventPayload::Session(SessionEvent::Backgrounded { session_id }) => {
+            parts.push("session_backgrounded".to_string());
+            parts.push(session_id.0 .0.to_string());
+        }
+        AuditEventPayload::Session(SessionEvent::Closed { session_id, reason }) => {
+            parts.push("session_closed".to_string());
+            parts.push(session_id.0 .0.to_string());
+            parts.push(encode_opt_string(reason.as_deref()));
+        }
+        AuditEventPayload::Session(SessionEvent::Reaped { session_id, reason }) => {
+            parts.push("session_reaped".to_string());
+            parts.push(session_id.0 .0.to_string());
+            parts.push(encode_hex(reason));
+        }
+        AuditEventPayload::Module(ModuleEvent::Discovered {
+            module_path,
+            module_version_id,
+        }) => {
+            parts.push("module_discovered".to_string());
+            parts.push(encode_hex(module_path));
+            parts.push(encode_opt_u64(module_version_id.map(|id| id.0 .0)));
+        }
+        AuditEventPayload::Module(ModuleEvent::Validated {
+            module_path,
+            api_version,
+        }) => {
+            parts.push("module_validated".to_string());
+            parts.push(encode_hex(module_path));
+            parts.push(encode_hex(api_version));
+        }
+        AuditEventPayload::Module(ModuleEvent::ValidationFailed {
+            module_path,
+            reason,
+        }) => {
+            parts.push("module_validation_failed".to_string());
+            parts.push(encode_hex(module_path));
+            parts.push(encode_hex(reason));
+        }
+        AuditEventPayload::Module(ModuleEvent::Executed {
+            module_path,
+            run_id,
+        }) => {
+            parts.push("module_executed".to_string());
+            parts.push(encode_hex(module_path));
+            parts.push(run_id.0 .0.to_string());
+        }
+    }
+    parts.join("|")
+}
+
+fn decode_audit_log(input: &str) -> Result<Vec<AuditEvent>, OrchestratorError> {
+    let mut lines = input.lines();
+    let Some(header) = lines.next() else {
+        return Err(OrchestratorError::Parse("empty audit log".to_string()));
+    };
+    if header != AUDIT_HEADER {
+        return Err(OrchestratorError::Parse(format!(
+            "unsupported audit header '{}'",
+            header
+        )));
+    }
+
+    let mut events = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        events.push(decode_audit_event(line)?);
+    }
+    Ok(events)
+}
+
+fn decode_audit_event(line: &str) -> Result<AuditEvent, OrchestratorError> {
+    let parts: Vec<&str> = line.split('|').collect();
+    if parts.len() < 5 || parts[0] != "event" {
+        return Err(OrchestratorError::Parse(format!(
+            "invalid audit event '{}'",
+            line
+        )));
+    }
+    let event_id = EventId(Id(parse_u64(parts[1])?));
+    let correlation_id = CorrelationId(Id(parse_u64(parts[2])?));
+    let occurred_at = parse_u64(parts[3])?;
+    let event_kind = parts[4];
+    let payload = match event_kind {
+        "run_submitted" => {
+            if parts.len() != 10 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid run_submitted event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Run(RunEvent::Submitted {
+                run_id: RunId(Id(parse_u64(parts[5])?)),
+                workspace_id: WorkspaceId(Id(parse_u64(parts[6])?)),
+                module_version_id: ModuleVersionId(Id(parse_u64(parts[7])?)),
+                target_id: parse_opt_u64(parts[8])?.map(|id| TargetId(Id(id))),
+                requested_by: decode_hex(parts[9])?,
+            })
+        }
+        "run_state_changed" => {
+            if parts.len() != 9 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid run_state_changed event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Run(RunEvent::StateChanged {
+                run_id: RunId(Id(parse_u64(parts[5])?)),
+                from: parse_run_state(parts[6])?,
+                to: parse_run_state(parts[7])?,
+                reason: decode_opt_string(parts[8])?,
+            })
+        }
+        "task_created" => {
+            if parts.len() != 11 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid task_created event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Task(TaskEvent::Created {
+                run_id: RunId(Id(parse_u64(parts[5])?)),
+                task_id: TaskId(Id(parse_u64(parts[6])?)),
+                name: decode_hex(parts[7])?,
+                max_attempts: parse_u32(parts[8])?,
+                timeout_ms: parse_u64(parts[9])?,
+                idempotency_key: decode_hex(parts[10])?,
+            })
+        }
+        "task_started" => {
+            if parts.len() != 8 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid task_started event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Task(TaskEvent::Started {
+                run_id: RunId(Id(parse_u64(parts[5])?)),
+                task_id: TaskId(Id(parse_u64(parts[6])?)),
+                attempt: parse_u32(parts[7])?,
+            })
+        }
+        "task_retried" => {
+            if parts.len() != 9 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid task_retried event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Task(TaskEvent::Retried {
+                run_id: RunId(Id(parse_u64(parts[5])?)),
+                task_id: TaskId(Id(parse_u64(parts[6])?)),
+                attempt: parse_u32(parts[7])?,
+                reason: decode_hex(parts[8])?,
+            })
+        }
+        "task_succeeded" => {
+            if parts.len() != 9 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid task_succeeded event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Task(TaskEvent::Succeeded {
+                run_id: RunId(Id(parse_u64(parts[5])?)),
+                task_id: TaskId(Id(parse_u64(parts[6])?)),
+                message: decode_opt_string(parts[7])?,
+                deduplicated_from: parse_opt_u64(parts[8])?.map(|id| TaskId(Id(id))),
+            })
+        }
+        "task_failed" => {
+            if parts.len() != 8 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid task_failed event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Task(TaskEvent::Failed {
+                run_id: RunId(Id(parse_u64(parts[5])?)),
+                task_id: TaskId(Id(parse_u64(parts[6])?)),
+                reason: decode_hex(parts[7])?,
+            })
+        }
+        "task_canceled" => {
+            if parts.len() != 8 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid task_canceled event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Task(TaskEvent::Canceled {
+                run_id: RunId(Id(parse_u64(parts[5])?)),
+                task_id: TaskId(Id(parse_u64(parts[6])?)),
+                reason: decode_opt_string(parts[7])?,
+            })
+        }
+        "session_opened" => {
+            if parts.len() != 9 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid session_opened event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Session(SessionEvent::Opened {
+                session_id: SessionId(Id(parse_u64(parts[5])?)),
+                run_id: parse_opt_u64(parts[6])?.map(|id| RunId(Id(id))),
+                session_type: decode_hex(parts[7])?,
+                target: decode_hex(parts[8])?,
+            })
+        }
+        "session_attached" => {
+            if parts.len() != 7 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid session_attached event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Session(SessionEvent::Attached {
+                session_id: SessionId(Id(parse_u64(parts[5])?)),
+                operator: decode_hex(parts[6])?,
+            })
+        }
+        "session_detached" => {
+            if parts.len() != 7 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid session_detached event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Session(SessionEvent::Detached {
+                session_id: SessionId(Id(parse_u64(parts[5])?)),
+                operator: decode_hex(parts[6])?,
+            })
+        }
+        "session_backgrounded" => {
+            if parts.len() != 6 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid session_backgrounded event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Session(SessionEvent::Backgrounded {
+                session_id: SessionId(Id(parse_u64(parts[5])?)),
+            })
+        }
+        "session_closed" => {
+            if parts.len() != 7 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid session_closed event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Session(SessionEvent::Closed {
+                session_id: SessionId(Id(parse_u64(parts[5])?)),
+                reason: decode_opt_string(parts[6])?,
+            })
+        }
+        "session_reaped" => {
+            if parts.len() != 7 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid session_reaped event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Session(SessionEvent::Reaped {
+                session_id: SessionId(Id(parse_u64(parts[5])?)),
+                reason: decode_hex(parts[6])?,
+            })
+        }
+        "module_discovered" => {
+            if parts.len() != 7 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid module_discovered event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Module(ModuleEvent::Discovered {
+                module_path: decode_hex(parts[5])?,
+                module_version_id: parse_opt_u64(parts[6])?.map(|id| ModuleVersionId(Id(id))),
+            })
+        }
+        "module_validated" => {
+            if parts.len() != 7 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid module_validated event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Module(ModuleEvent::Validated {
+                module_path: decode_hex(parts[5])?,
+                api_version: decode_hex(parts[6])?,
+            })
+        }
+        "module_validation_failed" => {
+            if parts.len() != 7 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid module_validation_failed event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Module(ModuleEvent::ValidationFailed {
+                module_path: decode_hex(parts[5])?,
+                reason: decode_hex(parts[6])?,
+            })
+        }
+        "module_executed" => {
+            if parts.len() != 7 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid module_executed event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Module(ModuleEvent::Executed {
+                module_path: decode_hex(parts[5])?,
+                run_id: RunId(Id(parse_u64(parts[6])?)),
+            })
+        }
+        _ => {
+            return Err(OrchestratorError::Parse(format!(
+                "unknown audit event kind '{}'",
+                event_kind
+            )));
+        }
+    };
+
+    Ok(AuditEvent {
+        id: event_id,
+        correlation_id,
+        occurred_at,
+        payload,
+    })
+}
+
+fn event_run_id(payload: &AuditEventPayload) -> Option<RunId> {
+    match payload {
+        AuditEventPayload::Run(RunEvent::Submitted { run_id, .. }) => Some(*run_id),
+        AuditEventPayload::Run(RunEvent::StateChanged { run_id, .. }) => Some(*run_id),
+        AuditEventPayload::Task(TaskEvent::Created { run_id, .. }) => Some(*run_id),
+        AuditEventPayload::Task(TaskEvent::Started { run_id, .. }) => Some(*run_id),
+        AuditEventPayload::Task(TaskEvent::Retried { run_id, .. }) => Some(*run_id),
+        AuditEventPayload::Task(TaskEvent::Succeeded { run_id, .. }) => Some(*run_id),
+        AuditEventPayload::Task(TaskEvent::Failed { run_id, .. }) => Some(*run_id),
+        AuditEventPayload::Task(TaskEvent::Canceled { run_id, .. }) => Some(*run_id),
+        AuditEventPayload::Session(SessionEvent::Opened {
+            run_id: Some(run_id),
+            ..
+        }) => Some(*run_id),
+        AuditEventPayload::Module(ModuleEvent::Executed { run_id, .. }) => Some(*run_id),
+        _ => None,
+    }
+}
+
+fn outcome_run_id(outcome: &DispatchOutcome) -> Option<RunId> {
+    match outcome {
+        DispatchOutcome::Succeeded { run_id, .. } => Some(*run_id),
+        DispatchOutcome::Requeued { run_id, .. } => Some(*run_id),
+        DispatchOutcome::Failed { run_id, .. } => Some(*run_id),
+        DispatchOutcome::Canceled { run_id, .. } => Some(*run_id),
+        DispatchOutcome::Deduplicated { run_id, .. } => Some(*run_id),
+        DispatchOutcome::Idle => None,
+    }
+}
+
+fn outcome_task_id(outcome: &DispatchOutcome) -> Option<TaskId> {
+    match outcome {
+        DispatchOutcome::Succeeded { task_id, .. } => Some(*task_id),
+        DispatchOutcome::Requeued { task_id, .. } => Some(*task_id),
+        DispatchOutcome::Failed { task_id, .. } => Some(*task_id),
+        DispatchOutcome::Canceled { task_id, .. } => Some(*task_id),
+        DispatchOutcome::Deduplicated { task_id, .. } => Some(*task_id),
+        DispatchOutcome::Idle => None,
+    }
+}
+
+fn outcome_reason(outcome: &DispatchOutcome) -> Option<String> {
+    match outcome {
+        DispatchOutcome::Requeued { reason, .. } => Some(reason.clone()),
+        DispatchOutcome::Failed { reason, .. } => Some(reason.clone()),
+        DispatchOutcome::Canceled { .. } => Some("task canceled".to_string()),
+        _ => None,
+    }
+}
+
+fn reconstruct_run_from_events(events: &[AuditEvent], run_id: RunId) -> Option<ReconstructedRun> {
+    let mut reconstructed: Option<ReconstructedRun> = None;
+
+    for event in events {
+        match &event.payload {
+            AuditEventPayload::Run(RunEvent::Submitted {
+                run_id: event_run_id,
+                workspace_id,
+                module_version_id,
+                target_id,
+                requested_by,
+            }) if *event_run_id == run_id => {
+                reconstructed = Some(ReconstructedRun {
+                    run_id,
+                    correlation_id: event.correlation_id,
+                    workspace_id: *workspace_id,
+                    module_version_id: *module_version_id,
+                    target_id: *target_id,
+                    requested_by: requested_by.clone(),
+                    state: RunState::Queued,
+                    created_at: event.occurred_at,
+                    started_at: None,
+                    finished_at: None,
+                    error: None,
+                    tasks: BTreeMap::new(),
+                });
+            }
+            AuditEventPayload::Run(RunEvent::StateChanged {
+                run_id: event_run_id,
+                to,
+                reason,
+                ..
+            }) if *event_run_id == run_id => {
+                let Some(run) = reconstructed.as_mut() else {
+                    continue;
+                };
+                run.state = *to;
+                if *to == RunState::Running && run.started_at.is_none() {
+                    run.started_at = Some(event.occurred_at);
+                }
+                if to.is_terminal() {
+                    if run.started_at.is_none() {
+                        run.started_at = Some(event.occurred_at);
+                    }
+                    run.finished_at = Some(event.occurred_at);
+                }
+                if *to == RunState::Failed {
+                    run.error = reason.clone();
+                } else if *to == RunState::Succeeded {
+                    run.error = None;
+                }
+            }
+            AuditEventPayload::Task(TaskEvent::Created {
+                run_id: event_run_id,
+                task_id,
+                name,
+                max_attempts,
+                timeout_ms,
+                idempotency_key,
+            }) if *event_run_id == run_id => {
+                let Some(run) = reconstructed.as_mut() else {
+                    continue;
+                };
+                run.tasks.insert(
+                    *task_id,
+                    ReconstructedTask {
+                        task_id: *task_id,
+                        name: name.clone(),
+                        state: TaskState::Queued,
+                        attempt_count: 0,
+                        max_attempts: *max_attempts,
+                        timeout_ms: *timeout_ms,
+                        idempotency_key: idempotency_key.clone(),
+                        error: None,
+                        deduplicated_from: None,
+                    },
+                );
+            }
+            AuditEventPayload::Task(TaskEvent::Started {
+                run_id: event_run_id,
+                task_id,
+                attempt,
+            }) if *event_run_id == run_id => {
+                let Some(run) = reconstructed.as_mut() else {
+                    continue;
+                };
+                if let Some(task) = run.tasks.get_mut(task_id) {
+                    task.state = TaskState::Running;
+                    task.attempt_count = *attempt;
+                    task.error = None;
+                }
+            }
+            AuditEventPayload::Task(TaskEvent::Retried {
+                run_id: event_run_id,
+                task_id,
+                attempt,
+                reason,
+            }) if *event_run_id == run_id => {
+                let Some(run) = reconstructed.as_mut() else {
+                    continue;
+                };
+                if let Some(task) = run.tasks.get_mut(task_id) {
+                    task.state = TaskState::Queued;
+                    task.attempt_count = *attempt;
+                    task.error = Some(reason.clone());
+                }
+            }
+            AuditEventPayload::Task(TaskEvent::Succeeded {
+                run_id: event_run_id,
+                task_id,
+                deduplicated_from,
+                ..
+            }) if *event_run_id == run_id => {
+                let Some(run) = reconstructed.as_mut() else {
+                    continue;
+                };
+                if let Some(task) = run.tasks.get_mut(task_id) {
+                    task.state = TaskState::Succeeded;
+                    task.error = None;
+                    task.deduplicated_from = *deduplicated_from;
+                }
+            }
+            AuditEventPayload::Task(TaskEvent::Failed {
+                run_id: event_run_id,
+                task_id,
+                reason,
+            }) if *event_run_id == run_id => {
+                let Some(run) = reconstructed.as_mut() else {
+                    continue;
+                };
+                if let Some(task) = run.tasks.get_mut(task_id) {
+                    task.state = TaskState::Failed;
+                    task.error = Some(reason.clone());
+                }
+            }
+            AuditEventPayload::Task(TaskEvent::Canceled {
+                run_id: event_run_id,
+                task_id,
+                reason,
+            }) if *event_run_id == run_id => {
+                let Some(run) = reconstructed.as_mut() else {
+                    continue;
+                };
+                if let Some(task) = run.tasks.get_mut(task_id) {
+                    task.state = TaskState::Canceled;
+                    task.error = reason.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    reconstructed
 }
 
 fn parse_u64(input: &str) -> Result<u64, OrchestratorError> {
@@ -1621,5 +2977,221 @@ mod tests {
             Some(&1),
             "executor side effect should occur once for same idempotency key"
         );
+    }
+
+    #[test]
+    fn observable_orchestrator_emits_typed_events_with_shared_correlation_id() {
+        let snapshot_store = InMemorySnapshotStore::default();
+        let audit_store = InMemoryAuditLogStore::default();
+        let mut orchestrator =
+            ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("new");
+
+        let run_id = orchestrator
+            .submit_run(
+                basic_request(),
+                RunPlan::new(vec![
+                    PlannedTask::new("evt", 2, 100, "evt-key").expect("task")
+                ])
+                .expect("plan"),
+            )
+            .expect("submit");
+        let mut executor = DeterministicExecutor::default();
+        let outcome = orchestrator.dispatch_next(&mut executor).expect("dispatch");
+        assert!(matches!(outcome, DispatchOutcome::Succeeded { .. }));
+
+        let events = orchestrator.load_audit_events().expect("events");
+        assert_eq!(events.len(), 6, "expected deterministic audit event count");
+
+        let run_correlation = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                AuditEventPayload::Run(RunEvent::Submitted {
+                    run_id: event_run_id,
+                    ..
+                }) if *event_run_id == run_id => Some(event.correlation_id),
+                _ => None,
+            })
+            .expect("run submitted event correlation");
+
+        for event in &events {
+            match &event.payload {
+                AuditEventPayload::Run(RunEvent::Submitted {
+                    run_id: event_run_id,
+                    ..
+                })
+                | AuditEventPayload::Run(RunEvent::StateChanged {
+                    run_id: event_run_id,
+                    ..
+                }) if *event_run_id == run_id => {
+                    assert_eq!(event.correlation_id, run_correlation);
+                }
+                AuditEventPayload::Task(TaskEvent::Created {
+                    run_id: event_run_id,
+                    ..
+                })
+                | AuditEventPayload::Task(TaskEvent::Started {
+                    run_id: event_run_id,
+                    ..
+                })
+                | AuditEventPayload::Task(TaskEvent::Retried {
+                    run_id: event_run_id,
+                    ..
+                })
+                | AuditEventPayload::Task(TaskEvent::Succeeded {
+                    run_id: event_run_id,
+                    ..
+                })
+                | AuditEventPayload::Task(TaskEvent::Failed {
+                    run_id: event_run_id,
+                    ..
+                })
+                | AuditEventPayload::Task(TaskEvent::Canceled {
+                    run_id: event_run_id,
+                    ..
+                }) if *event_run_id == run_id => {
+                    assert_eq!(event.correlation_id, run_correlation);
+                }
+                _ => {}
+            }
+        }
+
+        let reconstructed = orchestrator
+            .reconstruct_run_from_history(run_id)
+            .expect("reconstruct")
+            .expect("run");
+        assert_eq!(reconstructed.state, RunState::Succeeded);
+        assert_eq!(reconstructed.tasks.len(), 1);
+        let task = reconstructed.tasks.values().next().expect("task");
+        assert_eq!(task.state, TaskState::Succeeded);
+    }
+
+    #[test]
+    fn audit_file_store_is_append_only_and_replayable() {
+        let path = std::env::temp_dir().join(format!("moonlight-audit-{}.log", Id::next().0));
+        let mut store = FileAuditLogStore::new(&path);
+        let event_a = AuditEvent {
+            id: EventId::next(),
+            correlation_id: CorrelationId::next(),
+            occurred_at: now_secs(),
+            payload: AuditEventPayload::Module(ModuleEvent::Discovered {
+                module_path: "exploit/linux/test".to_string(),
+                module_version_id: None,
+            }),
+        };
+        let event_b = AuditEvent {
+            id: EventId::next(),
+            correlation_id: CorrelationId::next(),
+            occurred_at: now_secs(),
+            payload: AuditEventPayload::Session(SessionEvent::Backgrounded {
+                session_id: SessionId::next(),
+            }),
+        };
+
+        store.append_event(&event_a).expect("append-a");
+        store.append_event(&event_b).expect("append-b");
+
+        let raw = std::fs::read_to_string(&path).expect("raw");
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines[0], AUDIT_HEADER);
+        assert_eq!(lines.len(), 3, "header + two appended events");
+
+        let events = store.load_events().expect("load");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].payload, event_a.payload);
+        assert_eq!(events[1].payload, event_b.payload);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_reconstruction_works_after_restart_from_event_history() {
+        let snapshot_shared = Arc::new(Mutex::new(None));
+        let audit_shared = Arc::new(Mutex::new(Vec::<AuditEvent>::new()));
+
+        let run_id = {
+            let snapshot_store = InMemorySnapshotStore::from_shared(Arc::clone(&snapshot_shared));
+            let audit_store = InMemoryAuditLogStore::from_shared(Arc::clone(&audit_shared));
+            let mut orchestrator =
+                ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("new");
+            let run_id = orchestrator
+                .submit_run(
+                    basic_request(),
+                    RunPlan::new(vec![
+                        PlannedTask::new("retry", 2, 100, "restart-retry").expect("task")
+                    ])
+                    .expect("plan"),
+                )
+                .expect("submit");
+            let mut executor = DeterministicExecutor::default()
+                .with_behavior("restart-retry", Behavior::RetryOnce);
+            let first = orchestrator
+                .dispatch_next(&mut executor)
+                .expect("dispatch-1");
+            assert!(matches!(first, DispatchOutcome::Requeued { .. }));
+            let second = orchestrator
+                .dispatch_next(&mut executor)
+                .expect("dispatch-2");
+            assert!(matches!(second, DispatchOutcome::Succeeded { .. }));
+            run_id
+        };
+
+        let snapshot_store = InMemorySnapshotStore::from_shared(Arc::clone(&snapshot_shared));
+        let audit_store = InMemoryAuditLogStore::from_shared(Arc::clone(&audit_shared));
+        let mut recovered =
+            ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("recover");
+        let run = recovered
+            .reconstruct_run_from_history(run_id)
+            .expect("reconstruct")
+            .expect("run");
+        assert_eq!(run.state, RunState::Succeeded);
+        let task = run.tasks.values().next().expect("task");
+        assert_eq!(task.attempt_count, 2);
+        assert_eq!(task.state, TaskState::Succeeded);
+    }
+
+    #[test]
+    fn session_and_module_events_reuse_run_correlation_when_available() {
+        let snapshot_store = InMemorySnapshotStore::default();
+        let audit_store = InMemoryAuditLogStore::default();
+        let mut orchestrator =
+            ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("new");
+
+        let run_id = orchestrator
+            .submit_run(
+                basic_request(),
+                RunPlan::new(vec![
+                    PlannedTask::new("evt", 1, 100, "corr-key").expect("task")
+                ])
+                .expect("plan"),
+            )
+            .expect("submit");
+        let run_correlation = orchestrator
+            .correlation_id_for_run(run_id)
+            .expect("run correlation");
+
+        let session_corr = orchestrator
+            .record_session_event(
+                SessionEvent::Opened {
+                    session_id: SessionId::next(),
+                    run_id: Some(run_id),
+                    session_type: "telnet/new-environ".to_string(),
+                    target: "target:23".to_string(),
+                },
+                None,
+            )
+            .expect("session event");
+        assert_eq!(session_corr, run_correlation);
+
+        let module_corr = orchestrator
+            .record_module_event(
+                ModuleEvent::Executed {
+                    module_path: "exploit/linux/telnet/gnu_inetutils_telnetd_auth_bypass"
+                        .to_string(),
+                    run_id,
+                },
+                None,
+            )
+            .expect("module event");
+        assert_eq!(module_corr, run_correlation);
     }
 }
