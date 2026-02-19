@@ -11,6 +11,7 @@ use modules::{
 };
 
 use crate::ansi::Palette;
+use crate::contract::{escape_json, CliCode, CommandResponse, OutputMode};
 use crate::history::History;
 use crate::line::{read_line, Completer, CompletionResult};
 use crate::parser::tokenize;
@@ -44,6 +45,7 @@ pub struct Repl {
     session_id: Id,
     sessions: SessionManager,
     policy: PolicyEngine,
+    output_mode: OutputMode,
     palette: Palette,
 }
 
@@ -58,6 +60,7 @@ impl Repl {
             session_id: Id::next(),
             sessions: SessionManager::new(),
             policy: PolicyEngine::new(),
+            output_mode: OutputMode::Human,
             palette: Palette::new(),
         }
     }
@@ -68,7 +71,13 @@ impl Repl {
             for outcome in self.sessions.poll_all() {
                 _polled_bytes = _polled_bytes.saturating_add(outcome.bytes_read);
                 if let Some(err) = outcome.error {
-                    if outcome.is_partitioned {
+                    if self.output_mode.is_json() {
+                        self.emit_response(
+                            CommandResponse::err("sessions", CliCode::Execution, &err)
+                                .with_field("session_id", outcome.id)
+                                .with_field("partitioned", outcome.is_partitioned),
+                        );
+                    } else if outcome.is_partitioned {
                         eprintln!("session {} partitioned: {}", outcome.id, err);
                     } else {
                         eprintln!("session {} poll error: {}", outcome.id, err);
@@ -77,45 +86,23 @@ impl Repl {
             }
             let recovered = self.sessions.recover_partitioned();
             if !recovered.is_empty() {
-                println!(
-                    "{}",
-                    self.palette.success(&format!(
-                        "Recovered partitioned session(s): {}",
-                        recovered
-                            .iter()
-                            .map(|id| id.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
+                self.emit_response(
+                    CommandResponse::ok("sessions", "recovered partitioned sessions")
+                        .with_field("count", recovered.len()),
                 );
             }
             let reaped_stale = self.sessions.reap_stale();
             if !reaped_stale.is_empty() {
-                println!(
-                    "{}",
-                    self.palette.warning(&format!(
-                        "Reaped {} stale session(s): {}",
-                        reaped_stale.len(),
-                        reaped_stale
-                            .iter()
-                            .map(|id| id.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
+                self.emit_response(
+                    CommandResponse::ok("sessions", "reaped stale sessions")
+                        .with_field("count", reaped_stale.len()),
                 );
             }
             let reaped_partitioned = self.sessions.reap_partitioned();
             if !reaped_partitioned.is_empty() {
-                println!(
-                    "{}",
-                    self.palette.warning(&format!(
-                        "Reaped partitioned session(s): {}",
-                        reaped_partitioned
-                            .iter()
-                            .map(|id| id.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
+                self.emit_response(
+                    CommandResponse::ok("sessions", "reaped partitioned sessions")
+                        .with_field("count", reaped_partitioned.len()),
                 );
             }
             self.sessions.reap_closed();
@@ -164,15 +151,18 @@ impl Repl {
             "search" => self.cmd_search(tokens),
             "set" => self.cmd_set(tokens),
             "get" => self.cmd_get(tokens),
+            "setg" => self.cmd_setg(tokens),
+            "getg" => self.cmd_getg(tokens),
             "run" => self.cmd_run(tokens),
+            "output" => self.cmd_output(tokens),
             "policy" => self.cmd_policy(tokens),
             "info" => self.cmd_info(tokens),
             "sessions" => self.cmd_sessions(tokens),
             "interact" => self.cmd_interact(tokens),
-            _ => println!(
-                "{}",
-                self.palette
-                    .error(&format!("Unknown command: {}", tokens[0]))
+            _ => self.emit_error(
+                "command",
+                CliCode::NotFound,
+                &format!("unknown command: {}", tokens[0]),
             ),
         }
         false
@@ -188,8 +178,12 @@ impl Repl {
         println!("  info [module]        Show module details");
         println!("  set <opt> <value>    Set module option");
         println!("  get <opt>            Get module option");
+        println!("  setg <k> <v>         Set global setting (e.g. output_mode)");
+        println!("  getg <k>             Get global setting value");
         println!("  run                  Execute module");
         println!("  run --yes            Execute without prompt when confirmation is required");
+        println!("  output               Show current output mode (human|json)");
+        println!("  output <mode>        Set output mode: human|json");
         println!("  policy               Show guardrail policy and capabilities");
         println!("  policy enable <cap>  Enable a capability (exploit_execution, payload_execution, evasion_execution, public_targets, wide_target_scope, bulk_session_control)");
         println!("  policy disable <cap> Disable a capability");
@@ -211,7 +205,7 @@ impl Repl {
 
     fn cmd_use(&mut self, tokens: &[String]) {
         if tokens.len() < 2 {
-            println!("{}", self.palette.warning("Usage: use <module>"));
+            self.emit_error("use", CliCode::Usage, "usage: use <module>");
             return;
         }
         let name = &tokens[1];
@@ -222,16 +216,14 @@ impl Repl {
                         match load_dyn_module(entrypoint) {
                             Ok(module) => {
                                 self.active = Some(module);
-                                println!(
-                                    "{}",
-                                    self.palette.success(&format!("Using module: {name}"))
-                                );
+                                self.emit_ok_with_field("use", "module selected", "module", name);
                                 return;
                             }
                             Err(err) => {
-                                println!(
-                                    "{}",
-                                    self.palette.error(&format!("Module load failed: {err}"))
+                                self.emit_error(
+                                    "use",
+                                    CliCode::Execution,
+                                    &format!("module load failed: {err}"),
                                 );
                                 return;
                             }
@@ -239,19 +231,24 @@ impl Repl {
                     }
                 }
             }
-            println!(
-                "{}",
-                self.palette.error(&format!("Module not found: {name}"))
+            self.emit_error(
+                "use",
+                CliCode::NotFound,
+                &format!("module not found: {name}"),
             );
             return;
         };
         self.active = Some(module);
-        println!("{}", self.palette.success(&format!("Using module: {name}")));
+        self.emit_ok_with_field("use", "module selected", "module", name);
     }
 
     fn cmd_show(&self, tokens: &[String]) {
         if tokens.len() < 2 {
-            println!("{}", self.palette.warning("Usage: show <modules|options>"));
+            println!(
+                "{}",
+                self.palette
+                    .warning("Usage: show <modules|options|globals>")
+            );
             return;
         }
         match tokens[1].as_str() {
@@ -313,6 +310,12 @@ impl Repl {
                 );
                 print_options_table(module.options());
             }
+            "globals" => {
+                self.emit_response(
+                    CommandResponse::ok("show", "global settings")
+                        .with_field("output_mode", self.output_mode.as_str()),
+                );
+            }
             _ => println!(
                 "{}",
                 self.palette
@@ -323,35 +326,103 @@ impl Repl {
 
     fn cmd_set(&mut self, tokens: &[String]) {
         if tokens.len() < 3 {
-            println!("{}", self.palette.warning("Usage: set <option> <value>"));
+            self.emit_error("set", CliCode::Usage, "usage: set <option> <value>");
             return;
         }
-        let Some(module) = &mut self.active else {
-            println!("{}", self.palette.warning("No active module."));
+        if self.active.is_none() {
+            self.emit_error("set", CliCode::Validation, "no active module");
             return;
-        };
+        }
         let key = &tokens[1];
         let value = tokens[2..].join(" ");
-        if let Err(err) = module.options_mut().set(key, &value) {
-            println!("{}", self.palette.error(&format!("Error: {err}")));
+        let set_result = {
+            let module = self.active.as_mut().expect("checked is_some");
+            module.options_mut().set(key, &value)
+        };
+        if let Err(err) = set_result {
+            self.emit_error("set", CliCode::Validation, &err);
+            return;
         }
+        self.emit_response(
+            CommandResponse::ok("set", "option updated")
+                .with_field("option", key)
+                .with_field("value", value),
+        );
     }
 
     fn cmd_get(&self, tokens: &[String]) {
         if tokens.len() < 2 {
-            println!("{}", self.palette.warning("Usage: get <option>"));
+            self.emit_error("get", CliCode::Usage, "usage: get <option>");
             return;
         }
         let Some(module) = &self.active else {
-            println!("{}", self.palette.warning("No active module."));
+            self.emit_error("get", CliCode::Validation, "no active module");
             return;
         };
         let key = &tokens[1];
         let Some(opt) = module.options().get(key) else {
-            println!("{}", self.palette.error(&format!("Unknown option: {key}")));
+            self.emit_error("get", CliCode::NotFound, &format!("unknown option: {key}"));
             return;
         };
-        println!("{} = {}", opt.name, opt.value_as_string());
+        self.emit_response(
+            CommandResponse::ok("get", "option value")
+                .with_field("option", &opt.name)
+                .with_field("value", opt.value_as_string()),
+        );
+    }
+
+    fn cmd_setg(&mut self, tokens: &[String]) {
+        if tokens.len() < 3 {
+            self.emit_error("setg", CliCode::Usage, "usage: setg <key> <value>");
+            return;
+        }
+        let key = tokens[1].to_ascii_lowercase();
+        let value = tokens[2..].join(" ");
+        match key.as_str() {
+            "output_mode" | "output" => {
+                let Some(mode) = OutputMode::parse(&value) else {
+                    self.emit_error(
+                        "setg",
+                        CliCode::Validation,
+                        "output_mode must be one of: human|json",
+                    );
+                    return;
+                };
+                self.output_mode = mode;
+                self.emit_response(
+                    CommandResponse::ok("setg", "global setting updated")
+                        .with_field("key", "output_mode")
+                        .with_field("value", mode.as_str()),
+                );
+            }
+            _ => self.emit_error(
+                "setg",
+                CliCode::NotFound,
+                &format!("unknown global key: {key}"),
+            ),
+        }
+    }
+
+    fn cmd_getg(&self, tokens: &[String]) {
+        if tokens.len() < 2 {
+            self.emit_error("getg", CliCode::Usage, "usage: getg <key>");
+            return;
+        }
+        let key = tokens[1].to_ascii_lowercase();
+        match key.as_str() {
+            "output_mode" | "output" => {
+                self.emit_response(
+                    CommandResponse::ok("getg", "global setting")
+                        .with_field("key", "output_mode")
+                        .with_field("value", self.output_mode.as_str()),
+                );
+            }
+            _ => self.emit_error(
+                "getg",
+                CliCode::NotFound,
+                &format!("unknown global key: {key}"),
+            ),
+        }
     }
 
     fn cmd_search(&self, tokens: &[String]) {
@@ -449,14 +520,14 @@ impl Repl {
 
     fn cmd_run(&mut self, tokens: &[String]) {
         let Some(module) = self.active.as_ref() else {
-            println!("{}", self.palette.warning("No active module."));
+            self.emit_error("run", CliCode::Validation, "no active module");
             return;
         };
         if let Err(err) = module.options().validate() {
-            println!(
-                "{}",
-                self.palette
-                    .error(&format!("Option validation failed: {err}"))
+            self.emit_error(
+                "run",
+                CliCode::Validation,
+                &format!("option validation failed: {err}"),
             );
             return;
         }
@@ -470,9 +541,10 @@ impl Repl {
         ) {
             Ok(value) => value,
             Err(err) => {
-                println!(
-                    "{}",
-                    self.palette.error(&format!("Policy metadata error: {err}"))
+                self.emit_error(
+                    "run",
+                    CliCode::Validation,
+                    &format!("policy metadata error: {err}"),
                 );
                 return;
             }
@@ -487,15 +559,10 @@ impl Repl {
 
         match decision.kind {
             DecisionKind::Deny => {
-                println!(
-                    "{}",
-                    self.palette
-                        .error(&format!("Policy blocked run: {}", decision.reason))
-                );
-                println!(
-                    "{}",
-                    self.palette
-                        .info("Use `policy` to inspect/enable capabilities before retrying.")
+                self.emit_error(
+                    "run",
+                    CliCode::PolicyDenied,
+                    &format!("policy blocked run: {}", decision.reason),
                 );
                 return;
             }
@@ -504,10 +571,7 @@ impl Repl {
                     .confirm_intent(&format!("{} [yes/no]: ", decision.reason))
                     .unwrap_or(false)
                 {
-                    println!(
-                        "{}",
-                        self.palette.warning("Run canceled by policy confirmation.")
-                    );
+                    self.emit_error("run", CliCode::PolicyDenied, "run canceled by confirmation");
                     return;
                 }
             }
@@ -518,7 +582,7 @@ impl Repl {
             session_id: self.session_id.0,
         };
         let Some(module) = self.active.as_mut() else {
-            println!("{}", self.palette.warning("No active module."));
+            self.emit_error("run", CliCode::Validation, "no active module");
             return;
         };
         let module_name = module.metadata().name.clone();
@@ -528,26 +592,24 @@ impl Repl {
                     let kind = session.kind().to_string();
                     let target = session.target();
                     let id = self.sessions.register(module_name, session);
-                    println!(
-                        "{}",
-                        self.palette
-                            .success(&format!("Session {id} opened ({kind} -> {target})"))
+                    self.emit_response(
+                        CommandResponse::ok("run", "module executed; session opened")
+                            .with_field("session_id", id)
+                            .with_field("session_type", kind)
+                            .with_field("target", target),
                     );
+                    return;
                 }
                 if result.success {
-                    println!(
-                        "{}",
-                        self.palette
-                            .success(&format!("Success: {}", result.message))
+                    self.emit_response(
+                        CommandResponse::ok("run", "module executed")
+                            .with_field("message", result.message),
                     );
                 } else {
-                    println!(
-                        "{}",
-                        self.palette.error(&format!("Failed: {}", result.message))
-                    );
+                    self.emit_error("run", CliCode::Execution, &result.message);
                 }
             }
-            Err(err) => println!("{}", self.palette.error(&format!("Module error: {err}"))),
+            Err(err) => self.emit_error("run", CliCode::Execution, &format!("module error: {err}")),
         }
     }
 
@@ -556,7 +618,45 @@ impl Repl {
         if tokens.len() == 1 {
             let snapshots = self.sessions.snapshots();
             if snapshots.is_empty() {
-                println!("{}", self.palette.warning("No active sessions."));
+                self.emit_response(
+                    CommandResponse::ok("sessions", "no active sessions").with_field("count", 0),
+                );
+                return;
+            }
+            if self.output_mode.is_json() {
+                let sessions_json = snapshots
+                    .iter()
+                    .map(|snap| {
+                        format!(
+                            "{{\"id\":{},\"state\":\"{}\",\"attach\":\"{}\",\"pending_bytes\":{},\"idle_secs\":{},\"type\":\"{}\",\"target\":\"{}\",\"module\":\"{}\"}}",
+                            snap.id,
+                            if !snap.is_open {
+                                "closed".to_string()
+                            } else if snap.is_partitioned {
+                                format!(
+                                    "partitioned({}s,e={})",
+                                    snap.partition_age_secs.unwrap_or(0),
+                                    snap.consecutive_errors
+                                )
+                            } else {
+                                "open".to_string()
+                            },
+                            if snap.is_attached { "attached" } else { "bg" },
+                            snap.pending_bytes,
+                            snap.idle_secs,
+                            escape_json(&snap.kind),
+                            escape_json(&snap.target),
+                            escape_json(&snap.module_name)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!(
+                    "{{\"command\":\"sessions\",\"ok\":true,\"code\":\"{}\",\"message\":\"listed sessions\",\"count\":{},\"sessions\":[{}]}}",
+                    CliCode::Ok.as_str(),
+                    snapshots.len(),
+                    sessions_json
+                );
                 return;
             }
             let headers = [
@@ -667,11 +767,11 @@ impl Repl {
         match tokens[1].as_str() {
             "-k" | "--kill" => {
                 let Some(id_raw) = tokens.get(2) else {
-                    println!("{}", self.palette.warning("Usage: sessions -k <id>"));
+                    self.emit_error("sessions", CliCode::Usage, "usage: sessions -k <id> [--yes]");
                     return;
                 };
                 let Ok(id) = id_raw.parse::<u32>() else {
-                    println!("{}", self.palette.error("Session id must be an integer."));
+                    self.emit_error("sessions", CliCode::Validation, "session id must be an integer");
                     return;
                 };
                 let explicit_yes = tokens
@@ -680,9 +780,10 @@ impl Repl {
                 let decision = self.policy.evaluate(&PolicyRequest::close_session());
                 match decision.kind {
                     DecisionKind::Deny => {
-                        println!(
-                            "{}",
-                            self.palette.error(&format!("Policy blocked session close: {}", decision.reason))
+                        self.emit_error(
+                            "sessions",
+                            CliCode::PolicyDenied,
+                            &format!("policy blocked session close: {}", decision.reason),
                         );
                         return;
                     }
@@ -691,57 +792,63 @@ impl Repl {
                             .confirm_intent(&format!("{} [yes/no]: ", decision.reason))
                             .unwrap_or(false)
                         {
-                            println!("{}", self.palette.warning("Session close canceled."));
+                            self.emit_error("sessions", CliCode::PolicyDenied, "session close canceled");
                             return;
                         }
                     }
                     _ => {}
                 }
                 match self.sessions.close_and_remove(id) {
-                    Ok(true) => {
-                        println!("{}", self.palette.success(&format!("Session {id} closed.")))
-                    }
-                    Ok(false) => println!(
-                        "{}",
-                        self.palette.error(&format!("Session {id} not found."))
+                    Ok(true) => self.emit_response(
+                        CommandResponse::ok("sessions", "session closed").with_field("session_id", id),
                     ),
-                    Err(err) => println!(
-                        "{}",
-                        self.palette
-                            .error(&format!("Failed to close session {id}: {err}"))
+                    Ok(false) => {
+                        self.emit_error("sessions", CliCode::NotFound, &format!("session {id} not found"))
+                    }
+                    Err(err) => self.emit_error(
+                        "sessions",
+                        CliCode::Execution,
+                        &format!("failed to close session {id}: {err}"),
                     ),
                 }
             }
             "-r" | "--read" => {
                 let Some(id_raw) = tokens.get(2) else {
-                    println!("{}", self.palette.warning("Usage: sessions -r <id>"));
+                    self.emit_error("sessions", CliCode::Usage, "usage: sessions -r <id>");
                     return;
                 };
                 let Ok(id) = id_raw.parse::<u32>() else {
-                    println!("{}", self.palette.error("Session id must be an integer."));
+                    self.emit_error("sessions", CliCode::Validation, "session id must be an integer");
                     return;
                 };
                 if let Err(err) = self.sessions.poll(id) {
-                    println!("{}", self.palette.error(&format!("{err}")));
+                    self.emit_error("sessions", CliCode::Execution, &err.to_string());
                     return;
                 }
                 match self.sessions.read_buffered(id) {
                     Ok(data) if data.is_empty() => {
-                        println!(
-                            "{}",
-                            self.palette.info(&format!("Session {id} has no buffered output."))
+                        self.emit_response(
+                            CommandResponse::ok("sessions", "session has no buffered output")
+                                .with_field("session_id", id)
+                                .with_field("bytes", 0),
                         );
                     }
                     Ok(data) => {
-                        print!("{}", String::from_utf8_lossy(&data));
+                        self.emit_session_output(id, &data);
                     }
-                    Err(err) => println!("{}", self.palette.error(&format!("{err}"))),
+                    Err(err) => self.emit_error("sessions", CliCode::Execution, &err.to_string()),
                 }
             }
             "-R" | "--read-all" => {
                 for outcome in self.sessions.poll_all() {
                     if let Some(err) = outcome.error {
-                        if outcome.is_partitioned {
+                        if self.output_mode.is_json() {
+                            self.emit_response(
+                                CommandResponse::err("sessions", CliCode::Execution, &err)
+                                    .with_field("session_id", outcome.id)
+                                    .with_field("partitioned", outcome.is_partitioned),
+                            );
+                        } else if outcome.is_partitioned {
                             eprintln!("session {} partitioned: {}", outcome.id, err);
                         } else {
                             eprintln!("session {} poll error: {}", outcome.id, err);
@@ -750,27 +857,27 @@ impl Repl {
                 }
                 let recovered = self.sessions.recover_partitioned();
                 if !recovered.is_empty() {
-                    println!(
-                        "{}",
-                        self.palette.success(&format!(
-                            "Recovered partitioned session(s): {}",
-                            recovered
-                                .iter()
-                                .map(|id| id.to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ))
+                    self.emit_response(
+                        CommandResponse::ok("sessions", "recovered partitioned sessions")
+                            .with_field("count", recovered.len()),
                     );
                 }
                 let outputs = self.sessions.read_all_background();
                 if outputs.is_empty() {
-                    println!("{}", self.palette.info("No background output available."));
+                    self.emit_ok("sessions", "no background output available");
                     return;
                 }
+                let output_count = outputs.len();
                 for (id, bytes) in outputs {
-                    println!("{}", self.palette.info(&format!("[session {id}]")));
-                    print!("{}", String::from_utf8_lossy(&bytes));
+                    if !self.output_mode.is_json() {
+                        println!("{}", self.palette.info(&format!("[session {id}]")));
+                    }
+                    self.emit_session_output(id, &bytes);
                 }
+                self.emit_response(
+                    CommandResponse::ok("sessions", "read buffered output for background sessions")
+                        .with_field("count", output_count),
+                );
             }
             "-K" | "--kill-all" => {
                 let explicit_yes = tokens
@@ -779,10 +886,10 @@ impl Repl {
                 let decision = self.policy.evaluate(&PolicyRequest::close_all_sessions());
                 match decision.kind {
                     DecisionKind::Deny => {
-                        println!(
-                            "{}",
-                            self.palette
-                                .error(&format!("Policy blocked close-all: {}", decision.reason))
+                        self.emit_error(
+                            "sessions",
+                            CliCode::PolicyDenied,
+                            &format!("policy blocked close-all: {}", decision.reason),
                         );
                         return;
                     }
@@ -791,7 +898,11 @@ impl Repl {
                             .confirm_intent(&format!("{} [yes/no]: ", decision.reason))
                             .unwrap_or(false)
                         {
-                            println!("{}", self.palette.warning("Close-all canceled."));
+                            self.emit_error(
+                                "sessions",
+                                CliCode::PolicyDenied,
+                                "close-all canceled",
+                            );
                             return;
                         }
                     }
@@ -799,28 +910,56 @@ impl Repl {
                 }
 
                 match self.sessions.close_all() {
-                    Ok(count) => println!(
-                        "{}",
-                        self.palette.success(&format!("Closed {count} session(s)."))
+                    Ok(count) => self.emit_response(
+                        CommandResponse::ok("sessions", "closed sessions")
+                            .with_field("count", count),
                     ),
-                    Err(err) => println!(
-                        "{}",
-                        self.palette
-                            .error(&format!("Failed to close sessions: {err}"))
+                    Err(err) => self.emit_error(
+                        "sessions",
+                        CliCode::Execution,
+                        &format!("failed to close sessions: {err}"),
                     ),
                 }
             }
-            _ => println!(
-                "{}",
-                self.palette
-                    .warning("Usage: sessions | sessions -k <id> [--yes] | sessions -K [--yes] | sessions -r <id> | sessions -R")
+            _ => self.emit_error(
+                "sessions",
+                CliCode::Usage,
+                "usage: sessions | sessions -k <id> [--yes] | sessions -K [--yes] | sessions -r <id> | sessions -R",
             ),
         }
+    }
+
+    fn cmd_output(&mut self, tokens: &[String]) {
+        if tokens.len() == 1 {
+            self.emit_ok_with_field("output", "output mode", "mode", self.output_mode.as_str());
+            return;
+        }
+
+        let Some(mode) = OutputMode::parse(&tokens[1]) else {
+            self.emit_error("output", CliCode::Usage, "usage: output <human|json>");
+            return;
+        };
+
+        self.output_mode = mode;
+        self.emit_ok_with_field("output", "output mode updated", "mode", mode.as_str());
     }
 
     fn cmd_policy(&mut self, tokens: &[String]) {
         if tokens.len() == 1 {
             let granted = self.policy.granted_capabilities();
+            if self.output_mode.is_json() {
+                let caps = granted
+                    .iter()
+                    .map(|cap| cap.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                self.emit_response(
+                    CommandResponse::ok("policy", "policy capabilities")
+                        .with_field("enabled_count", granted.len())
+                        .with_field("enabled", caps),
+                );
+                return;
+            }
             println!("{}", self.palette.info("Policy Guardrails"));
             if granted.is_empty() {
                 println!(
@@ -842,20 +981,20 @@ impl Repl {
         }
 
         if tokens.len() < 3 {
-            println!(
-                "{}",
-                self.palette
-                    .warning("Usage: policy <enable|disable> <capability>")
+            self.emit_error(
+                "policy",
+                CliCode::Usage,
+                "usage: policy <enable|disable> <capability>",
             );
             return;
         }
 
         let action = tokens[1].to_ascii_lowercase();
         let Some(capability) = Capability::parse(&tokens[2]) else {
-            println!(
-                "{}",
-                self.palette
-                    .error(&format!("Unknown capability: {}", tokens[2]))
+            self.emit_error(
+                "policy",
+                CliCode::Validation,
+                &format!("unknown capability: {}", tokens[2]),
             );
             return;
         };
@@ -863,46 +1002,56 @@ impl Repl {
         match action.as_str() {
             "enable" => {
                 self.policy.grant(capability);
-                println!(
-                    "{}",
-                    self.palette
-                        .success(&format!("Enabled capability: {}", capability.as_str()))
+                self.emit_response(
+                    CommandResponse::ok("policy", "capability enabled")
+                        .with_field("capability", capability.as_str()),
                 );
             }
             "disable" => {
                 self.policy.revoke(capability);
-                println!(
-                    "{}",
-                    self.palette
-                        .success(&format!("Disabled capability: {}", capability.as_str()))
+                self.emit_response(
+                    CommandResponse::ok("policy", "capability disabled")
+                        .with_field("capability", capability.as_str()),
                 );
             }
-            _ => println!(
-                "{}",
-                self.palette
-                    .warning("Usage: policy <enable|disable> <capability>")
+            _ => self.emit_error(
+                "policy",
+                CliCode::Usage,
+                "usage: policy <enable|disable> <capability>",
             ),
         }
     }
 
     fn cmd_interact(&mut self, tokens: &[String]) {
         if tokens.len() < 2 {
-            println!("{}", self.palette.warning("Usage: interact <id>"));
+            self.emit_error("interact", CliCode::Usage, "usage: interact <id>");
             return;
         }
         let Ok(id) = tokens[1].parse::<u32>() else {
-            println!("{}", self.palette.error("Session id must be an integer."));
+            self.emit_error(
+                "interact",
+                CliCode::Validation,
+                "session id must be an integer",
+            );
             return;
         };
         if !self.sessions.has(id) {
-            println!(
-                "{}",
-                self.palette.error(&format!("Session {id} not found."))
+            self.emit_error(
+                "interact",
+                CliCode::NotFound,
+                &format!("session {id} not found"),
             );
             return;
         }
+        self.emit_response(
+            CommandResponse::ok("interact", "session attached").with_field("session_id", id),
+        );
         if let Err(err) = self.interact_session(id) {
-            println!("{}", self.palette.error(&format!("Interact error: {err}")));
+            self.emit_error(
+                "interact",
+                CliCode::Execution,
+                &format!("interact error: {err}"),
+            );
         }
     }
 
@@ -914,7 +1063,10 @@ impl Repl {
         let result = (|| -> Result<(), ReplError> {
             loop {
                 if !self.sessions.has(id) {
-                    println!("{}", self.palette.warning(&format!("Session {id} closed.")));
+                    self.emit_response(
+                        CommandResponse::ok("interact", "session closed")
+                            .with_field("session_id", id),
+                    );
                     return Ok(());
                 }
                 self.sessions
@@ -924,14 +1076,16 @@ impl Repl {
                     .sessions
                     .read_buffered(id)
                     .map_err(|e| ReplError::Io(format!("session read failed: {e}")))?;
-                if !pending.is_empty() {
-                    print!("{}", String::from_utf8_lossy(&pending));
-                }
+                self.emit_session_output(id, &pending);
                 let prompt = format!("session({id})> ");
                 let completer = ReplCompleter { repl: self };
                 let line = read_line(&prompt, &completer, self.history.entries())
                     .map_err(|e| ReplError::Io(e.to_string()))?;
                 let Some(line) = line else {
+                    self.emit_response(
+                        CommandResponse::ok("interact", "session detached")
+                            .with_field("session_id", id),
+                    );
                     return Ok(());
                 };
                 let line = line.trim_end();
@@ -941,9 +1095,9 @@ impl Repl {
                 self.history.add(format!("session({id}) {line}"));
                 let lowered = line.to_ascii_lowercase();
                 if lowered == "background" || lowered == "bg" {
-                    println!(
-                        "{}",
-                        self.palette.info(&format!("Backgrounded session {id}."))
+                    self.emit_response(
+                        CommandResponse::ok("interact", "session backgrounded")
+                            .with_field("session_id", id),
                     );
                     return Ok(());
                 }
@@ -951,7 +1105,10 @@ impl Repl {
                     self.sessions
                         .close_and_remove(id)
                         .map_err(|e| ReplError::Io(format!("session close failed: {e}")))?;
-                    println!("{}", self.palette.success(&format!("Session {id} closed.")));
+                    self.emit_response(
+                        CommandResponse::ok("interact", "session closed")
+                            .with_field("session_id", id),
+                    );
                     return Ok(());
                 }
                 let mut payload = line.as_bytes().to_vec();
@@ -966,9 +1123,7 @@ impl Repl {
                     .sessions
                     .read_buffered(id)
                     .map_err(|e| ReplError::Io(format!("session read failed: {e}")))?;
-                if !response.is_empty() {
-                    print!("{}", String::from_utf8_lossy(&response));
-                }
+                self.emit_session_output(id, &response);
             }
         })();
 
@@ -1068,6 +1223,47 @@ impl Repl {
             .map_err(|e| ReplError::Io(e.to_string()))?;
         let answer = input.trim().to_ascii_lowercase();
         Ok(matches!(answer.as_str(), "yes" | "y"))
+    }
+
+    fn emit_response(&self, response: CommandResponse) {
+        if self.output_mode.is_json() {
+            println!("{}", response.render_json());
+            return;
+        }
+        let rendered = response.render_human();
+        if response.ok {
+            println!("{}", self.palette.success(&rendered));
+        } else {
+            println!("{}", self.palette.error(&rendered));
+        }
+    }
+
+    fn emit_ok(&self, command: &str, message: &str) {
+        self.emit_response(CommandResponse::ok(command, message));
+    }
+
+    fn emit_ok_with_field(&self, command: &str, message: &str, key: &str, value: impl ToString) {
+        self.emit_response(CommandResponse::ok(command, message).with_field(key, value));
+    }
+
+    fn emit_error(&self, command: &str, code: CliCode, message: &str) {
+        self.emit_response(CommandResponse::err(command, code, message));
+    }
+
+    fn emit_session_output(&self, session_id: u32, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.output_mode.is_json() {
+            let text = String::from_utf8_lossy(bytes);
+            println!(
+                "{{\"event\":\"session_output\",\"session_id\":{},\"output\":\"{}\"}}",
+                session_id,
+                escape_json(&text)
+            );
+        } else {
+            print!("{}", String::from_utf8_lossy(bytes));
+        }
     }
 }
 
@@ -1180,15 +1376,64 @@ impl Repl {
                 }
                 "show" => {
                     if token_index == 1 {
-                        candidates = ["modules", "options"]
+                        candidates = ["modules", "options", "globals"]
                             .iter()
                             .filter(|v| v.starts_with(current))
                             .map(|v| v.to_string())
                             .collect();
                     }
                 }
+                "setg" => {
+                    if token_index == 1 {
+                        candidates = global_key_candidates(current);
+                    } else if token_index == 2 {
+                        if matches!(tokens.get(1), Some(&"output_mode") | Some(&"output")) {
+                            candidates = ["human", "json"]
+                                .iter()
+                                .filter(|v| v.starts_with(current))
+                                .map(|v| v.to_string())
+                                .collect();
+                        }
+                    }
+                }
+                "getg" => {
+                    if token_index == 1 {
+                        candidates = global_key_candidates(current);
+                    }
+                }
                 "search" => {
                     candidates = search_flag_candidates(current);
+                }
+                "run" => {
+                    if token_index == 1 {
+                        candidates = ["--yes", "-y"]
+                            .iter()
+                            .filter(|v| v.starts_with(current))
+                            .map(|v| v.to_string())
+                            .collect();
+                    }
+                }
+                "output" => {
+                    if token_index == 1 {
+                        candidates = ["human", "json"]
+                            .iter()
+                            .filter(|v| v.starts_with(current))
+                            .map(|v| v.to_string())
+                            .collect();
+                    }
+                }
+                "policy" => {
+                    if token_index == 1 {
+                        candidates = ["enable", "disable"]
+                            .iter()
+                            .filter(|v| v.starts_with(current))
+                            .map(|v| v.to_string())
+                            .collect();
+                    } else if token_index == 2
+                        && matches!(tokens.get(1), Some(&"enable") | Some(&"disable"))
+                    {
+                        candidates = capability_candidates(current);
+                    }
                 }
                 "interact" => {
                     if token_index == 1 {
@@ -1217,6 +1462,26 @@ impl Repl {
                             Some(&"-k") | Some(&"--kill") | Some(&"-r") | Some(&"--read")
                         ) {
                             candidates = session_id_candidates(self, current);
+                        } else if matches!(tokens.get(1), Some(&"-K") | Some(&"--kill-all")) {
+                            candidates = ["--yes", "-y"]
+                                .iter()
+                                .filter(|v| v.starts_with(current))
+                                .map(|v| v.to_string())
+                                .collect();
+                        }
+                    } else if token_index == 3
+                        && matches!(tokens.get(1), Some(&"-k") | Some(&"--kill"))
+                    {
+                        if tokens
+                            .get(2)
+                            .and_then(|value| value.parse::<u32>().ok())
+                            .is_some()
+                        {
+                            candidates = ["--yes", "-y"]
+                                .iter()
+                                .filter(|v| v.starts_with(current))
+                                .map(|v| v.to_string())
+                                .collect();
                         }
                     }
                 }
@@ -1231,13 +1496,29 @@ impl Repl {
 
 fn command_candidates(prefix: &str) -> Vec<String> {
     let commands = [
-        "help", "show", "use", "search", "set", "get", "run", "sessions", "interact", "history",
-        "info", "exit", "quit",
+        "help", "show", "use", "search", "set", "get", "setg", "getg", "run", "output", "policy",
+        "sessions", "interact", "history", "info", "exit", "quit",
     ];
     commands
         .iter()
         .filter(|cmd| cmd.starts_with(prefix))
         .map(|cmd| cmd.to_string())
+        .collect()
+}
+
+fn capability_candidates(prefix: &str) -> Vec<String> {
+    all_capabilities()
+        .iter()
+        .map(|cap| cap.as_str().to_string())
+        .filter(|cap| cap.starts_with(prefix))
+        .collect()
+}
+
+fn global_key_candidates(prefix: &str) -> Vec<String> {
+    ["output_mode", "output"]
+        .iter()
+        .filter(|key| key.starts_with(prefix))
+        .map(|key| key.to_string())
         .collect()
 }
 
