@@ -6,6 +6,8 @@ use modules::{ModuleError, ModuleSession};
 const DEFAULT_STALE_TIMEOUT_SECS: u64 = 30 * 60;
 const DEFAULT_MAX_PENDING_BYTES: usize = 1024 * 1024;
 const DEFAULT_READ_DRAIN_BYTES: usize = 64 * 1024;
+const DEFAULT_PARTITION_ERROR_THRESHOLD: u32 = 3;
+const DEFAULT_PARTITION_GRACE_SECS: u64 = 5 * 60;
 
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
@@ -15,6 +17,9 @@ pub struct SessionSnapshot {
     pub target: String,
     pub is_open: bool,
     pub is_attached: bool,
+    pub is_partitioned: bool,
+    pub partition_age_secs: Option<u64>,
+    pub consecutive_errors: u32,
     pub pending_bytes: usize,
     pub idle_secs: u64,
 }
@@ -23,6 +28,7 @@ pub struct SessionSnapshot {
 pub struct SessionPollOutcome {
     pub id: u32,
     pub bytes_read: usize,
+    pub is_partitioned: bool,
     pub error: Option<String>,
 }
 
@@ -65,6 +71,8 @@ pub struct SessionEntry {
     handle: Box<dyn ModuleSession>,
     attached: bool,
     last_activity_at: u64,
+    consecutive_errors: u32,
+    partitioned_since: Option<u64>,
     pending: VecDeque<Vec<u8>>,
     pending_bytes: usize,
 }
@@ -81,6 +89,8 @@ impl SessionEntry {
             handle: session,
             attached: false,
             last_activity_at: now,
+            consecutive_errors: 0,
+            partitioned_since: None,
             pending: VecDeque::new(),
             pending_bytes: 0,
         }
@@ -94,20 +104,47 @@ impl SessionEntry {
         self.attached
     }
 
+    pub fn is_partitioned(&self) -> bool {
+        self.partitioned_since.is_some()
+    }
+
+    pub fn partition_age_secs(&self, now: u64) -> Option<u64> {
+        self.partitioned_since
+            .map(|since| now.saturating_sub(since))
+    }
+
     pub fn write(&mut self, input: &[u8], now: u64) -> Result<(), ModuleError> {
+        if self.is_partitioned() {
+            return Err(ModuleError::Execution(
+                "session is partitioned; waiting for recovery".to_string(),
+            ));
+        }
         self.handle.write(input).map(|_| {
-            self.last_activity_at = now;
+            self.mark_poll_success(now);
         })
     }
 
-    pub fn poll(&mut self, now: u64, max_pending_bytes: usize) -> Result<usize, ModuleError> {
-        let data = self.handle.read()?;
-        let bytes = data.len();
-        if bytes > 0 {
-            self.last_activity_at = now;
-            self.enqueue_pending(data, max_pending_bytes);
+    pub fn poll(
+        &mut self,
+        now: u64,
+        max_pending_bytes: usize,
+        partition_error_threshold: u32,
+    ) -> Result<usize, ModuleError> {
+        match self.handle.read() {
+            Ok(data) => {
+                let bytes = data.len();
+                if bytes > 0 {
+                    self.last_activity_at = now;
+                    self.enqueue_pending(data, max_pending_bytes);
+                }
+                self.mark_poll_success(now);
+                Ok(bytes)
+            }
+            Err(err) => {
+                self.mark_poll_error(now, partition_error_threshold);
+                Err(err)
+            }
         }
-        Ok(bytes)
     }
 
     pub fn close(&mut self) -> Result<(), ModuleError> {
@@ -131,7 +168,7 @@ impl SessionEntry {
             return Err(SessionManagerError::AlreadyAttached(self.id));
         }
         self.attached = true;
-        self.last_activity_at = now;
+        self.mark_poll_success(now);
         Ok(())
     }
 
@@ -140,7 +177,7 @@ impl SessionEntry {
             return Err(SessionManagerError::NotAttached(self.id));
         }
         self.attached = false;
-        self.last_activity_at = now;
+        self.mark_poll_success(now);
         Ok(())
     }
 
@@ -185,6 +222,19 @@ impl SessionEntry {
         }
         out
     }
+
+    fn mark_poll_success(&mut self, now: u64) {
+        self.last_activity_at = now;
+        self.consecutive_errors = 0;
+        self.partitioned_since = None;
+    }
+
+    fn mark_poll_error(&mut self, now: u64, threshold: u32) {
+        self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+        if self.consecutive_errors >= threshold.max(1) && self.partitioned_since.is_none() {
+            self.partitioned_since = Some(now);
+        }
+    }
 }
 
 pub struct SessionManager {
@@ -193,6 +243,8 @@ pub struct SessionManager {
     stale_timeout_secs: u64,
     max_pending_bytes: usize,
     default_drain_bytes: usize,
+    partition_error_threshold: u32,
+    partition_grace_secs: u64,
 }
 
 impl SessionManager {
@@ -201,12 +253,28 @@ impl SessionManager {
     }
 
     pub fn with_config(stale_timeout_secs: u64, max_pending_bytes: usize) -> Self {
+        Self::with_fault_config(
+            stale_timeout_secs,
+            max_pending_bytes,
+            DEFAULT_PARTITION_ERROR_THRESHOLD,
+            DEFAULT_PARTITION_GRACE_SECS,
+        )
+    }
+
+    pub fn with_fault_config(
+        stale_timeout_secs: u64,
+        max_pending_bytes: usize,
+        partition_error_threshold: u32,
+        partition_grace_secs: u64,
+    ) -> Self {
         Self {
             next_id: 1,
             entries: BTreeMap::new(),
             stale_timeout_secs,
             max_pending_bytes: max_pending_bytes.max(1),
             default_drain_bytes: DEFAULT_READ_DRAIN_BYTES,
+            partition_error_threshold: partition_error_threshold.max(1),
+            partition_grace_secs,
         }
     }
 
@@ -259,6 +327,9 @@ impl SessionManager {
                 target: entry.target.clone(),
                 is_open: entry.is_open(),
                 is_attached: entry.is_attached(),
+                is_partitioned: entry.is_partitioned(),
+                partition_age_secs: entry.partition_age_secs(now),
+                consecutive_errors: entry.consecutive_errors,
                 pending_bytes: entry.pending_bytes,
                 idle_secs: now.saturating_sub(entry.last_activity_at),
             })
@@ -287,7 +358,7 @@ impl SessionManager {
         if !entry.is_open() {
             return Ok(0);
         }
-        let bytes = entry.poll(now, self.max_pending_bytes)?;
+        let bytes = entry.poll(now, self.max_pending_bytes, self.partition_error_threshold)?;
         Ok(bytes)
     }
 
@@ -299,11 +370,21 @@ impl SessionManager {
                 Ok(bytes) => outcomes.push(SessionPollOutcome {
                     id,
                     bytes_read: bytes,
+                    is_partitioned: self
+                        .entries
+                        .get(&id)
+                        .map(|entry| entry.is_partitioned())
+                        .unwrap_or(false),
                     error: None,
                 }),
                 Err(err) => outcomes.push(SessionPollOutcome {
                     id,
                     bytes_read: 0,
+                    is_partitioned: self
+                        .entries
+                        .get(&id)
+                        .map(|entry| entry.is_partitioned())
+                        .unwrap_or(false),
                     error: Some(err.to_string()),
                 }),
             }
@@ -387,7 +468,7 @@ impl SessionManager {
             .entries
             .iter()
             .filter_map(|(id, entry)| {
-                if !entry.is_open() || entry.attached {
+                if !entry.is_open() || entry.attached || entry.is_partitioned() {
                     return None;
                 }
                 if entry.is_stale(now, self.stale_timeout_secs) {
@@ -398,6 +479,61 @@ impl SessionManager {
             .collect();
         let mut reaped = Vec::with_capacity(stale_ids.len());
         for id in stale_ids {
+            if let Some(mut entry) = self.entries.remove(&id) {
+                let _ = entry.close();
+                reaped.push(id);
+            }
+        }
+        reaped
+    }
+
+    pub fn recover_partitioned(&mut self) -> Vec<u32> {
+        let ids: Vec<u32> = self
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                if entry.is_open() && entry.is_partitioned() {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut recovered = Vec::new();
+        for id in ids {
+            if self.poll(id).is_ok()
+                && self
+                    .entries
+                    .get(&id)
+                    .map(|entry| !entry.is_partitioned())
+                    .unwrap_or(false)
+            {
+                recovered.push(id);
+            }
+        }
+        recovered
+    }
+
+    pub fn reap_partitioned(&mut self) -> Vec<u32> {
+        let now = now_secs();
+        let ids: Vec<u32> = self
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                if entry.attached || !entry.is_partitioned() {
+                    return None;
+                }
+                let age = entry.partition_age_secs(now).unwrap_or(0);
+                if age >= self.partition_grace_secs {
+                    return Some(*id);
+                }
+                None
+            })
+            .collect();
+
+        let mut reaped = Vec::with_capacity(ids.len());
+        for id in ids {
             if let Some(mut entry) = self.entries.remove(&id) {
                 let _ = entry.close();
                 reaped.push(id);
@@ -419,7 +555,7 @@ mod tests {
 
     struct DummySession {
         open: bool,
-        pending_reads: VecDeque<Vec<u8>>,
+        pending_reads: VecDeque<Result<Vec<u8>, ModuleError>>,
         writes: Vec<Vec<u8>>,
     }
 
@@ -452,7 +588,9 @@ mod tests {
         }
 
         fn read(&mut self) -> Result<Vec<u8>, ModuleError> {
-            Ok(self.pending_reads.pop_front().unwrap_or_default())
+            self.pending_reads
+                .pop_front()
+                .unwrap_or_else(|| Ok(Vec::new()))
         }
 
         fn close(&mut self) -> Result<(), ModuleError> {
@@ -486,9 +624,9 @@ mod tests {
     fn manager_multiplex_poll_and_buffer_reads() {
         let mut manager = SessionManager::new();
         let mut a = DummySession::new();
-        a.pending_reads.push_back(b"alpha".to_vec());
+        a.pending_reads.push_back(Ok(b"alpha".to_vec()));
         let mut b = DummySession::new();
-        b.pending_reads.push_back(b"beta".to_vec());
+        b.pending_reads.push_back(Ok(b"beta".to_vec()));
         let a_id = manager.register("aux/a".to_string(), Box::new(a));
         let b_id = manager.register("aux/b".to_string(), Box::new(b));
 
@@ -509,5 +647,51 @@ mod tests {
         assert_eq!(reaped, vec![stale_id]);
         assert!(!manager.has(stale_id));
         assert!(manager.has(attached_id));
+    }
+
+    #[test]
+    fn manager_detects_and_recovers_partitioned_sessions() {
+        let mut manager = SessionManager::with_fault_config(30, 1024, 2, 300);
+        let mut flaky = DummySession::new();
+        flaky
+            .pending_reads
+            .push_back(Err(ModuleError::Execution("network timeout".to_string())));
+        flaky
+            .pending_reads
+            .push_back(Err(ModuleError::Execution("network timeout".to_string())));
+        flaky.pending_reads.push_back(Ok(b"recovered".to_vec()));
+
+        let id = manager.register("aux/flaky".to_string(), Box::new(flaky));
+
+        let first = manager.poll(id);
+        assert!(first.is_err());
+        assert!(!manager.snapshots()[0].is_partitioned);
+
+        let second = manager.poll(id);
+        assert!(second.is_err());
+        assert!(manager.snapshots()[0].is_partitioned);
+
+        let recovered = manager.recover_partitioned();
+        assert_eq!(recovered, vec![id]);
+        assert!(!manager.snapshots()[0].is_partitioned);
+        assert_eq!(manager.read_buffered(id).expect("read"), b"recovered");
+    }
+
+    #[test]
+    fn manager_reaps_partitioned_sessions_after_grace_period() {
+        let mut manager = SessionManager::with_fault_config(30, 1024, 1, 0);
+        let mut flaky = DummySession::new();
+        flaky
+            .pending_reads
+            .push_back(Err(ModuleError::Execution("partition".to_string())));
+        let id = manager.register("aux/flaky".to_string(), Box::new(flaky));
+
+        let poll = manager.poll(id);
+        assert!(poll.is_err());
+        assert!(manager.snapshots()[0].is_partitioned);
+
+        let reaped = manager.reap_partitioned();
+        assert_eq!(reaped, vec![id]);
+        assert!(!manager.has(id));
     }
 }

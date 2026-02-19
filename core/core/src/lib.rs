@@ -5,6 +5,7 @@ pub mod ids;
 pub mod log;
 pub mod observability;
 pub mod orchestrator;
+pub mod reliability;
 pub mod time;
 
 pub use error::{CoreError, CoreResult};

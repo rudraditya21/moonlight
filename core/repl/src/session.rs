@@ -62,8 +62,26 @@ impl Repl {
             for outcome in self.sessions.poll_all() {
                 _polled_bytes = _polled_bytes.saturating_add(outcome.bytes_read);
                 if let Some(err) = outcome.error {
-                    eprintln!("session {} poll error: {}", outcome.id, err);
+                    if outcome.is_partitioned {
+                        eprintln!("session {} partitioned: {}", outcome.id, err);
+                    } else {
+                        eprintln!("session {} poll error: {}", outcome.id, err);
+                    }
                 }
+            }
+            let recovered = self.sessions.recover_partitioned();
+            if !recovered.is_empty() {
+                println!(
+                    "{}",
+                    self.palette.success(&format!(
+                        "Recovered partitioned session(s): {}",
+                        recovered
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                );
             }
             let reaped_stale = self.sessions.reap_stale();
             if !reaped_stale.is_empty() {
@@ -73,6 +91,20 @@ impl Repl {
                         "Reaped {} stale session(s): {}",
                         reaped_stale.len(),
                         reaped_stale
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                );
+            }
+            let reaped_partitioned = self.sessions.reap_partitioned();
+            if !reaped_partitioned.is_empty() {
+                println!(
+                    "{}",
+                    self.palette.warning(&format!(
+                        "Reaped partitioned session(s): {}",
+                        reaped_partitioned
                             .iter()
                             .map(|id| id.to_string())
                             .collect::<Vec<_>>()
@@ -473,7 +505,14 @@ impl Repl {
                 headers[7].len(),
             ];
             for snap in snapshots {
-                let state = if snap.is_open { "open" } else { "closed" }.to_string();
+                let state = if !snap.is_open {
+                    "closed".to_string()
+                } else if snap.is_partitioned {
+                    let age = snap.partition_age_secs.unwrap_or(0);
+                    format!("partitioned({age}s,e={})", snap.consecutive_errors)
+                } else {
+                    "open".to_string()
+                };
                 let attach = if snap.is_attached {
                     "attached".to_string()
                 } else {
@@ -610,8 +649,26 @@ impl Repl {
             "-R" | "--read-all" => {
                 for outcome in self.sessions.poll_all() {
                     if let Some(err) = outcome.error {
-                        eprintln!("session {} poll error: {}", outcome.id, err);
+                        if outcome.is_partitioned {
+                            eprintln!("session {} partitioned: {}", outcome.id, err);
+                        } else {
+                            eprintln!("session {} poll error: {}", outcome.id, err);
+                        }
                     }
+                }
+                let recovered = self.sessions.recover_partitioned();
+                if !recovered.is_empty() {
+                    println!(
+                        "{}",
+                        self.palette.success(&format!(
+                            "Recovered partitioned session(s): {}",
+                            recovered
+                                .iter()
+                                .map(|id| id.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    );
                 }
                 let outputs = self.sessions.read_all_background();
                 if outputs.is_empty() {
