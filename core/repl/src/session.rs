@@ -1,6 +1,10 @@
 use std::collections::HashSet;
+use std::io::{self, Write};
 
 use corelib::ids::Id;
+use corelib::policy::{
+    Capability, DecisionKind, ModuleContext as PolicyModuleContext, PolicyEngine, PolicyRequest,
+};
 use modules::{
     load_dyn_module, Module, ModuleCatalog, ModuleCategory, ModuleContext, ModuleRank,
     ModuleRegistry, SearchQuery,
@@ -39,6 +43,7 @@ pub struct Repl {
     active: Option<Box<dyn Module>>,
     session_id: Id,
     sessions: SessionManager,
+    policy: PolicyEngine,
     palette: Palette,
 }
 
@@ -52,6 +57,7 @@ impl Repl {
             active: None,
             session_id: Id::next(),
             sessions: SessionManager::new(),
+            policy: PolicyEngine::new(),
             palette: Palette::new(),
         }
     }
@@ -158,7 +164,8 @@ impl Repl {
             "search" => self.cmd_search(tokens),
             "set" => self.cmd_set(tokens),
             "get" => self.cmd_get(tokens),
-            "run" => self.cmd_run(),
+            "run" => self.cmd_run(tokens),
+            "policy" => self.cmd_policy(tokens),
             "info" => self.cmd_info(tokens),
             "sessions" => self.cmd_sessions(tokens),
             "interact" => self.cmd_interact(tokens),
@@ -182,6 +189,10 @@ impl Repl {
         println!("  set <opt> <value>    Set module option");
         println!("  get <opt>            Get module option");
         println!("  run                  Execute module");
+        println!("  run --yes            Execute without prompt when confirmation is required");
+        println!("  policy               Show guardrail policy and capabilities");
+        println!("  policy enable <cap>  Enable a capability (exploit_execution, payload_execution, evasion_execution, public_targets, wide_target_scope, bulk_session_control)");
+        println!("  policy disable <cap> Disable a capability");
         println!("  sessions             List sessions");
         println!("  sessions -k <id>     Close a session");
         println!("  sessions -K          Close all sessions");
@@ -436,8 +447,8 @@ impl Repl {
         print_aligned_owned_rows(&rows);
     }
 
-    fn cmd_run(&mut self) {
-        let Some(module) = &mut self.active else {
+    fn cmd_run(&mut self, tokens: &[String]) {
+        let Some(module) = self.active.as_ref() else {
             println!("{}", self.palette.warning("No active module."));
             return;
         };
@@ -449,8 +460,66 @@ impl Repl {
             );
             return;
         }
+        let metadata = module.metadata().clone();
+        let target = extract_target_from_options(module.options());
+        let policy_module = match PolicyModuleContext::new(
+            &metadata.name,
+            metadata.category.as_str(),
+            metadata.rank.as_str(),
+            metadata.tags.clone(),
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                println!(
+                    "{}",
+                    self.palette.error(&format!("Policy metadata error: {err}"))
+                );
+                return;
+            }
+        };
+        let decision = self.policy.evaluate(&PolicyRequest::execute_module(
+            policy_module,
+            target.clone(),
+        ));
+        let explicit_yes = tokens
+            .iter()
+            .any(|token| token.eq_ignore_ascii_case("--yes") || token.eq_ignore_ascii_case("-y"));
+
+        match decision.kind {
+            DecisionKind::Deny => {
+                println!(
+                    "{}",
+                    self.palette
+                        .error(&format!("Policy blocked run: {}", decision.reason))
+                );
+                println!(
+                    "{}",
+                    self.palette
+                        .info("Use `policy` to inspect/enable capabilities before retrying.")
+                );
+                return;
+            }
+            DecisionKind::RequireConfirmation if !explicit_yes => {
+                if !self
+                    .confirm_intent(&format!("{} [yes/no]: ", decision.reason))
+                    .unwrap_or(false)
+                {
+                    println!(
+                        "{}",
+                        self.palette.warning("Run canceled by policy confirmation.")
+                    );
+                    return;
+                }
+            }
+            _ => {}
+        }
+
         let ctx = ModuleContext {
             session_id: self.session_id.0,
+        };
+        let Some(module) = self.active.as_mut() else {
+            println!("{}", self.palette.warning("No active module."));
+            return;
         };
         let module_name = module.metadata().name.clone();
         match module.run(&ctx) {
@@ -605,6 +674,29 @@ impl Repl {
                     println!("{}", self.palette.error("Session id must be an integer."));
                     return;
                 };
+                let explicit_yes = tokens
+                    .iter()
+                    .any(|token| token.eq_ignore_ascii_case("--yes") || token.eq_ignore_ascii_case("-y"));
+                let decision = self.policy.evaluate(&PolicyRequest::close_session());
+                match decision.kind {
+                    DecisionKind::Deny => {
+                        println!(
+                            "{}",
+                            self.palette.error(&format!("Policy blocked session close: {}", decision.reason))
+                        );
+                        return;
+                    }
+                    DecisionKind::RequireConfirmation if !explicit_yes => {
+                        if !self
+                            .confirm_intent(&format!("{} [yes/no]: ", decision.reason))
+                            .unwrap_or(false)
+                        {
+                            println!("{}", self.palette.warning("Session close canceled."));
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
                 match self.sessions.close_and_remove(id) {
                     Ok(true) => {
                         println!("{}", self.palette.success(&format!("Session {id} closed.")))
@@ -680,21 +772,115 @@ impl Repl {
                     print!("{}", String::from_utf8_lossy(&bytes));
                 }
             }
-            "-K" | "--kill-all" => match self.sessions.close_all() {
-                Ok(count) => println!(
-                    "{}",
-                    self.palette.success(&format!("Closed {count} session(s)."))
-                ),
-                Err(err) => println!(
-                    "{}",
-                    self.palette
-                        .error(&format!("Failed to close sessions: {err}"))
-                ),
-            },
+            "-K" | "--kill-all" => {
+                let explicit_yes = tokens
+                    .iter()
+                    .any(|token| token.eq_ignore_ascii_case("--yes") || token.eq_ignore_ascii_case("-y"));
+                let decision = self.policy.evaluate(&PolicyRequest::close_all_sessions());
+                match decision.kind {
+                    DecisionKind::Deny => {
+                        println!(
+                            "{}",
+                            self.palette
+                                .error(&format!("Policy blocked close-all: {}", decision.reason))
+                        );
+                        return;
+                    }
+                    DecisionKind::RequireConfirmation if !explicit_yes => {
+                        if !self
+                            .confirm_intent(&format!("{} [yes/no]: ", decision.reason))
+                            .unwrap_or(false)
+                        {
+                            println!("{}", self.palette.warning("Close-all canceled."));
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+
+                match self.sessions.close_all() {
+                    Ok(count) => println!(
+                        "{}",
+                        self.palette.success(&format!("Closed {count} session(s)."))
+                    ),
+                    Err(err) => println!(
+                        "{}",
+                        self.palette
+                            .error(&format!("Failed to close sessions: {err}"))
+                    ),
+                }
+            }
             _ => println!(
                 "{}",
                 self.palette
-                    .warning("Usage: sessions | sessions -k <id> | sessions -K | sessions -r <id> | sessions -R")
+                    .warning("Usage: sessions | sessions -k <id> [--yes] | sessions -K [--yes] | sessions -r <id> | sessions -R")
+            ),
+        }
+    }
+
+    fn cmd_policy(&mut self, tokens: &[String]) {
+        if tokens.len() == 1 {
+            let granted = self.policy.granted_capabilities();
+            println!("{}", self.palette.info("Policy Guardrails"));
+            if granted.is_empty() {
+                println!(
+                    "{}",
+                    self.palette
+                        .warning("No elevated capabilities enabled (safe-by-default mode active).")
+                );
+            } else {
+                println!("Enabled capabilities:");
+                for capability in granted {
+                    println!("  - {}", capability.as_str());
+                }
+            }
+            println!("Available capabilities:");
+            for capability in all_capabilities() {
+                println!("  - {}", capability.as_str());
+            }
+            return;
+        }
+
+        if tokens.len() < 3 {
+            println!(
+                "{}",
+                self.palette
+                    .warning("Usage: policy <enable|disable> <capability>")
+            );
+            return;
+        }
+
+        let action = tokens[1].to_ascii_lowercase();
+        let Some(capability) = Capability::parse(&tokens[2]) else {
+            println!(
+                "{}",
+                self.palette
+                    .error(&format!("Unknown capability: {}", tokens[2]))
+            );
+            return;
+        };
+
+        match action.as_str() {
+            "enable" => {
+                self.policy.grant(capability);
+                println!(
+                    "{}",
+                    self.palette
+                        .success(&format!("Enabled capability: {}", capability.as_str()))
+                );
+            }
+            "disable" => {
+                self.policy.revoke(capability);
+                println!(
+                    "{}",
+                    self.palette
+                        .success(&format!("Disabled capability: {}", capability.as_str()))
+                );
+            }
+            _ => println!(
+                "{}",
+                self.palette
+                    .warning("Usage: policy <enable|disable> <capability>")
             ),
         }
     }
@@ -870,6 +1056,19 @@ impl Repl {
             format!("{}> ", base)
         }
     }
+
+    fn confirm_intent(&self, prompt: &str) -> Result<bool, ReplError> {
+        print!("{prompt}");
+        io::stdout()
+            .flush()
+            .map_err(|e| ReplError::Io(e.to_string()))?;
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| ReplError::Io(e.to_string()))?;
+        let answer = input.trim().to_ascii_lowercase();
+        Ok(matches!(answer.as_str(), "yes" | "y"))
+    }
 }
 
 trait ModuleOptionExt {
@@ -897,6 +1096,42 @@ fn normalize_prompt(prompt: &str) -> String {
     } else {
         base.to_string()
     }
+}
+
+fn extract_target_from_options(options: &modules::ModuleOptions) -> Option<String> {
+    const TARGET_KEYS: &[&str] = &[
+        "rhost",
+        "rhosts",
+        "target",
+        "host",
+        "address",
+        "ip",
+        "remote_host",
+    ];
+
+    for option in options.iter() {
+        if TARGET_KEYS
+            .iter()
+            .any(|key| option.name.eq_ignore_ascii_case(key))
+        {
+            let value = option.value_as_string();
+            if !value.trim().is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn all_capabilities() -> &'static [Capability] {
+    &[
+        Capability::ExploitExecution,
+        Capability::PayloadExecution,
+        Capability::EvasionExecution,
+        Capability::PublicTargets,
+        Capability::WideTargetScope,
+        Capability::BulkSessionControl,
+    ]
 }
 
 struct ReplCompleter<'a> {
