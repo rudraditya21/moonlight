@@ -9,7 +9,18 @@ pub fn run(config: Config) -> Result<(), ReplError> {
     let registry = build_registry().map_err(|e| ReplError::Registry(e.to_string()))?;
     let catalog =
         match ModuleCatalog::load(Path::new(&config.module_path), Path::new(&config.cache_dir)) {
-            Ok(catalog) => Some(catalog),
+            Ok(catalog) => {
+                if !catalog.validation_errors().is_empty() {
+                    eprintln!(
+                        "Module catalog validation rejected {} manifest(s):",
+                        catalog.validation_errors().len()
+                    );
+                    for err in catalog.validation_errors() {
+                        eprintln!("  - {err}");
+                    }
+                }
+                Some(catalog)
+            }
             Err(err) => {
                 eprintln!("Module catalog load error: {err}");
                 None

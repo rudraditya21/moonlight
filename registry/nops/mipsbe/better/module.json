@@ -1,4 +1,7 @@
 {
+  "manifest_version": 1,
+  "module_api_version": 1,
+  "runtime": "builtin",
   "name": "nops/mipsbe/better",
   "description": "Mixed MIPS (big endian) NOP generator",
   "category": "nop",
@@ -10,5 +13,6 @@
   "tags": [
     "nop",
     "mipsbe"
-  ]
+  ],
+  "entrypoint": "module.rs"
 }

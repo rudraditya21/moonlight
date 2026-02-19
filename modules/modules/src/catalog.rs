@@ -7,6 +7,7 @@ use corelib::error::{CoreError, CoreResult};
 use phf::PhfMap;
 
 use crate::cache::CachedEntry;
+use crate::contract::ModuleCompatibilityPolicy;
 use crate::hash::{
     ensure_dir, file_fingerprint_with_hash, file_metadata_fingerprint, read_to_string,
 };
@@ -116,6 +117,7 @@ pub struct ModuleCatalog {
     token_index: Option<StringIndex>,
     category_index: Vec<Vec<usize>>,
     rank_index: Vec<Vec<usize>>,
+    validation_errors: Vec<String>,
 }
 
 impl ModuleCatalog {
@@ -146,7 +148,10 @@ impl ModuleCatalog {
                 }
             })
             .collect::<Vec<_>>();
-        let mut results = process_manifest_tasks(tasks, &cache_map)?;
+        let policy = ModuleCompatibilityPolicy::catalog_default();
+        let task_results = process_manifest_tasks(tasks, &cache_map, &policy)?;
+        let mut results = task_results.processed;
+        let validation_errors = task_results.errors;
 
         let needs_rewrite = loaded_index
             .as_ref()
@@ -156,7 +161,9 @@ impl ModuleCatalog {
             && results.len() == cache_map.len()
             && results.iter().all(|item| item.fast_match);
         if unchanged && !needs_rewrite {
-            return Ok(catalog_from_index(loaded_index.unwrap(), root));
+            let mut catalog = catalog_from_index(loaded_index.unwrap(), root);
+            catalog.validation_errors = validation_errors;
+            return Ok(catalog);
         }
 
         results.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -172,7 +179,8 @@ impl ModuleCatalog {
             });
         }
 
-        let catalog = ModuleCatalog::from_records(records)?;
+        let mut catalog = ModuleCatalog::from_records(records)?;
+        catalog.validation_errors = validation_errors;
         save_index(&index_path, &cached_entries, &catalog)?;
         Ok(catalog)
     }
@@ -187,6 +195,10 @@ impl ModuleCatalog {
 
     pub fn has_name_index(&self) -> bool {
         self.name_index.is_some()
+    }
+
+    pub fn validation_errors(&self) -> &[String] {
+        &self.validation_errors
     }
 
     pub fn get_by_name(&self, name: &str) -> Option<&ModuleRecord> {
@@ -371,6 +383,7 @@ impl ModuleCatalog {
             token_index,
             category_index,
             rank_index,
+            validation_errors: Vec::new(),
         })
     }
 }
@@ -390,12 +403,19 @@ struct ManifestProcessed {
     fast_match: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ManifestTaskBatch {
+    processed: Vec<ManifestProcessed>,
+    errors: Vec<String>,
+}
+
 fn process_manifest_tasks(
     tasks: Vec<ManifestTask>,
     cache_map: &HashMap<String, CachedEntry>,
-) -> CoreResult<Vec<ManifestProcessed>> {
+    policy: &ModuleCompatibilityPolicy,
+) -> CoreResult<ManifestTaskBatch> {
     if tasks.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ManifestTaskBatch::default());
     }
     let worker_count = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -403,36 +423,50 @@ fn process_manifest_tasks(
     let workers = worker_count.min(tasks.len()).max(1);
     let chunk_size = (tasks.len() + workers - 1) / workers;
     let cache_map = Arc::new(cache_map.clone());
+    let policy = Arc::new(*policy);
     let mut handles = Vec::with_capacity(workers);
     for chunk in tasks.chunks(chunk_size) {
         let cache_map = Arc::clone(&cache_map);
+        let policy = Arc::clone(&policy);
         let chunk_vec = chunk.to_vec();
-        handles.push(thread::spawn(
-            move || -> CoreResult<Vec<ManifestProcessed>> {
-                let mut out = Vec::with_capacity(chunk_vec.len());
-                for task in chunk_vec {
-                    out.push(process_manifest_task(task, &cache_map)?);
+        handles.push(thread::spawn(move || -> CoreResult<ManifestTaskBatch> {
+            let mut out = Vec::with_capacity(chunk_vec.len());
+            let mut errors = Vec::new();
+            for task in chunk_vec {
+                match process_manifest_task(task, &cache_map, &policy) {
+                    Ok(item) => out.push(item),
+                    Err(err) => errors.push(err),
                 }
-                Ok(out)
-            },
-        ));
+            }
+            Ok(ManifestTaskBatch {
+                processed: out,
+                errors,
+            })
+        }));
     }
 
     let mut results = Vec::with_capacity(tasks.len());
+    let mut errors = Vec::new();
     for handle in handles {
         let chunk = handle
             .join()
             .map_err(|_| CoreError::Message("manifest worker panicked".to_string()))??;
-        results.extend(chunk);
+        results.extend(chunk.processed);
+        errors.extend(chunk.errors);
     }
-    Ok(results)
+    Ok(ManifestTaskBatch {
+        processed: results,
+        errors,
+    })
 }
 
 fn process_manifest_task(
     task: ManifestTask,
     cache_map: &HashMap<String, CachedEntry>,
-) -> CoreResult<ManifestProcessed> {
-    let (size, mtime) = file_metadata_fingerprint(&task.manifest_path)?;
+    policy: &ModuleCompatibilityPolicy,
+) -> Result<ManifestProcessed, String> {
+    let (size, mtime) =
+        file_metadata_fingerprint(&task.manifest_path).map_err(|e| e.to_string())?;
     if let Some(entry) = cache_map.get(&task.rel_path) {
         if entry.fingerprint.matches_fast(size, mtime) {
             return Ok(ManifestProcessed {
@@ -444,11 +478,15 @@ fn process_manifest_task(
             });
         }
     }
-    let content = read_to_string(&task.manifest_path)?;
-    let manifest = ModuleManifest::parse_str(&content)
-        .map_err(|e| CoreError::Parse(format!("{}: {}", task.rel_path, e)))?;
+    let content = read_to_string(&task.manifest_path).map_err(|e| e.to_string())?;
+    let manifest =
+        ModuleManifest::parse_str(&content).map_err(|e| format!("{}: {}", task.rel_path, e))?;
+    manifest
+        .validate_against_policy(policy)
+        .map_err(|e| format!("{}: {}", task.rel_path, e))?;
     let metadata = manifest.metadata;
-    let fingerprint = file_fingerprint_with_hash(&task.manifest_path, size, mtime)?;
+    let fingerprint =
+        file_fingerprint_with_hash(&task.manifest_path, size, mtime).map_err(|e| e.to_string())?;
     Ok(ManifestProcessed {
         manifest_path: task.manifest_path,
         rel_path: task.rel_path,
@@ -481,6 +519,7 @@ fn catalog_from_index(index: LoadedIndex, root: &Path) -> ModuleCatalog {
         token_index: index.token_index,
         category_index: index.category_index,
         rank_index: index.rank_index,
+        validation_errors: Vec::new(),
     }
 }
 
@@ -1321,7 +1360,7 @@ mod tests {
             .collect::<Vec<String>>()
             .join(",");
         let content = format!(
-            "{{\n  \"name\": \"{}\",\n  \"description\": \"{}\",\n  \"category\": \"{}\",\n  \"author\": \"me\",\n  \"tags\": [{}]\n}}",
+            "{{\n  \"manifest_version\": 1,\n  \"module_api_version\": 1,\n  \"runtime\": \"builtin\",\n  \"name\": \"{}\",\n  \"description\": \"{}\",\n  \"category\": \"{}\",\n  \"rank\": \"normal\",\n  \"author\": \"me\",\n  \"platforms\": [\"cross\"],\n  \"tags\": [{}],\n  \"entrypoint\": \"module.rs\"\n}}",
             name, name, category, tags_json
         );
         std::fs::write(path, content).expect("write manifest");
@@ -1338,7 +1377,7 @@ mod tests {
         std::fs::create_dir_all(&mod_b).expect("create b");
         write_manifest(
             &mod_a.join("module.json"),
-            "aux/http/test",
+            "auxiliary/http/test",
             "auxiliary",
             &["http"],
         );
@@ -1357,7 +1396,62 @@ mod tests {
         query.tags.push("http".to_string());
         let results = catalog.search(&query);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].metadata.name, "aux/http/test");
+        assert_eq!(results[0].metadata.name, "auxiliary/http/test");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn invalid_manifest_is_rejected_without_blocking_valid_entries() {
+        let root = std::env::temp_dir().join("moonlight_catalog_invalid_manifest_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        let valid = root.join("valid");
+        let invalid = root.join("invalid");
+        std::fs::create_dir_all(&valid).expect("create valid");
+        std::fs::create_dir_all(&invalid).expect("create invalid");
+        write_manifest(
+            &valid.join("module.json"),
+            "auxiliary/http/valid",
+            "auxiliary",
+            &["http"],
+        );
+
+        std::fs::write(
+            invalid.join("module.json"),
+            r#"{
+  "manifest_version": 1,
+  "module_api_version": 99,
+  "runtime": "builtin",
+  "name": "auxiliary/http/invalid",
+  "description": "Invalid",
+  "category": "auxiliary",
+  "rank": "normal",
+  "author": "me",
+  "platforms": ["cross"],
+  "tags": ["http"],
+  "entrypoint": "module.rs"
+}"#,
+        )
+        .expect("write invalid manifest");
+
+        let cache_dir = root.join(".cache");
+        let catalog = ModuleCatalog::load(&root, &cache_dir).expect("load catalog");
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(
+            catalog
+                .get_by_name("auxiliary/http/valid")
+                .expect("valid module")
+                .metadata
+                .name,
+            "auxiliary/http/valid"
+        );
+        assert_eq!(catalog.validation_errors().len(), 1);
+        assert!(
+            catalog.validation_errors()[0].contains("unsupported module_api_version"),
+            "error: {}",
+            catalog.validation_errors()[0]
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

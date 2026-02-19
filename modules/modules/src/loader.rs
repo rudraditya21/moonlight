@@ -2,6 +2,7 @@ use std::ffi::{CStr, CString};
 use std::path::Path;
 
 use crate::base::{Module, ModuleContext, ModuleError, ModuleResult};
+use crate::contract::ModuleCompatibilityPolicy;
 use crate::json::{parse_json, JsonValue};
 use crate::manifest::ModuleManifest;
 use crate::metadata::ModuleMetadata;
@@ -39,11 +40,15 @@ pub fn load_dyn_module(path: &Path) -> Result<Box<dyn Module>, ModuleError> {
         ));
     }
     let api = unsafe { &*api_ptr };
-    validate_api(api)?;
+    let exported_api_version = validate_api(api)?;
 
     let metadata_json = read_api_string(api.get_metadata_json, api.free_string)?;
     let manifest = ModuleManifest::parse_str(&metadata_json)
         .map_err(|e| ModuleError::Execution(format!("metadata parse error: {e}")))?;
+    let policy = ModuleCompatibilityPolicy::dynlib_loader_default();
+    manifest
+        .validate_dynlib_compatibility(&policy, exported_api_version)
+        .map_err(|e| ModuleError::Execution(format!("metadata compatibility error: {e}")))?;
     let metadata = manifest.metadata;
     let options = if let Some(get_options) = api.get_options_json {
         let options_json = read_api_string(Some(get_options), api.free_string)?;
@@ -154,8 +159,9 @@ impl Drop for DynModule {
 
 unsafe impl Send for DynModule {}
 
-fn validate_api(api: &ModuleApiV1) -> Result<(), ModuleError> {
-    if api.api_version != 1 {
+fn validate_api(api: &ModuleApiV1) -> Result<u32, ModuleError> {
+    let policy = ModuleCompatibilityPolicy::dynlib_loader_default();
+    if !policy.supports_module_api_version(api.api_version) {
         return Err(ModuleError::Execution(format!(
             "unsupported API version: {}",
             api.api_version
@@ -174,7 +180,7 @@ fn validate_api(api: &ModuleApiV1) -> Result<(), ModuleError> {
     if api.free_string.is_none() {
         return Err(ModuleError::Execution("missing free_string()".to_string()));
     }
-    Ok(())
+    Ok(api.api_version)
 }
 
 fn read_api_string(

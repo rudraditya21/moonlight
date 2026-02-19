@@ -2,6 +2,7 @@ mod base;
 mod builtins;
 mod cache;
 mod catalog;
+mod contract;
 mod crypto;
 mod exploit;
 mod hash;
@@ -18,6 +19,7 @@ pub use base::{
 };
 pub use builtins::register_builtin_modules;
 pub use catalog::{ModuleCatalog, ModuleRecord, SearchQuery};
+pub use contract::{ModuleCompatibilityPolicy, ModuleRuntime};
 pub use loader::load_dyn_module;
 pub use metadata::{ModuleCategory, ModuleMetadata, ModuleRank, ModuleReference};
 pub use options::{ModuleOption, ModuleOptionKind, ModuleOptionValue, ModuleOptions};
