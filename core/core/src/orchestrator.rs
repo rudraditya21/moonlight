@@ -242,6 +242,19 @@ struct ExecutionSnapshot {
     idempotency: Vec<IdempotencyRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrchestratorLimits {
+    pub max_pending_tasks: usize,
+}
+
+impl Default for OrchestratorLimits {
+    fn default() -> Self {
+        Self {
+            max_pending_tasks: usize::MAX,
+        }
+    }
+}
+
 pub trait SnapshotStore {
     fn load_snapshot(&mut self) -> Result<Option<String>, OrchestratorError>;
     fn save_snapshot(&mut self, snapshot: &str) -> Result<(), OrchestratorError>;
@@ -582,16 +595,22 @@ pub struct ExecutionOrchestrator<S: SnapshotStore> {
     tasks: BTreeMap<TaskId, ScheduledTask>,
     queue: VecDeque<TaskId>,
     idempotency: BTreeMap<String, IdempotencyRecord>,
+    limits: OrchestratorLimits,
 }
 
 impl<S: SnapshotStore> ExecutionOrchestrator<S> {
     pub fn new(store: S) -> Result<Self, OrchestratorError> {
+        Self::with_limits(store, OrchestratorLimits::default())
+    }
+
+    pub fn with_limits(store: S, limits: OrchestratorLimits) -> Result<Self, OrchestratorError> {
         let mut this = Self {
             store,
             runs: BTreeMap::new(),
             tasks: BTreeMap::new(),
             queue: VecDeque::new(),
             idempotency: BTreeMap::new(),
+            limits,
         };
 
         if let Some(raw) = this.store.load_snapshot()? {
@@ -618,6 +637,14 @@ impl<S: SnapshotStore> ExecutionOrchestrator<S> {
         request: RunRequest,
         plan: RunPlan,
     ) -> Result<RunId, OrchestratorError> {
+        if self.queue.len().saturating_add(plan.tasks.len()) > self.limits.max_pending_tasks {
+            return Err(OrchestratorError::Validation(format!(
+                "queue pressure exceeded: pending={} incoming={} limit={}",
+                self.queue.len(),
+                plan.tasks.len(),
+                self.limits.max_pending_tasks
+            )));
+        }
         let now = now_secs();
         let run = Run::new_at(
             request.workspace_id,
@@ -2658,6 +2685,10 @@ fn parse_task_state(state: &str) -> Result<TaskState, OrchestratorError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::performance::{PerformanceBudget, PerformanceSample};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+    use std::time::Instant;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Behavior {
@@ -2748,6 +2779,23 @@ mod tests {
                 }
             };
             Ok(report)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FastSuccessExecutor;
+
+    impl TaskExecutor for FastSuccessExecutor {
+        fn execute(
+            &mut self,
+            _context: &TaskExecutionContext,
+        ) -> Result<TaskExecutionReport, OrchestratorError> {
+            Ok(TaskExecutionReport {
+                elapsed_ms: 1,
+                outcome: TaskExecutionOutcome::Success {
+                    message: "ok".to_string(),
+                },
+            })
         }
     }
 
@@ -2977,6 +3025,170 @@ mod tests {
             Some(&1),
             "executor side effect should occur once for same idempotency key"
         );
+    }
+
+    #[test]
+    fn queue_pressure_rejects_new_runs_beyond_limit() {
+        let store = InMemorySnapshotStore::default();
+        let mut orchestrator = ExecutionOrchestrator::with_limits(
+            store,
+            OrchestratorLimits {
+                max_pending_tasks: 1,
+            },
+        )
+        .expect("new");
+
+        orchestrator
+            .submit_run(
+                basic_request(),
+                RunPlan::new(vec![PlannedTask::new("first", 1, 100, "k1").expect("task")])
+                    .expect("plan"),
+            )
+            .expect("submit first");
+
+        let err = orchestrator
+            .submit_run(
+                basic_request(),
+                RunPlan::new(vec![PlannedTask::new("second", 1, 100, "k2").expect("task")])
+                    .expect("plan"),
+            )
+            .expect_err("queue limit should reject second run");
+        assert!(
+            err.to_string().contains("queue pressure exceeded"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn concurrent_run_and_queue_pressure_load_meets_budget_regression_gates() {
+        const SUBMIT_THREADS: usize = 4;
+        const RUNS_PER_THREAD: usize = 50;
+        const TASKS_PER_RUN: usize = 3;
+        const TOTAL_RUNS: usize = SUBMIT_THREADS * RUNS_PER_THREAD;
+        const TOTAL_TASKS: usize = TOTAL_RUNS * TASKS_PER_RUN;
+
+        let store = InMemorySnapshotStore::default();
+        let orchestrator = Arc::new(Mutex::new(
+            ExecutionOrchestrator::with_limits(
+                store,
+                OrchestratorLimits {
+                    max_pending_tasks: 20_000,
+                },
+            )
+            .expect("new"),
+        ));
+        let run_ids = Arc::new(Mutex::new(Vec::<RunId>::new()));
+
+        let submit_start = Instant::now();
+        let mut submit_workers = Vec::new();
+        for _ in 0..SUBMIT_THREADS {
+            let orchestrator = Arc::clone(&orchestrator);
+            let run_ids = Arc::clone(&run_ids);
+            submit_workers.push(thread::spawn(move || {
+                for idx in 0..RUNS_PER_THREAD {
+                    let key_seed = format!("t{}", idx);
+                    let plan = RunPlan::new(vec![
+                        PlannedTask::new("stage-1", 2, 500, &format!("{key_seed}-1"))
+                            .expect("task-1"),
+                        PlannedTask::new("stage-2", 2, 500, &format!("{key_seed}-2"))
+                            .expect("task-2"),
+                        PlannedTask::new("stage-3", 2, 500, &format!("{key_seed}-3"))
+                            .expect("task-3"),
+                    ])
+                    .expect("plan");
+
+                    let run_id = {
+                        let mut guard = orchestrator.lock().expect("lock");
+                        guard.submit_run(basic_request(), plan).expect("submit")
+                    };
+                    run_ids.lock().expect("run_ids").push(run_id);
+                }
+            }));
+        }
+        for worker in submit_workers {
+            worker.join().expect("submit worker");
+        }
+        let submit_elapsed_ms = submit_start.elapsed().as_millis() as u64;
+
+        let submit_budget =
+            PerformanceBudget::new("orchestrator_submit_concurrent", 20_000, 50, None);
+        let submit_eval = submit_budget.evaluate(&PerformanceSample {
+            operations: TOTAL_RUNS as u64,
+            total_elapsed_ms: submit_elapsed_ms,
+            latencies_ms: Vec::new(),
+        });
+        assert!(
+            submit_eval.passed,
+            "submit regression gate failed: {:?}",
+            submit_eval.failures
+        );
+
+        let dispatch_operations = Arc::new(AtomicU64::new(0));
+        let dispatch_latencies = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let dispatch_start = Instant::now();
+        let mut dispatch_workers = Vec::new();
+        for _ in 0..SUBMIT_THREADS {
+            let orchestrator = Arc::clone(&orchestrator);
+            let dispatch_operations = Arc::clone(&dispatch_operations);
+            let dispatch_latencies = Arc::clone(&dispatch_latencies);
+            dispatch_workers.push(thread::spawn(move || {
+                let mut executor = FastSuccessExecutor;
+                loop {
+                    let call_start = Instant::now();
+                    let (outcome, pending) = {
+                        let mut guard = orchestrator.lock().expect("lock");
+                        let outcome = guard.dispatch_next(&mut executor).expect("dispatch");
+                        let pending = guard.pending_tasks();
+                        (outcome, pending)
+                    };
+
+                    if !matches!(outcome, DispatchOutcome::Idle) {
+                        dispatch_operations.fetch_add(1, Ordering::Relaxed);
+                        dispatch_latencies
+                            .lock()
+                            .expect("latencies")
+                            .push(call_start.elapsed().as_millis() as u64);
+                    }
+
+                    if matches!(outcome, DispatchOutcome::Idle) && pending == 0 {
+                        break;
+                    }
+                    if matches!(outcome, DispatchOutcome::Idle) {
+                        thread::yield_now();
+                    }
+                }
+            }));
+        }
+        for worker in dispatch_workers {
+            worker.join().expect("dispatch worker");
+        }
+        let dispatch_elapsed_ms = dispatch_start.elapsed().as_millis() as u64;
+        let latencies_ms = dispatch_latencies.lock().expect("latencies").clone();
+
+        let dispatch_budget =
+            PerformanceBudget::new("orchestrator_dispatch_concurrent", 25_000, 100, Some(50));
+        let dispatch_eval = dispatch_budget.evaluate(&PerformanceSample {
+            operations: dispatch_operations.load(Ordering::Relaxed),
+            total_elapsed_ms: dispatch_elapsed_ms,
+            latencies_ms,
+        });
+        assert!(
+            dispatch_eval.passed,
+            "dispatch regression gate failed: {:?}",
+            dispatch_eval.failures
+        );
+        assert_eq!(
+            dispatch_operations.load(Ordering::Relaxed),
+            TOTAL_TASKS as u64,
+            "expected one dispatch operation per task"
+        );
+
+        let run_ids = run_ids.lock().expect("run_ids");
+        assert_eq!(run_ids.len(), TOTAL_RUNS);
+        let guard = orchestrator.lock().expect("lock");
+        for run_id in run_ids.iter() {
+            assert_eq!(guard.run_state(*run_id), Some(RunState::Succeeded));
+        }
     }
 
     #[test]

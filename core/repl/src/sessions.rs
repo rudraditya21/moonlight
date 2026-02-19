@@ -223,6 +223,25 @@ impl SessionEntry {
         out
     }
 
+    fn enforce_pending_limit(&mut self, max_pending_bytes: usize) {
+        let cap = max_pending_bytes.max(1);
+        if self.pending_bytes <= cap {
+            return;
+        }
+        let mut merged = Vec::with_capacity(self.pending_bytes);
+        while let Some(chunk) = self.pending.pop_front() {
+            merged.extend_from_slice(&chunk);
+        }
+        if merged.len() > cap {
+            let keep_from = merged.len().saturating_sub(cap);
+            merged = merged.split_off(keep_from);
+        }
+        self.pending_bytes = merged.len();
+        if !merged.is_empty() {
+            self.pending.push_back(merged);
+        }
+    }
+
     fn mark_poll_success(&mut self, now: u64) {
         self.last_activity_at = now;
         self.consecutive_errors = 0;
@@ -289,6 +308,25 @@ impl SessionManager {
 
     pub fn has(&self, id: u32) -> bool {
         self.entries.contains_key(&id)
+    }
+
+    pub fn max_pending_bytes(&self) -> usize {
+        self.max_pending_bytes
+    }
+
+    pub fn set_max_pending_bytes(&mut self, max_pending_bytes: usize) {
+        self.max_pending_bytes = max_pending_bytes.max(1);
+        for entry in self.entries.values_mut() {
+            entry.enforce_pending_limit(self.max_pending_bytes);
+        }
+    }
+
+    pub fn default_drain_bytes(&self) -> usize {
+        self.default_drain_bytes
+    }
+
+    pub fn set_default_drain_bytes(&mut self, default_drain_bytes: usize) {
+        self.default_drain_bytes = default_drain_bytes.max(1);
     }
 
     pub fn is_attached(&self, id: u32) -> bool {
@@ -552,6 +590,10 @@ impl Default for SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use corelib::performance::{PerformanceBudget, PerformanceSample};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Instant;
 
     struct DummySession {
         open: bool,
@@ -693,5 +735,128 @@ mod tests {
         let reaped = manager.reap_partitioned();
         assert_eq!(reaped, vec![id]);
         assert!(!manager.has(id));
+    }
+
+    #[test]
+    fn manager_tunes_backpressure_limit_and_trims_existing_buffers() {
+        let mut manager = SessionManager::with_config(30, 64);
+        let mut session = DummySession::new();
+        session.pending_reads.push_back(Ok((0u8..80u8).collect()));
+        let id = manager.register("aux/buffer".to_string(), Box::new(session));
+
+        manager.poll(id).expect("poll");
+        let before = manager
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.id == id)
+            .expect("snapshot");
+        assert_eq!(before.pending_bytes, 64);
+
+        manager.set_max_pending_bytes(16);
+        assert_eq!(manager.max_pending_bytes(), 16);
+        manager.set_default_drain_bytes(8);
+        assert_eq!(manager.default_drain_bytes(), 8);
+
+        let after = manager
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.id == id)
+            .expect("snapshot");
+        assert_eq!(after.pending_bytes, 16);
+        let drained = manager.read_buffered(id).expect("drain");
+        assert_eq!(drained.len(), 8);
+        assert_eq!(drained, (64u8..72u8).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn concurrent_session_polling_meets_scale_budget() {
+        const SESSION_COUNT: usize = 96;
+        const CHUNKS_PER_SESSION: usize = 20;
+        const CHUNK_SIZE: usize = 256;
+        const WORKERS: usize = 6;
+
+        let mut manager = SessionManager::with_config(30, 4096);
+        let mut ids = Vec::with_capacity(SESSION_COUNT);
+        for session_idx in 0..SESSION_COUNT {
+            let mut session = DummySession::new();
+            for chunk_idx in 0..CHUNKS_PER_SESSION {
+                let value = ((session_idx + chunk_idx) % 255) as u8;
+                session.pending_reads.push_back(Ok(vec![value; CHUNK_SIZE]));
+            }
+            ids.push(manager.register("aux/load".to_string(), Box::new(session)));
+        }
+
+        let manager = Arc::new(Mutex::new(manager));
+        let started = Instant::now();
+        let mut workers = Vec::with_capacity(WORKERS);
+
+        for worker_idx in 0..WORKERS {
+            let manager = Arc::clone(&manager);
+            let worker_ids: Vec<u32> = ids
+                .iter()
+                .copied()
+                .enumerate()
+                .filter_map(|(idx, id)| (idx % WORKERS == worker_idx).then_some(id))
+                .collect();
+            workers.push(thread::spawn(move || {
+                let mut drained = 0u64;
+                let mut operations = 0u64;
+                let mut latencies = Vec::<u64>::new();
+
+                for _ in 0..CHUNKS_PER_SESSION {
+                    for id in &worker_ids {
+                        let call_started = Instant::now();
+                        let bytes = {
+                            let mut guard = manager.lock().expect("lock");
+                            guard.poll(*id).expect("poll");
+                            guard.read_buffered_limited(*id, CHUNK_SIZE).expect("read")
+                        };
+                        if !bytes.is_empty() {
+                            drained = drained.saturating_add(bytes.len() as u64);
+                            operations = operations.saturating_add(1);
+                            latencies.push(call_started.elapsed().as_millis() as u64);
+                        }
+                    }
+                }
+                (drained, operations, latencies)
+            }));
+        }
+
+        let mut total_drained = 0u64;
+        let mut total_operations = 0u64;
+        let mut latencies_ms = Vec::<u64>::new();
+        for worker in workers {
+            let (drained, operations, mut worker_latencies) = worker.join().expect("worker");
+            total_drained = total_drained.saturating_add(drained);
+            total_operations = total_operations.saturating_add(operations);
+            latencies_ms.append(&mut worker_latencies);
+        }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        let expected_bytes = (SESSION_COUNT * CHUNKS_PER_SESSION * CHUNK_SIZE) as u64;
+        assert_eq!(total_drained, expected_bytes);
+        assert_eq!(
+            total_operations,
+            (SESSION_COUNT * CHUNKS_PER_SESSION) as u64
+        );
+
+        let snapshots = manager.lock().expect("lock").snapshots();
+        for snapshot in snapshots {
+            assert_eq!(snapshot.pending_bytes, 0);
+            assert!(snapshot.is_open);
+        }
+
+        let budget =
+            PerformanceBudget::new("session_manager_concurrent_poll", 30_000, 150, Some(25));
+        let evaluation = budget.evaluate(&PerformanceSample {
+            operations: total_operations,
+            total_elapsed_ms: elapsed_ms,
+            latencies_ms,
+        });
+        assert!(
+            evaluation.passed,
+            "session load regression gate failed: {:?}",
+            evaluation.failures
+        );
     }
 }

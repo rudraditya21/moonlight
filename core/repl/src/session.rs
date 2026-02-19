@@ -178,7 +178,9 @@ impl Repl {
         println!("  info [module]        Show module details");
         println!("  set <opt> <value>    Set module option");
         println!("  get <opt>            Get module option");
-        println!("  setg <k> <v>         Set global setting (e.g. output_mode)");
+        println!(
+            "  setg <k> <v>         Set global setting (e.g. output_mode, session_max_pending_bytes)"
+        );
         println!("  getg <k>             Get global setting value");
         println!("  run                  Execute module");
         println!("  run --yes            Execute without prompt when confirmation is required");
@@ -395,6 +397,54 @@ impl Repl {
                         .with_field("value", mode.as_str()),
                 );
             }
+            "session_max_pending_bytes" | "session_pending_bytes" => {
+                let Ok(parsed) = value.parse::<usize>() else {
+                    self.emit_error(
+                        "setg",
+                        CliCode::Validation,
+                        "session_max_pending_bytes must be a positive integer",
+                    );
+                    return;
+                };
+                if parsed == 0 {
+                    self.emit_error(
+                        "setg",
+                        CliCode::Validation,
+                        "session_max_pending_bytes must be greater than zero",
+                    );
+                    return;
+                }
+                self.sessions.set_max_pending_bytes(parsed);
+                self.emit_response(
+                    CommandResponse::ok("setg", "global setting updated")
+                        .with_field("key", "session_max_pending_bytes")
+                        .with_field("value", parsed),
+                );
+            }
+            "session_drain_bytes" | "session_read_drain_bytes" => {
+                let Ok(parsed) = value.parse::<usize>() else {
+                    self.emit_error(
+                        "setg",
+                        CliCode::Validation,
+                        "session_drain_bytes must be a positive integer",
+                    );
+                    return;
+                };
+                if parsed == 0 {
+                    self.emit_error(
+                        "setg",
+                        CliCode::Validation,
+                        "session_drain_bytes must be greater than zero",
+                    );
+                    return;
+                }
+                self.sessions.set_default_drain_bytes(parsed);
+                self.emit_response(
+                    CommandResponse::ok("setg", "global setting updated")
+                        .with_field("key", "session_drain_bytes")
+                        .with_field("value", parsed),
+                );
+            }
             _ => self.emit_error(
                 "setg",
                 CliCode::NotFound,
@@ -415,6 +465,20 @@ impl Repl {
                     CommandResponse::ok("getg", "global setting")
                         .with_field("key", "output_mode")
                         .with_field("value", self.output_mode.as_str()),
+                );
+            }
+            "session_max_pending_bytes" | "session_pending_bytes" => {
+                self.emit_response(
+                    CommandResponse::ok("getg", "global setting")
+                        .with_field("key", "session_max_pending_bytes")
+                        .with_field("value", self.sessions.max_pending_bytes()),
+                );
+            }
+            "session_drain_bytes" | "session_read_drain_bytes" => {
+                self.emit_response(
+                    CommandResponse::ok("getg", "global setting")
+                        .with_field("key", "session_drain_bytes")
+                        .with_field("value", self.sessions.default_drain_bytes()),
                 );
             }
             _ => self.emit_error(
@@ -1393,6 +1457,18 @@ impl Repl {
                                 .filter(|v| v.starts_with(current))
                                 .map(|v| v.to_string())
                                 .collect();
+                        } else if matches!(
+                            tokens.get(1),
+                            Some(&"session_max_pending_bytes")
+                                | Some(&"session_pending_bytes")
+                                | Some(&"session_drain_bytes")
+                                | Some(&"session_read_drain_bytes")
+                        ) {
+                            candidates = ["1024", "4096", "65536"]
+                                .iter()
+                                .filter(|v| v.starts_with(current))
+                                .map(|v| v.to_string())
+                                .collect();
                         }
                     }
                 }
@@ -1515,11 +1591,18 @@ fn capability_candidates(prefix: &str) -> Vec<String> {
 }
 
 fn global_key_candidates(prefix: &str) -> Vec<String> {
-    ["output_mode", "output"]
-        .iter()
-        .filter(|key| key.starts_with(prefix))
-        .map(|key| key.to_string())
-        .collect()
+    [
+        "output_mode",
+        "output",
+        "session_max_pending_bytes",
+        "session_pending_bytes",
+        "session_drain_bytes",
+        "session_read_drain_bytes",
+    ]
+    .iter()
+    .filter(|key| key.starts_with(prefix))
+    .map(|key| key.to_string())
+    .collect()
 }
 
 fn module_candidates(repl: &Repl, prefix: &str) -> Vec<String> {
