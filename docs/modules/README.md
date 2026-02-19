@@ -2,6 +2,27 @@
 
 This directory contains operator-focused documentation for Moonlight modules.
 
+## Policy and Global Settings
+Moonlight runs with safety guardrails enabled by default.
+
+- Exploit modules require `policy enable exploit_execution` before `run`.
+- Payload modules require `policy enable payload_execution` before `run`.
+- Evasion modules require `policy enable evasion_execution` before `run`.
+- Public targets can require `policy enable public_targets`.
+- Wide-scope targets can require `policy enable wide_target_scope`.
+- Use `run --yes` to skip interactive confirmation prompts for a single run.
+- Use `policy` to inspect currently enabled capabilities.
+
+Useful operator settings:
+
+```text
+setg output_mode human
+setg output_mode json
+setg session_max_pending_bytes 65536
+setg session_drain_bytes 4096
+getg output_mode
+```
+
 ## Exploit Modules
 - `exploit/linux/telnet/gnu_inetutils_telnetd_auth_bypass`  
   See `docs/modules/exploit/linux/telnet/gnu_inetutils_telnetd_auth_bypass.md`.
