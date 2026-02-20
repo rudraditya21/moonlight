@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,6 +10,7 @@ use crate::campaign::{
     ObjectiveIngestionDispatcher, ObjectiveIngestionEvent, ObjectiveReevaluationTrigger,
     ObjectiveStatus, PredicateSnapshot, RiskLevel,
 };
+use crate::control::ControlState;
 use crate::domain::{
     ArtifactId, CorrelationId, DomainError, EventId, FindingId, ModuleVersionId, Run, RunId,
     RunState, SessionId, TargetId, Task, TaskId, TaskState, WorkspaceId,
@@ -415,6 +416,45 @@ pub struct ReconstructedTask {
     pub idempotency_key: String,
     pub error: Option<String>,
     pub deduplicated_from: Option<TaskId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayDiagnostic {
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayedObjective {
+    pub objective_id: ObjectiveId,
+    pub name: Option<String>,
+    pub risk_level: Option<RiskLevel>,
+    pub status: ObjectiveStatus,
+    pub prerequisites: BTreeSet<ObjectiveId>,
+    pub evaluation_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconstructedCampaign {
+    pub campaign_id: CampaignId,
+    pub correlation_id: CorrelationId,
+    pub sequence_high_watermark: u64,
+    pub name: Option<String>,
+    pub status: CampaignStatus,
+    pub objective_ids: BTreeSet<ObjectiveId>,
+    pub objectives: BTreeMap<ObjectiveId, ReplayedObjective>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CampaignReplayReport {
+    pub campaign: Option<ReconstructedCampaign>,
+    pub diagnostics: Vec<ReplayDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CampaignReplayConsistency {
+    pub report: CampaignReplayReport,
+    pub consistent: bool,
 }
 
 pub trait AuditLogStore {
@@ -1779,6 +1819,33 @@ impl<S: SnapshotStore, A: AuditLogStore> ObservableExecutionOrchestrator<S, A> {
         Ok(reconstruct_run_from_events(&events, run_id))
     }
 
+    pub fn reconstruct_campaign_from_history(
+        &mut self,
+        campaign_id: &CampaignId,
+    ) -> Result<CampaignReplayReport, OrchestratorError> {
+        let events = self.audit_store.load_events()?;
+        Ok(reconstruct_campaign_from_events(&events, campaign_id))
+    }
+
+    pub fn replay_campaign_consistency(
+        &mut self,
+        campaign_id: &CampaignId,
+        snapshot: &ControlState,
+    ) -> Result<CampaignReplayConsistency, OrchestratorError> {
+        let report = self.reconstruct_campaign_from_history(campaign_id)?;
+        let diagnostics = compare_campaign_replay_to_snapshot(&report, snapshot, campaign_id);
+        let mut merged = report.diagnostics.clone();
+        merged.extend(diagnostics);
+        let consistent = merged.is_empty();
+        Ok(CampaignReplayConsistency {
+            report: CampaignReplayReport {
+                campaign: report.campaign,
+                diagnostics: merged,
+            },
+            consistent,
+        })
+    }
+
     pub fn run_state(&self, run_id: RunId) -> Option<RunState> {
         self.inner.run_state(run_id)
     }
@@ -2974,6 +3041,399 @@ fn reconstruct_run_from_events(events: &[AuditEvent], run_id: RunId) -> Option<R
     }
 
     reconstructed
+}
+
+fn reconstruct_campaign_from_events(
+    events: &[AuditEvent],
+    campaign_id: &CampaignId,
+) -> CampaignReplayReport {
+    let mut diagnostics = Vec::<ReplayDiagnostic>::new();
+    let mut reconstructed: Option<ReconstructedCampaign> = None;
+
+    for event in events {
+        let AuditEventPayload::Campaign(campaign_event) = &event.payload else {
+            continue;
+        };
+        let payload_campaign_id = campaign_event.payload.campaign_id();
+        if payload_campaign_id != campaign_id {
+            continue;
+        }
+
+        let Some(campaign) = reconstructed.as_mut() else {
+            reconstructed = Some(ReconstructedCampaign {
+                campaign_id: campaign_id.clone(),
+                correlation_id: event.correlation_id,
+                sequence_high_watermark: 0,
+                name: None,
+                status: CampaignStatus::Active,
+                objective_ids: BTreeSet::new(),
+                objectives: BTreeMap::new(),
+            });
+            continue;
+        };
+
+        if campaign.correlation_id != event.correlation_id {
+            diagnostics.push(ReplayDiagnostic {
+                code: "ML-REPLAY-0001",
+                message: format!(
+                    "campaign {} has mixed lineage correlations {} and {}",
+                    campaign_id.as_str(),
+                    campaign.correlation_id.0 .0,
+                    event.correlation_id.0 .0
+                ),
+            });
+        }
+    }
+
+    for event in events {
+        let AuditEventPayload::Campaign(campaign_event) = &event.payload else {
+            continue;
+        };
+        let payload_campaign_id = campaign_event.payload.campaign_id();
+        if payload_campaign_id != campaign_id {
+            continue;
+        }
+        let Some(campaign) = reconstructed.as_mut() else {
+            continue;
+        };
+
+        let expected_next = campaign.sequence_high_watermark.saturating_add(1);
+        if campaign_event.sequence != expected_next {
+            diagnostics.push(ReplayDiagnostic {
+                code: "ML-REPLAY-0002",
+                message: format!(
+                    "campaign {} sequence mismatch: expected {}, found {}",
+                    campaign_id.as_str(),
+                    expected_next,
+                    campaign_event.sequence
+                ),
+            });
+        }
+        campaign.sequence_high_watermark = campaign_event.sequence;
+
+        match &campaign_event.payload {
+            CampaignPayload::CampaignCreated { name, .. } => {
+                if campaign.name.is_some() {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0003",
+                        message: format!(
+                            "campaign {} contains duplicate CampaignCreated event",
+                            campaign_id.as_str()
+                        ),
+                    });
+                }
+                campaign.name = Some(name.clone());
+                campaign.status = CampaignStatus::Active;
+            }
+            CampaignPayload::CampaignStatusChanged { from, to, .. } => {
+                if campaign.status != *from {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0004",
+                        message: format!(
+                            "campaign {} status mismatch during replay: event from={} but current={}",
+                            campaign_id.as_str(),
+                            from.as_str(),
+                            campaign.status.as_str()
+                        ),
+                    });
+                }
+                if !campaign.status.can_transition_to(*to) {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0005",
+                        message: format!(
+                            "campaign {} invalid transition during replay: {} -> {}",
+                            campaign_id.as_str(),
+                            campaign.status.as_str(),
+                            to.as_str()
+                        ),
+                    });
+                }
+                campaign.status = *to;
+            }
+            CampaignPayload::ObjectiveCreated {
+                objective_id,
+                name,
+                risk_level,
+                ..
+            } => {
+                campaign.objective_ids.insert(objective_id.clone());
+                let entry = campaign
+                    .objectives
+                    .entry(objective_id.clone())
+                    .or_insert_with(|| ReplayedObjective {
+                        objective_id: objective_id.clone(),
+                        name: None,
+                        risk_level: None,
+                        status: ObjectiveStatus::Pending,
+                        prerequisites: BTreeSet::new(),
+                        evaluation_count: 0,
+                    });
+                entry.name = Some(name.clone());
+                entry.risk_level = Some(*risk_level);
+            }
+            CampaignPayload::ObjectivePrereqLinked {
+                objective_id,
+                prerequisite_id,
+                ..
+            } => {
+                campaign.objective_ids.insert(objective_id.clone());
+                campaign.objective_ids.insert(prerequisite_id.clone());
+                let entry = campaign
+                    .objectives
+                    .entry(objective_id.clone())
+                    .or_insert_with(|| ReplayedObjective {
+                        objective_id: objective_id.clone(),
+                        name: None,
+                        risk_level: None,
+                        status: ObjectiveStatus::Pending,
+                        prerequisites: BTreeSet::new(),
+                        evaluation_count: 0,
+                    });
+                entry.prerequisites.insert(prerequisite_id.clone());
+            }
+            CampaignPayload::ObjectiveStatusChanged {
+                objective_id,
+                from,
+                to,
+                ..
+            } => {
+                let entry = campaign
+                    .objectives
+                    .entry(objective_id.clone())
+                    .or_insert_with(|| ReplayedObjective {
+                        objective_id: objective_id.clone(),
+                        name: None,
+                        risk_level: None,
+                        status: ObjectiveStatus::Pending,
+                        prerequisites: BTreeSet::new(),
+                        evaluation_count: 0,
+                    });
+                if entry.status != *from {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0006",
+                        message: format!(
+                            "objective {} status mismatch during replay: event from={} current={}",
+                            objective_id.as_str(),
+                            from.as_str(),
+                            entry.status.as_str()
+                        ),
+                    });
+                }
+                if !entry.status.can_transition_to(*to) {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0007",
+                        message: format!(
+                            "objective {} invalid transition during replay: {} -> {}",
+                            objective_id.as_str(),
+                            entry.status.as_str(),
+                            to.as_str()
+                        ),
+                    });
+                }
+                entry.status = *to;
+                campaign.objective_ids.insert(objective_id.clone());
+            }
+            CampaignPayload::ObjectiveEvaluated {
+                objective_id,
+                prerequisites_satisfied,
+                success_criteria_satisfied,
+                failure_criteria_satisfied,
+                resulting_status,
+                ..
+            } => {
+                let entry = campaign
+                    .objectives
+                    .entry(objective_id.clone())
+                    .or_insert_with(|| ReplayedObjective {
+                        objective_id: objective_id.clone(),
+                        name: None,
+                        risk_level: None,
+                        status: ObjectiveStatus::Pending,
+                        prerequisites: BTreeSet::new(),
+                        evaluation_count: 0,
+                    });
+                entry.evaluation_count = entry.evaluation_count.saturating_add(1);
+
+                if entry.status != *resulting_status {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0008",
+                        message: format!(
+                            "objective {} evaluated status mismatch: replay={} event={}",
+                            objective_id.as_str(),
+                            entry.status.as_str(),
+                            resulting_status.as_str()
+                        ),
+                    });
+                }
+                if *resulting_status == ObjectiveStatus::Eligible && !*prerequisites_satisfied {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0009",
+                        message: format!(
+                            "objective {} marked eligible without prerequisite satisfaction",
+                            objective_id.as_str()
+                        ),
+                    });
+                }
+                if *resulting_status == ObjectiveStatus::Achieved && !*success_criteria_satisfied {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0010",
+                        message: format!(
+                            "objective {} marked achieved without success criteria",
+                            objective_id.as_str()
+                        ),
+                    });
+                }
+                if *resulting_status == ObjectiveStatus::Failed && !*failure_criteria_satisfied {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0011",
+                        message: format!(
+                            "objective {} marked failed without failure criteria",
+                            objective_id.as_str()
+                        ),
+                    });
+                }
+
+                campaign.objective_ids.insert(objective_id.clone());
+            }
+        }
+    }
+
+    if reconstructed.is_none() {
+        diagnostics.push(ReplayDiagnostic {
+            code: "ML-REPLAY-0012",
+            message: format!(
+                "campaign {} not found in audit event history",
+                campaign_id.as_str()
+            ),
+        });
+    }
+
+    CampaignReplayReport {
+        campaign: reconstructed,
+        diagnostics,
+    }
+}
+
+fn compare_campaign_replay_to_snapshot(
+    report: &CampaignReplayReport,
+    snapshot: &ControlState,
+    campaign_id: &CampaignId,
+) -> Vec<ReplayDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let Some(replayed) = report.campaign.as_ref() else {
+        diagnostics.push(ReplayDiagnostic {
+            code: "ML-REPLAY-0013",
+            message: format!(
+                "cannot compare snapshot for campaign {} because replay produced no campaign state",
+                campaign_id.as_str()
+            ),
+        });
+        return diagnostics;
+    };
+
+    let Some(snapshot_campaign) = snapshot.campaigns.get(campaign_id) else {
+        diagnostics.push(ReplayDiagnostic {
+            code: "ML-REPLAY-0014",
+            message: format!(
+                "snapshot missing campaign {} while replay produced one",
+                campaign_id.as_str()
+            ),
+        });
+        return diagnostics;
+    };
+
+    if replayed.status != snapshot_campaign.status {
+        diagnostics.push(ReplayDiagnostic {
+            code: "ML-REPLAY-0015",
+            message: format!(
+                "campaign {} status mismatch replay={} snapshot={}",
+                campaign_id.as_str(),
+                replayed.status.as_str(),
+                snapshot_campaign.status.as_str()
+            ),
+        });
+    }
+
+    let snapshot_objective_ids = snapshot_campaign
+        .objective_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if replayed.objective_ids != snapshot_objective_ids {
+        diagnostics.push(ReplayDiagnostic {
+            code: "ML-REPLAY-0016",
+            message: format!(
+                "campaign {} objective id set mismatch replay={} snapshot={}",
+                campaign_id.as_str(),
+                replayed.objective_ids.len(),
+                snapshot_objective_ids.len()
+            ),
+        });
+    }
+
+    for objective_id in &replayed.objective_ids {
+        let Some(snapshot_objective) = snapshot.objectives.get(objective_id) else {
+            diagnostics.push(ReplayDiagnostic {
+                code: "ML-REPLAY-0017",
+                message: format!(
+                    "snapshot missing objective {} present in replay for campaign {}",
+                    objective_id.as_str(),
+                    campaign_id.as_str()
+                ),
+            });
+            continue;
+        };
+        if snapshot_objective.campaign_id != *campaign_id {
+            diagnostics.push(ReplayDiagnostic {
+                code: "ML-REPLAY-0018",
+                message: format!(
+                    "snapshot objective {} belongs to campaign {} instead of {}",
+                    objective_id.as_str(),
+                    snapshot_objective.campaign_id.as_str(),
+                    campaign_id.as_str()
+                ),
+            });
+        }
+        let Some(replayed_objective) = replayed.objectives.get(objective_id) else {
+            diagnostics.push(ReplayDiagnostic {
+                code: "ML-REPLAY-0019",
+                message: format!(
+                    "replay missing objective {} listed in replay objective id set",
+                    objective_id.as_str()
+                ),
+            });
+            continue;
+        };
+        if replayed_objective.status != snapshot_objective.status {
+            diagnostics.push(ReplayDiagnostic {
+                code: "ML-REPLAY-0020",
+                message: format!(
+                    "objective {} status mismatch replay={} snapshot={}",
+                    objective_id.as_str(),
+                    replayed_objective.status.as_str(),
+                    snapshot_objective.status.as_str()
+                ),
+            });
+        }
+    }
+
+    for objective in snapshot.objectives.values() {
+        if &objective.campaign_id != campaign_id {
+            continue;
+        }
+        if !replayed.objective_ids.contains(&objective.id) {
+            diagnostics.push(ReplayDiagnostic {
+                code: "ML-REPLAY-0021",
+                message: format!(
+                    "snapshot objective {} for campaign {} missing from replay",
+                    objective.id.as_str(),
+                    campaign_id.as_str()
+                ),
+            });
+        }
+    }
+
+    diagnostics
 }
 
 fn parse_u64(input: &str) -> Result<u64, OrchestratorError> {
@@ -4318,5 +4778,244 @@ mod tests {
             objectives[&objective_session].status,
             ObjectiveStatus::Achieved
         );
+    }
+
+    #[test]
+    fn campaign_cold_replay_reconstructs_identical_objective_outcomes() {
+        let snapshot_shared = Arc::new(Mutex::new(None));
+        let audit_shared = Arc::new(Mutex::new(Vec::<AuditEvent>::new()));
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_id =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective id");
+
+        {
+            let snapshot_store = InMemorySnapshotStore::from_shared(Arc::clone(&snapshot_shared));
+            let audit_store = InMemoryAuditLogStore::from_shared(Arc::clone(&audit_shared));
+            let mut orchestrator =
+                ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("new");
+
+            orchestrator
+                .record_campaign_events(
+                    vec![
+                        CampaignPayload::CampaignCreated {
+                            campaign_id: campaign_id.clone(),
+                            name: "operation".to_string(),
+                        },
+                        CampaignPayload::ObjectiveCreated {
+                            campaign_id: campaign_id.clone(),
+                            objective_id: objective_id.clone(),
+                            name: "escalate".to_string(),
+                            risk_level: RiskLevel::High,
+                        },
+                        CampaignPayload::ObjectiveStatusChanged {
+                            campaign_id: campaign_id.clone(),
+                            objective_id: objective_id.clone(),
+                            from: ObjectiveStatus::Pending,
+                            to: ObjectiveStatus::Eligible,
+                            reason: Some("prerequisites".to_string()),
+                        },
+                        CampaignPayload::ObjectiveStatusChanged {
+                            campaign_id: campaign_id.clone(),
+                            objective_id: objective_id.clone(),
+                            from: ObjectiveStatus::Eligible,
+                            to: ObjectiveStatus::InProgress,
+                            reason: Some("operator start".to_string()),
+                        },
+                        CampaignPayload::ObjectiveStatusChanged {
+                            campaign_id: campaign_id.clone(),
+                            objective_id: objective_id.clone(),
+                            from: ObjectiveStatus::InProgress,
+                            to: ObjectiveStatus::Achieved,
+                            reason: Some("criteria met".to_string()),
+                        },
+                        CampaignPayload::ObjectiveEvaluated {
+                            campaign_id: campaign_id.clone(),
+                            objective_id: objective_id.clone(),
+                            trigger: ObjectiveReevaluationTrigger::RunCompleted,
+                            prerequisites_satisfied: true,
+                            success_criteria_satisfied: true,
+                            failure_criteria_satisfied: false,
+                            resulting_status: ObjectiveStatus::Achieved,
+                        },
+                    ],
+                    None,
+                )
+                .expect("record campaign events");
+
+            let report = orchestrator
+                .reconstruct_campaign_from_history(&campaign_id)
+                .expect("replay");
+            assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+            let campaign = report.campaign.expect("campaign");
+            assert_eq!(campaign.objective_ids.len(), 1);
+            assert_eq!(
+                campaign
+                    .objectives
+                    .get(&objective_id)
+                    .expect("objective")
+                    .status,
+                ObjectiveStatus::Achieved
+            );
+        }
+
+        let snapshot_store = InMemorySnapshotStore::from_shared(Arc::clone(&snapshot_shared));
+        let audit_store = InMemoryAuditLogStore::from_shared(Arc::clone(&audit_shared));
+        let mut recovered =
+            ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("recover");
+        let replay = recovered
+            .reconstruct_campaign_from_history(&campaign_id)
+            .expect("replay");
+        assert!(replay.diagnostics.is_empty(), "{:?}", replay.diagnostics);
+        let campaign = replay.campaign.expect("campaign");
+        assert_eq!(
+            campaign
+                .objectives
+                .get(&objective_id)
+                .expect("objective")
+                .status,
+            ObjectiveStatus::Achieved
+        );
+    }
+
+    #[test]
+    fn campaign_replay_consistency_reports_snapshot_mismatches() {
+        let snapshot_store = InMemorySnapshotStore::default();
+        let audit_store = InMemoryAuditLogStore::default();
+        let mut orchestrator =
+            ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("new");
+
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_id =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective id");
+
+        orchestrator
+            .record_campaign_events(
+                vec![
+                    CampaignPayload::CampaignCreated {
+                        campaign_id: campaign_id.clone(),
+                        name: "operation".to_string(),
+                    },
+                    CampaignPayload::ObjectiveCreated {
+                        campaign_id: campaign_id.clone(),
+                        objective_id: objective_id.clone(),
+                        name: "escalate".to_string(),
+                        risk_level: RiskLevel::High,
+                    },
+                    CampaignPayload::ObjectiveEvaluated {
+                        campaign_id: campaign_id.clone(),
+                        objective_id: objective_id.clone(),
+                        trigger: ObjectiveReevaluationTrigger::ManualRequest,
+                        prerequisites_satisfied: true,
+                        success_criteria_satisfied: false,
+                        failure_criteria_satisfied: false,
+                        resulting_status: ObjectiveStatus::Pending,
+                    },
+                ],
+                None,
+            )
+            .expect("record events");
+
+        let mut snapshot = ControlState::default();
+        let mut campaign =
+            crate::campaign::Campaign::new_at(campaign_id.clone(), "operation", "", 1, None)
+                .expect("campaign");
+        campaign.add_objective(objective_id.clone());
+        let mut objective = crate::campaign::Objective::new_at(
+            objective_id,
+            campaign_id.clone(),
+            "escalate",
+            "",
+            vec![],
+            vec![crate::campaign::Predicate::RunSucceeded {
+                module_name: "exploit/linux/example".to_string(),
+            }],
+            vec![],
+            RiskLevel::High,
+            None,
+            1,
+        )
+        .expect("objective");
+        objective.status = ObjectiveStatus::Failed;
+        snapshot.campaigns.insert(campaign_id.clone(), campaign);
+        snapshot
+            .objectives
+            .insert(objective.id.clone(), objective.clone());
+
+        let consistency = orchestrator
+            .replay_campaign_consistency(&campaign_id, &snapshot)
+            .expect("consistency");
+        assert!(!consistency.consistent);
+        assert!(consistency
+            .report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "ML-REPLAY-0020"));
+    }
+
+    #[test]
+    fn campaign_replay_emits_diagnostics_for_invalid_event_sequences() {
+        let mut store = InMemoryAuditLogStore::default();
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_id =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective id");
+        let correlation = CorrelationId::next();
+
+        store
+            .append_event(&AuditEvent {
+                id: EventId::next(),
+                correlation_id: correlation,
+                occurred_at: now_secs(),
+                payload: AuditEventPayload::Campaign(CampaignAuditEvent {
+                    sequence: 1,
+                    occurred_at: now_secs(),
+                    payload: CampaignPayload::CampaignCreated {
+                        campaign_id: campaign_id.clone(),
+                        name: "operation".to_string(),
+                    },
+                }),
+            })
+            .expect("append 1");
+        store
+            .append_event(&AuditEvent {
+                id: EventId::next(),
+                correlation_id: CorrelationId::next(),
+                occurred_at: now_secs(),
+                payload: AuditEventPayload::Campaign(CampaignAuditEvent {
+                    sequence: 3,
+                    occurred_at: now_secs(),
+                    payload: CampaignPayload::ObjectiveEvaluated {
+                        campaign_id: campaign_id.clone(),
+                        objective_id,
+                        trigger: ObjectiveReevaluationTrigger::ManualRequest,
+                        prerequisites_satisfied: false,
+                        success_criteria_satisfied: false,
+                        failure_criteria_satisfied: false,
+                        resulting_status: ObjectiveStatus::Achieved,
+                    },
+                }),
+            })
+            .expect("append 2");
+
+        let snapshot_store = InMemorySnapshotStore::default();
+        let mut orchestrator =
+            ObservableExecutionOrchestrator::new(snapshot_store, store).expect("new");
+        let report = orchestrator
+            .reconstruct_campaign_from_history(&campaign_id)
+            .expect("replay");
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "ML-REPLAY-0001"));
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "ML-REPLAY-0002"));
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "ML-REPLAY-0010"));
     }
 }
