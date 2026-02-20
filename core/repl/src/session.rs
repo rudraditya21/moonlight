@@ -86,7 +86,7 @@ const COMMAND_HELP: &[CommandHelpSpec] = &[
         summary: "Show general help or help for one command",
         usage: "help [command]",
         aliases: &[],
-        examples: &["help", "help run", "help release"],
+        examples: &["help", "help run", "help campaign", "help objective"],
         notes: &[],
     },
     CommandHelpSpec {
@@ -213,7 +213,7 @@ const COMMAND_HELP: &[CommandHelpSpec] = &[
             "campaign list",
             "campaign status <campaign-id> paused --yes",
         ],
-        notes: &[],
+        notes: &["See docs/guide/campaign_objective_operations.md for full operator workflow."],
     },
     CommandHelpSpec {
         name: "objective",
@@ -227,6 +227,7 @@ const COMMAND_HELP: &[CommandHelpSpec] = &[
         ],
         notes: &[
             "Predicate formats: finding_exists:<type>, session_privilege:<user|elevated|root>, artifact_tag_match:<tag>, run_succeeded:<module>, custom_metadata_match:<key>=<value>",
+            "See docs/guide/campaign_objective_operations.md for detailed examples and troubleshooting.",
         ],
     },
     CommandHelpSpec {

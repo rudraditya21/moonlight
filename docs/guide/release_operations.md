@@ -29,6 +29,7 @@ What it does:
 - Evaluates documentation completeness gates.
 - Validates migration path from current schema to latest schema.
 - Verifies rollback snapshot availability.
+- Verifies rollback snapshot payload compatibility with schema semantics.
 - Evaluates checklist requirements and reports blockers.
 
 ### Compatibility Matrix
@@ -97,8 +98,13 @@ moonlight> release rollback apply <snapshot-id>
 
 What it does:
 - Validates snapshot checksum.
+- Validates snapshot payload compatibility with target schema.
 - Restores control-state schema version from snapshot.
 - Records restore in migration history.
+
+Schema note:
+- For schema `v5+`, rollback snapshots include campaign/objective envelope fields.
+- Incompatible payloads are rejected deterministically before restore.
 
 ### Prune snapshots
 
@@ -115,6 +121,9 @@ Documentation gates verify that required usage docs exist and include required h
 Current gates:
 - `docs/guide/modules.md`
 - `docs/guide/release_operations.md`
+
+Related operator guide:
+- `docs/guide/campaign_objective_operations.md`
 
 Gate behavior:
 - Fails when required files are missing.

@@ -127,6 +127,8 @@ Command assistance:
 moonlight> help
 moonlight> help run
 moonlight> help sessions
+moonlight> help campaign
+moonlight> help objective
 moonlight> clear
 ```
 
@@ -144,6 +146,13 @@ The prompt reflects the active module when one is selected:
 ```
 moonlight(nops/riscv32le/simple)>
 ```
+
+## Campaign and Objective REPL Usage
+Campaign and objective orchestration commands are documented in:
+
+- `docs/guide/campaign_objective_operations.md`
+
+Use this guide for campaign lifecycle commands, objective predicate syntax, replay/recovery semantics, and troubleshooting.
 
 ## Performance
 Keep modules efficient and avoid expensive initialization in `run`. If a module performs heavy work, consider lazy initialization and reuse internal state.
