@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::domain;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CampaignModelError {
     InvalidField {
@@ -11,6 +13,9 @@ pub enum CampaignModelError {
         entity: &'static str,
         from: &'static str,
         to: &'static str,
+    },
+    Parse {
+        reason: &'static str,
     },
     MissingObjective {
         objective_id: ObjectiveId,
@@ -29,6 +34,7 @@ impl fmt::Display for CampaignModelError {
             CampaignModelError::InvalidTransition { entity, from, to } => {
                 write!(f, "invalid {entity} transition: {from} -> {to}")
             }
+            CampaignModelError::Parse { reason } => write!(f, "parse error: {reason}"),
             CampaignModelError::MissingObjective { objective_id } => {
                 write!(
                     f,
@@ -56,6 +62,7 @@ impl CampaignModelError {
             CampaignModelError::InvalidTransition { .. } => "ML-CAMP-0002",
             CampaignModelError::MissingObjective { .. } => "ML-CAMP-0003",
             CampaignModelError::PrerequisiteCycle { .. } => "ML-CAMP-0004",
+            CampaignModelError::Parse { .. } => "ML-CAMP-0005",
         }
     }
 }
@@ -308,6 +315,265 @@ impl MetadataValue {
             }
         }
     }
+
+    fn write_wire(&self, out: &mut Vec<u8>) {
+        match self {
+            MetadataValue::Null => out.push(0),
+            MetadataValue::Bool(false) => out.push(1),
+            MetadataValue::Bool(true) => out.push(2),
+            MetadataValue::Integer(value) => {
+                out.push(3);
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+            MetadataValue::FloatBits(bits) => {
+                out.push(4);
+                out.extend_from_slice(&bits.to_be_bytes());
+            }
+            MetadataValue::Text(value) => {
+                out.push(5);
+                write_string(out, value);
+            }
+            MetadataValue::Array(values) => {
+                out.push(6);
+                write_u32(out, values.len() as u32);
+                for value in values {
+                    value.write_wire(out);
+                }
+            }
+            MetadataValue::Object(map) => {
+                out.push(7);
+                write_u32(out, map.len() as u32);
+                for (key, value) in map {
+                    write_string(out, key);
+                    value.write_wire(out);
+                }
+            }
+        }
+    }
+
+    fn read_wire(cursor: &mut WireCursor<'_>) -> Result<Self, CampaignModelError> {
+        let tag = cursor.read_u8()?;
+        match tag {
+            0 => Ok(MetadataValue::Null),
+            1 => Ok(MetadataValue::Bool(false)),
+            2 => Ok(MetadataValue::Bool(true)),
+            3 => Ok(MetadataValue::Integer(cursor.read_i64()?)),
+            4 => Ok(MetadataValue::FloatBits(cursor.read_u64()?)),
+            5 => Ok(MetadataValue::Text(cursor.read_string()?)),
+            6 => {
+                let count = cursor.read_u32()? as usize;
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
+                    values.push(MetadataValue::read_wire(cursor)?);
+                }
+                Ok(MetadataValue::Array(values))
+            }
+            7 => {
+                let count = cursor.read_u32()? as usize;
+                let mut map = BTreeMap::new();
+                for _ in 0..count {
+                    let key = cursor.read_string()?;
+                    if map.contains_key(&key) {
+                        return Err(CampaignModelError::Parse {
+                            reason: "duplicate metadata object key",
+                        });
+                    }
+                    map.insert(key, MetadataValue::read_wire(cursor)?);
+                }
+                Ok(MetadataValue::Object(map))
+            }
+            _ => Err(CampaignModelError::Parse {
+                reason: "unknown metadata tag",
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactSnapshot {
+    pub artifact: domain::Artifact,
+    pub tags: BTreeSet<String>,
+    pub metadata: BTreeMap<String, MetadataValue>,
+}
+
+impl ArtifactSnapshot {
+    pub fn new(artifact: domain::Artifact) -> Self {
+        Self {
+            artifact,
+            tags: BTreeSet::new(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_tag(mut self, tag: &str) -> Self {
+        self.tags.insert(normalize_token(tag));
+        self
+    }
+
+    pub fn with_metadata(mut self, key: &str, value: MetadataValue) -> Self {
+        self.metadata.insert(normalize_token(key), value);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingSnapshot {
+    pub finding: domain::Finding,
+    pub finding_type: String,
+    pub metadata: BTreeMap<String, MetadataValue>,
+}
+
+impl FindingSnapshot {
+    pub fn new(finding: domain::Finding, finding_type: &str) -> Result<Self, CampaignModelError> {
+        ensure_non_empty(finding_type, "finding_snapshot.finding_type")?;
+        Ok(Self {
+            finding,
+            finding_type: normalize_token(finding_type),
+            metadata: BTreeMap::new(),
+        })
+    }
+
+    pub fn with_metadata(mut self, key: &str, value: MetadataValue) -> Self {
+        self.metadata.insert(normalize_token(key), value);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    pub session: domain::Session,
+    pub privilege: Option<SessionPrivilegeLevel>,
+    pub metadata: BTreeMap<String, MetadataValue>,
+}
+
+impl SessionSnapshot {
+    pub fn new(session: domain::Session) -> Self {
+        Self {
+            session,
+            privilege: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_privilege(mut self, privilege: SessionPrivilegeLevel) -> Self {
+        self.privilege = Some(privilege);
+        self
+    }
+
+    pub fn with_metadata(mut self, key: &str, value: MetadataValue) -> Self {
+        self.metadata.insert(normalize_token(key), value);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSnapshot {
+    pub run: domain::Run,
+    pub module_name: String,
+    pub metadata: BTreeMap<String, MetadataValue>,
+}
+
+impl RunSnapshot {
+    pub fn new(run: domain::Run, module_name: &str) -> Result<Self, CampaignModelError> {
+        ensure_non_empty(module_name, "run_snapshot.module_name")?;
+        Ok(Self {
+            run,
+            module_name: normalize_token(module_name),
+            metadata: BTreeMap::new(),
+        })
+    }
+
+    pub fn with_metadata(mut self, key: &str, value: MetadataValue) -> Self {
+        self.metadata.insert(normalize_token(key), value);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateSnapshot {
+    pub artifacts: Vec<ArtifactSnapshot>,
+    pub findings: Vec<FindingSnapshot>,
+    pub sessions: Vec<SessionSnapshot>,
+    pub runs: Vec<RunSnapshot>,
+    pub metadata: BTreeMap<String, MetadataValue>,
+}
+
+impl PredicateSnapshot {
+    pub fn new() -> Self {
+        Self {
+            artifacts: Vec::new(),
+            findings: Vec::new(),
+            sessions: Vec::new(),
+            runs: Vec::new(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_artifact(mut self, artifact: ArtifactSnapshot) -> Self {
+        self.artifacts.push(artifact);
+        self
+    }
+
+    pub fn with_finding(mut self, finding: FindingSnapshot) -> Self {
+        self.findings.push(finding);
+        self
+    }
+
+    pub fn with_session(mut self, session: SessionSnapshot) -> Self {
+        self.sessions.push(session);
+        self
+    }
+
+    pub fn with_run(mut self, run: RunSnapshot) -> Self {
+        self.runs.push(run);
+        self
+    }
+
+    pub fn with_metadata(mut self, key: &str, value: MetadataValue) -> Self {
+        self.metadata.insert(normalize_token(key), value);
+        self
+    }
+
+    fn contains_metadata_match(&self, key: &str, value: &MetadataValue) -> bool {
+        let token = normalize_token(key);
+        if self
+            .metadata
+            .get(&token)
+            .is_some_and(|existing| existing == value)
+        {
+            return true;
+        }
+        if self
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.metadata.get(&token).is_some_and(|v| v == value))
+        {
+            return true;
+        }
+        if self
+            .findings
+            .iter()
+            .any(|finding| finding.metadata.get(&token).is_some_and(|v| v == value))
+        {
+            return true;
+        }
+        if self
+            .sessions
+            .iter()
+            .any(|session| session.metadata.get(&token).is_some_and(|v| v == value))
+        {
+            return true;
+        }
+        self.runs
+            .iter()
+            .any(|run| run.metadata.get(&token).is_some_and(|v| v == value))
+    }
+}
+
+impl Default for PredicateSnapshot {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,6 +628,109 @@ impl Predicate {
                 .map(|actual| actual == value)
                 .unwrap_or(false),
         }
+    }
+
+    pub fn evaluate_snapshot(&self, snapshot: &PredicateSnapshot) -> bool {
+        match self {
+            Predicate::FindingExists { finding_type } => snapshot
+                .findings
+                .iter()
+                .any(|finding| finding.finding_type == normalize_token(finding_type)),
+            Predicate::SessionPrivilege { level } => snapshot
+                .sessions
+                .iter()
+                .any(|session| session.privilege == Some(*level)),
+            Predicate::ArtifactTagMatch { tag } => {
+                let token = normalize_token(tag);
+                snapshot
+                    .artifacts
+                    .iter()
+                    .any(|artifact| artifact.tags.contains(&token))
+            }
+            Predicate::RunSucceeded { module_name } => {
+                let token = normalize_token(module_name);
+                snapshot.runs.iter().any(|run| {
+                    run.module_name == token && run.run.state == domain::RunState::Succeeded
+                })
+            }
+            Predicate::CustomMetadataMatch { key, value } => {
+                snapshot.contains_metadata_match(key, value)
+            }
+        }
+    }
+
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            Predicate::FindingExists { finding_type } => {
+                out.push(1);
+                write_string(&mut out, &normalize_token(finding_type));
+            }
+            Predicate::SessionPrivilege { level } => {
+                out.push(2);
+                out.push(match level {
+                    SessionPrivilegeLevel::User => 0,
+                    SessionPrivilegeLevel::Elevated => 1,
+                    SessionPrivilegeLevel::Root => 2,
+                });
+            }
+            Predicate::ArtifactTagMatch { tag } => {
+                out.push(3);
+                write_string(&mut out, &normalize_token(tag));
+            }
+            Predicate::RunSucceeded { module_name } => {
+                out.push(4);
+                write_string(&mut out, &normalize_token(module_name));
+            }
+            Predicate::CustomMetadataMatch { key, value } => {
+                out.push(5);
+                write_string(&mut out, &normalize_token(key));
+                value.write_wire(&mut out);
+            }
+        }
+        out
+    }
+
+    pub fn from_wire_bytes(input: &[u8]) -> Result<Self, CampaignModelError> {
+        let mut cursor = WireCursor::new(input);
+        let tag = cursor.read_u8()?;
+        let predicate = match tag {
+            1 => Predicate::FindingExists {
+                finding_type: cursor.read_string()?,
+            },
+            2 => {
+                let privilege = cursor.read_u8()?;
+                let level = match privilege {
+                    0 => SessionPrivilegeLevel::User,
+                    1 => SessionPrivilegeLevel::Elevated,
+                    2 => SessionPrivilegeLevel::Root,
+                    _ => {
+                        return Err(CampaignModelError::Parse {
+                            reason: "unknown session privilege level tag",
+                        });
+                    }
+                };
+                Predicate::SessionPrivilege { level }
+            }
+            3 => Predicate::ArtifactTagMatch {
+                tag: cursor.read_string()?,
+            },
+            4 => Predicate::RunSucceeded {
+                module_name: cursor.read_string()?,
+            },
+            5 => {
+                let key = cursor.read_string()?;
+                let value = MetadataValue::read_wire(&mut cursor)?;
+                Predicate::CustomMetadataMatch { key, value }
+            }
+            _ => {
+                return Err(CampaignModelError::Parse {
+                    reason: "unknown predicate tag",
+                });
+            }
+        };
+        cursor.ensure_finished()?;
+        Ok(predicate)
     }
 }
 
@@ -580,10 +949,22 @@ impl Objective {
             .all(|predicate| predicate.evaluate(view))
     }
 
+    pub fn success_criteria_satisfied_snapshot(&self, snapshot: &PredicateSnapshot) -> bool {
+        self.success_criteria
+            .iter()
+            .all(|predicate| predicate.evaluate_snapshot(snapshot))
+    }
+
     pub fn failure_criteria_satisfied(&self, view: &PredicateEvaluationView) -> bool {
         self.failure_criteria
             .iter()
             .any(|predicate| predicate.evaluate(view))
+    }
+
+    pub fn failure_criteria_satisfied_snapshot(&self, snapshot: &PredicateSnapshot) -> bool {
+        self.failure_criteria
+            .iter()
+            .any(|predicate| predicate.evaluate_snapshot(snapshot))
     }
 
     pub fn evaluate_transition(
@@ -593,6 +974,33 @@ impl Objective {
     ) -> ObjectiveEvaluationResult {
         let success_criteria_satisfied = self.success_criteria_satisfied(view);
         let failure_criteria_satisfied = self.failure_criteria_satisfied(view);
+
+        let next_status = match self.status {
+            ObjectiveStatus::Pending if prerequisites_satisfied => Some(ObjectiveStatus::Eligible),
+            ObjectiveStatus::InProgress if failure_criteria_satisfied => {
+                Some(ObjectiveStatus::Failed)
+            }
+            ObjectiveStatus::InProgress if success_criteria_satisfied => {
+                Some(ObjectiveStatus::Achieved)
+            }
+            _ => None,
+        };
+
+        ObjectiveEvaluationResult {
+            prerequisites_satisfied,
+            success_criteria_satisfied,
+            failure_criteria_satisfied,
+            next_status,
+        }
+    }
+
+    pub fn evaluate_transition_snapshot(
+        &self,
+        prerequisites_satisfied: bool,
+        snapshot: &PredicateSnapshot,
+    ) -> ObjectiveEvaluationResult {
+        let success_criteria_satisfied = self.success_criteria_satisfied_snapshot(snapshot);
+        let failure_criteria_satisfied = self.failure_criteria_satisfied_snapshot(snapshot);
 
         let next_status = match self.status {
             ObjectiveStatus::Pending if prerequisites_satisfied => Some(ObjectiveStatus::Eligible),
@@ -922,6 +1330,75 @@ pub struct CampaignEvent {
     pub payload: CampaignEventPayload,
 }
 
+struct WireCursor<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> WireCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
+    }
+
+    fn read_u8(&mut self) -> Result<u8, CampaignModelError> {
+        let byte = *self
+            .data
+            .get(self.offset)
+            .ok_or(CampaignModelError::Parse {
+                reason: "unexpected end of input",
+            })?;
+        self.offset += 1;
+        Ok(byte)
+    }
+
+    fn read_exact<const N: usize>(&mut self) -> Result<[u8; N], CampaignModelError> {
+        if self.offset + N > self.data.len() {
+            return Err(CampaignModelError::Parse {
+                reason: "unexpected end of input",
+            });
+        }
+        let mut buf = [0u8; N];
+        buf.copy_from_slice(&self.data[self.offset..self.offset + N]);
+        self.offset += N;
+        Ok(buf)
+    }
+
+    fn read_u32(&mut self) -> Result<u32, CampaignModelError> {
+        Ok(u32::from_be_bytes(self.read_exact::<4>()?))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, CampaignModelError> {
+        Ok(u64::from_be_bytes(self.read_exact::<8>()?))
+    }
+
+    fn read_i64(&mut self) -> Result<i64, CampaignModelError> {
+        Ok(i64::from_be_bytes(self.read_exact::<8>()?))
+    }
+
+    fn read_string(&mut self) -> Result<String, CampaignModelError> {
+        let len = self.read_u32()? as usize;
+        if self.offset + len > self.data.len() {
+            return Err(CampaignModelError::Parse {
+                reason: "string length exceeds input buffer",
+            });
+        }
+        let raw = &self.data[self.offset..self.offset + len];
+        self.offset += len;
+        String::from_utf8(raw.to_vec()).map_err(|_| CampaignModelError::Parse {
+            reason: "invalid utf-8 string",
+        })
+    }
+
+    fn ensure_finished(&self) -> Result<(), CampaignModelError> {
+        if self.offset != self.data.len() {
+            return Err(CampaignModelError::Parse {
+                reason: "extra bytes at end of input",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisitState {
     Visiting,
@@ -1031,6 +1508,15 @@ fn dedupe_objective_ids(ids: Vec<ObjectiveId>) -> Vec<ObjectiveId> {
         }
     }
     out
+}
+
+fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_string(out: &mut Vec<u8>, value: &str) {
+    write_u32(out, value.len() as u32);
+    out.extend_from_slice(value.as_bytes());
 }
 
 fn ensure_non_empty(value: &str, field: &'static str) -> Result<(), CampaignModelError> {
@@ -1466,5 +1952,191 @@ mod tests {
         )
         .expect_err("self prereq must fail");
         assert_eq!(self_ref_err.code(), "ML-CAMP-0001");
+    }
+
+    #[test]
+    fn predicate_wire_serialization_round_trip_is_deterministic() {
+        let predicates = vec![
+            Predicate::FindingExists {
+                finding_type: "credential".to_string(),
+            },
+            Predicate::SessionPrivilege {
+                level: SessionPrivilegeLevel::Elevated,
+            },
+            Predicate::ArtifactTagMatch {
+                tag: "loot".to_string(),
+            },
+            Predicate::RunSucceeded {
+                module_name: "exploit/linux/example".to_string(),
+            },
+            Predicate::CustomMetadataMatch {
+                key: "owner".to_string(),
+                value: MetadataValue::Object(BTreeMap::from([
+                    (
+                        "team".to_string(),
+                        MetadataValue::Text("purple".to_string()),
+                    ),
+                    ("risk".to_string(), MetadataValue::Integer(2)),
+                ])),
+            },
+        ];
+
+        for predicate in predicates {
+            let encoded_a = predicate.to_wire_bytes();
+            let encoded_b = predicate.to_wire_bytes();
+            assert_eq!(encoded_a, encoded_b, "wire bytes must be deterministic");
+
+            let decoded = Predicate::from_wire_bytes(&encoded_a).expect("decode predicate");
+            assert_eq!(decoded, predicate);
+            assert_eq!(decoded.to_wire_bytes(), encoded_a);
+        }
+    }
+
+    #[test]
+    fn predicate_snapshot_evaluation_is_pure_and_replay_safe() {
+        let workspace = domain::Workspace::new_at("ws", "test", 1).expect("workspace");
+        let module = domain::ModuleVersion::new_at(
+            "exploit/linux/example",
+            "1.0.0",
+            1,
+            "entrypoint",
+            "sha256",
+            1,
+        )
+        .expect("module");
+        let mut run =
+            domain::Run::new_at(workspace.id, module.id, None, "operator", 2).expect("run");
+        run.transition_state(domain::RunState::Running, 3)
+            .expect("run running");
+        run.transition_state(domain::RunState::Succeeded, 4)
+            .expect("run succeeded");
+
+        let mut session =
+            domain::Session::new_at(run.id, None, "shell", "127.0.0.1:23", 5).expect("session");
+        session
+            .transition_state(domain::SessionState::Open, 6)
+            .expect("session open");
+
+        let mut artifact = domain::Artifact::new_at(
+            run.id,
+            None,
+            Some(session.id),
+            domain::ArtifactKind::CommandOutput,
+            "cmd-out",
+            "memory://1",
+            7,
+        )
+        .expect("artifact");
+        artifact
+            .transition_state(domain::ArtifactState::Available, 8)
+            .expect("artifact available");
+
+        let finding = domain::Finding::new_at(
+            run.id,
+            None,
+            Some(session.id),
+            "Credential found",
+            "password in config",
+            domain::FindingSeverity::High,
+            9,
+        )
+        .expect("finding");
+
+        let snapshot = PredicateSnapshot::new()
+            .with_run(
+                RunSnapshot::new(run, "exploit/linux/example")
+                    .expect("run snapshot")
+                    .with_metadata("owner", MetadataValue::Text("red".to_string())),
+            )
+            .with_session(
+                SessionSnapshot::new(session)
+                    .with_privilege(SessionPrivilegeLevel::Root)
+                    .with_metadata("channel", MetadataValue::Text("pty".to_string())),
+            )
+            .with_artifact(
+                ArtifactSnapshot::new(artifact)
+                    .with_tag("loot")
+                    .with_metadata("path", MetadataValue::Text("/tmp/loot".to_string())),
+            )
+            .with_finding(
+                FindingSnapshot::new(finding, "credential")
+                    .expect("finding snapshot")
+                    .with_metadata("source", MetadataValue::Text("procfs".to_string())),
+            )
+            .with_metadata("owner", MetadataValue::Text("red".to_string()));
+
+        let predicates = vec![
+            Predicate::FindingExists {
+                finding_type: "credential".to_string(),
+            },
+            Predicate::SessionPrivilege {
+                level: SessionPrivilegeLevel::Root,
+            },
+            Predicate::ArtifactTagMatch {
+                tag: "loot".to_string(),
+            },
+            Predicate::RunSucceeded {
+                module_name: "exploit/linux/example".to_string(),
+            },
+            Predicate::CustomMetadataMatch {
+                key: "owner".to_string(),
+                value: MetadataValue::Text("red".to_string()),
+            },
+            Predicate::CustomMetadataMatch {
+                key: "path".to_string(),
+                value: MetadataValue::Text("/tmp/loot".to_string()),
+            },
+        ];
+
+        for predicate in predicates {
+            let first = predicate.evaluate_snapshot(&snapshot);
+            let second = predicate.evaluate_snapshot(&snapshot);
+            assert_eq!(first, second, "evaluation must be deterministic");
+            assert!(first, "predicate must match immutable snapshot");
+        }
+    }
+
+    #[test]
+    fn objective_snapshot_evaluation_matches_for_identical_inputs() {
+        let objective = Objective::new_at(
+            objective_id("7f5f5d5c-f9a9-42dc-a0ef-3d96f5565de8"),
+            campaign_id("de305d54-75b4-431b-adb2-eb6b9e546014"),
+            "Escalate",
+            "Get root",
+            vec![],
+            vec![Predicate::SessionPrivilege {
+                level: SessionPrivilegeLevel::Root,
+            }],
+            vec![Predicate::FindingExists {
+                finding_type: "detection".to_string(),
+            }],
+            RiskLevel::High,
+            None,
+            10,
+        )
+        .expect("objective");
+
+        let workspace = domain::Workspace::new_at("ws", "test", 1).expect("workspace");
+        let module = domain::ModuleVersion::new_at(
+            "exploit/linux/example",
+            "1.0.0",
+            1,
+            "entrypoint",
+            "sha256",
+            1,
+        )
+        .expect("module");
+        let run = domain::Run::new_at(workspace.id, module.id, None, "operator", 2).expect("run");
+        let session =
+            domain::Session::new_at(run.id, None, "shell", "127.0.0.1:23", 3).expect("session");
+        let snapshot = PredicateSnapshot::new()
+            .with_run(RunSnapshot::new(run, "exploit/linux/example").expect("run snapshot"))
+            .with_session(
+                SessionSnapshot::new(session).with_privilege(SessionPrivilegeLevel::Root),
+            );
+
+        let first = objective.evaluate_transition_snapshot(true, &snapshot);
+        let second = objective.evaluate_transition_snapshot(true, &snapshot);
+        assert_eq!(first, second);
     }
 }
