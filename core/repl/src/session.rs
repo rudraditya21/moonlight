@@ -63,6 +63,173 @@ pub struct Repl {
     palette: Palette,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CommandHelpSpec {
+    name: &'static str,
+    summary: &'static str,
+    usage: &'static str,
+    aliases: &'static [&'static str],
+    examples: &'static [&'static str],
+    notes: &'static [&'static str],
+}
+
+const COMMAND_HELP: &[CommandHelpSpec] = &[
+    CommandHelpSpec {
+        name: "help",
+        summary: "Show general help or help for one command",
+        usage: "help [command]",
+        aliases: &[],
+        examples: &["help", "help run", "help release"],
+        notes: &[],
+    },
+    CommandHelpSpec {
+        name: "clear",
+        summary: "Clear terminal screen",
+        usage: "clear",
+        aliases: &["cls"],
+        examples: &["clear"],
+        notes: &[
+            "In JSON output mode, clear returns a normal command response instead of terminal control bytes.",
+        ],
+    },
+    CommandHelpSpec {
+        name: "show",
+        summary: "Show modules/options/globals",
+        usage: "show modules | show options | show globals",
+        aliases: &[],
+        examples: &["show modules", "show options", "show globals"],
+        notes: &[],
+    },
+    CommandHelpSpec {
+        name: "use",
+        summary: "Select a module",
+        usage: "use <module>",
+        aliases: &[],
+        examples: &["use exploit/linux/telnet/gnu_inetutils_telnetd_auth_bypass"],
+        notes: &[],
+    },
+    CommandHelpSpec {
+        name: "search",
+        summary: "Search module catalog",
+        usage: "search <query> [--category <cat>] [--rank <rank>] [--platform <platform>] [--tag <tag>] [--limit <n>]",
+        aliases: &[],
+        examples: &["search telnet", "search hash --category auxiliary --limit 10"],
+        notes: &[],
+    },
+    CommandHelpSpec {
+        name: "info",
+        summary: "Show module metadata and options",
+        usage: "info [module]",
+        aliases: &[],
+        examples: &["info", "info exploit/linux/telnet/gnu_inetutils_telnetd_auth_bypass"],
+        notes: &[],
+    },
+    CommandHelpSpec {
+        name: "set",
+        summary: "Set module option value",
+        usage: "set <option> <value>",
+        aliases: &[],
+        examples: &["set RHOST <ip-addr>", "set RPORT <port>"],
+        notes: &[],
+    },
+    CommandHelpSpec {
+        name: "get",
+        summary: "Get module option value",
+        usage: "get <option>",
+        aliases: &[],
+        examples: &["get RHOST"],
+        notes: &[],
+    },
+    CommandHelpSpec {
+        name: "setg",
+        summary: "Set global setting",
+        usage: "setg <key> <value>",
+        aliases: &[],
+        examples: &[
+            "setg output_mode json",
+            "setg session_max_pending_bytes 65536",
+            "setg session_drain_bytes 4096",
+        ],
+        notes: &[],
+    },
+    CommandHelpSpec {
+        name: "getg",
+        summary: "Get global setting",
+        usage: "getg <key>",
+        aliases: &[],
+        examples: &["getg output_mode", "getg session_max_pending_bytes"],
+        notes: &[],
+    },
+    CommandHelpSpec {
+        name: "run",
+        summary: "Execute active module",
+        usage: "run [--yes]",
+        aliases: &[],
+        examples: &["run", "run --yes"],
+        notes: &["--yes skips confirmation prompts for that execution."],
+    },
+    CommandHelpSpec {
+        name: "output",
+        summary: "Show or set output mode",
+        usage: "output [human|json]",
+        aliases: &[],
+        examples: &["output", "output json"],
+        notes: &[],
+    },
+    CommandHelpSpec {
+        name: "policy",
+        summary: "Show or update safety capabilities",
+        usage: "policy | policy <enable|disable> <capability>",
+        aliases: &[],
+        examples: &["policy", "policy enable exploit_execution", "policy disable public_targets"],
+        notes: &[],
+    },
+    CommandHelpSpec {
+        name: "release",
+        summary: "Run release readiness, migration, and rollback workflows",
+        usage: "release | release check | release matrix | release migrate ... | release rollback ...",
+        aliases: &[],
+        examples: &[
+            "release check",
+            "release migrate plan 1 3",
+            "release rollback snapshot pre-release",
+        ],
+        notes: &[],
+    },
+    CommandHelpSpec {
+        name: "sessions",
+        summary: "List/read/close sessions",
+        usage: "sessions | sessions -r <id> | sessions -R | sessions -k <id> [--yes] | sessions -K [--yes]",
+        aliases: &[],
+        examples: &["sessions", "sessions -r 1", "sessions -k 1 --yes"],
+        notes: &[],
+    },
+    CommandHelpSpec {
+        name: "interact",
+        summary: "Attach interactive shell to session",
+        usage: "interact <session-id>",
+        aliases: &[],
+        examples: &["interact 1"],
+        notes: &["Inside interact mode, use 'background' to detach without closing session."],
+    },
+    CommandHelpSpec {
+        name: "history",
+        summary: "Show command history",
+        usage: "history",
+        aliases: &[],
+        examples: &["history"],
+        notes: &[],
+    },
+    CommandHelpSpec {
+        name: "exit",
+        summary: "Exit the console",
+        usage: "exit",
+        aliases: &["quit"],
+        examples: &["exit", "quit"],
+        notes: &[],
+    },
+];
+
 impl Repl {
     pub fn new(prompt: String, registry: ModuleRegistry, catalog: Option<ModuleCatalog>) -> Self {
         let module_compat = ModuleCompatibilityPolicy::catalog_default();
@@ -210,7 +377,8 @@ impl Repl {
     fn handle_command(&mut self, tokens: &[String]) -> bool {
         let cmd = tokens[0].to_lowercase();
         match cmd.as_str() {
-            "help" => self.cmd_help(),
+            "help" => self.cmd_help(tokens),
+            "clear" | "cls" => self.cmd_clear(),
             "exit" | "quit" => return true,
             "history" => self.cmd_history(),
             "use" => self.cmd_use(tokens),
@@ -236,40 +404,73 @@ impl Repl {
         false
     }
 
-    fn cmd_help(&self) {
-        println!("Commands:");
-        println!("  help                Show this help");
-        println!("  show modules         List modules");
-        println!("  use <name>           Select module");
-        println!("  show options         Show module options");
-        println!("  search <query>       Search modules");
-        println!("  info [module]        Show module details");
-        println!("  set <opt> <value>    Set module option");
-        println!("  get <opt>            Get module option");
-        println!(
-            "  setg <k> <v>         Set global setting (e.g. output_mode, session_max_pending_bytes)"
+    fn cmd_help(&self, tokens: &[String]) {
+        if tokens.len() == 1 {
+            if self.output_mode.is_json() {
+                let commands = command_primary_names().join(",");
+                self.emit_response(
+                    CommandResponse::ok("help", "available commands")
+                        .with_field("count", COMMAND_HELP.len())
+                        .with_field("commands", commands),
+                );
+                return;
+            }
+            println!("Commands:");
+            for spec in COMMAND_HELP {
+                println!("  {:<16} {}", spec.name, spec.summary);
+            }
+            println!("Run 'help <command>' for detailed usage.");
+            return;
+        }
+
+        let topic = tokens[1].to_ascii_lowercase();
+        let Some(spec) = find_command_help(&topic) else {
+            self.emit_error(
+                "help",
+                CliCode::NotFound,
+                &format!(
+                    "unknown command for help: {} (run 'help' to list commands)",
+                    tokens[1]
+                ),
+            );
+            return;
+        };
+
+        self.emit_response(
+            CommandResponse::ok("help", "command help")
+                .with_field("command", spec.name)
+                .with_field("usage", spec.usage),
         );
-        println!("  getg <k>             Get global setting value");
-        println!("  run                  Execute module");
-        println!("  run --yes            Execute without prompt when confirmation is required");
-        println!("  output               Show current output mode (human|json)");
-        println!("  output <mode>        Set output mode: human|json");
-        println!("  policy               Show guardrail policy and capabilities");
-        println!("  policy enable <cap>  Enable a capability (exploit_execution, payload_execution, evasion_execution, public_targets, wide_target_scope, bulk_session_control)");
-        println!("  policy disable <cap> Disable a capability");
-        println!("  release              Show release state and usage");
-        println!("  release check        Run release readiness checks");
-        println!("  release matrix       Run compatibility matrix tests");
-        println!("  release migrate ...  Plan/apply schema migrations");
-        println!("  release rollback ... Manage rollback snapshots");
-        println!("  sessions             List sessions");
-        println!("  sessions -k <id>     Close a session");
-        println!("  sessions -K          Close all sessions");
-        println!("  sessions -r <id>     Read buffered output for one session");
-        println!("  sessions -R          Read buffered output for all background sessions");
-        println!("  interact <id>        Interact with a session");
-        println!("  history              Show command history");
-        println!("  exit|quit            Exit the console");
+        if self.output_mode.is_json() {
+            return;
+        }
+
+        println!("Description: {}", spec.summary);
+        println!("Usage:       {}", spec.usage);
+        if !spec.aliases.is_empty() {
+            println!("Aliases:     {}", spec.aliases.join(", "));
+        }
+        if !spec.examples.is_empty() {
+            println!("Examples:");
+            for example in spec.examples {
+                println!("  {}", example);
+            }
+        }
+        if !spec.notes.is_empty() {
+            println!("Notes:");
+            for note in spec.notes {
+                println!("  - {}", note);
+            }
+        }
+    }
+
+    fn cmd_clear(&self) {
+        if self.output_mode.is_json() {
+            self.emit_ok("clear", "screen cleared");
+            return;
+        }
+        print!("\x1b[2J\x1b[H");
+        let _ = io::stdout().flush();
     }
 
     fn cmd_history(&self) {
@@ -2137,6 +2338,11 @@ impl Repl {
         } else {
             let cmd = tokens[0].to_lowercase();
             match cmd.as_str() {
+                "help" => {
+                    if token_index == 1 {
+                        candidates = help_topic_candidates(current);
+                    }
+                }
                 "use" | "info" => {
                     if token_index == 1 {
                         candidates = module_candidates(self, current);
@@ -2220,6 +2426,7 @@ impl Repl {
                         candidates = capability_candidates(current);
                     }
                 }
+                "clear" | "cls" => {}
                 "release" => {
                     if token_index == 1 {
                         candidates = ["check", "matrix", "migrate", "rollback"]
@@ -2337,12 +2544,8 @@ impl Repl {
 }
 
 fn command_candidates(prefix: &str) -> Vec<String> {
-    let commands = [
-        "help", "show", "use", "search", "set", "get", "setg", "getg", "run", "output", "policy",
-        "release", "sessions", "interact", "history", "info", "exit", "quit",
-    ];
-    commands
-        .iter()
+    command_tokens()
+        .into_iter()
         .filter(|cmd| cmd.starts_with(prefix))
         .map(|cmd| cmd.to_string())
         .collect()
@@ -2353,6 +2556,14 @@ fn capability_candidates(prefix: &str) -> Vec<String> {
         .iter()
         .map(|cap| cap.as_str().to_string())
         .filter(|cap| cap.starts_with(prefix))
+        .collect()
+}
+
+fn help_topic_candidates(prefix: &str) -> Vec<String> {
+    command_tokens()
+        .into_iter()
+        .filter(|name| name.starts_with(prefix))
+        .map(|name| name.to_string())
         .collect()
 }
 
@@ -2444,6 +2655,41 @@ fn bool_word(value: bool) -> String {
 
 fn release_usage_string() -> String {
     "usage: release check | release matrix | release migrate plan <from> <to> | release migrate apply <to> | release rollback snapshot <label> | release rollback list | release rollback apply <snapshot_id> | release rollback prune <keep_latest>".to_string()
+}
+
+fn command_tokens() -> Vec<&'static str> {
+    let mut tokens = Vec::new();
+    for spec in COMMAND_HELP {
+        tokens.push(spec.name);
+        for alias in spec.aliases {
+            tokens.push(*alias);
+        }
+    }
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
+}
+
+fn command_primary_names() -> Vec<String> {
+    COMMAND_HELP
+        .iter()
+        .map(|spec| spec.name.to_string())
+        .collect()
+}
+
+fn find_command_help(topic: &str) -> Option<&'static CommandHelpSpec> {
+    let normalized = topic.trim().to_ascii_lowercase();
+    for spec in COMMAND_HELP {
+        if spec.name == normalized {
+            return Some(spec);
+        }
+        for alias in spec.aliases {
+            if *alias == normalized {
+                return Some(spec);
+            }
+        }
+    }
+    None
 }
 
 fn print_aligned_rows(rows: &[(&str, &str)]) {
@@ -2538,5 +2784,42 @@ fn print_options_table(options: &modules::ModuleOptions) {
             w3 = widths[3],
             w4 = widths[4]
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_lookup_supports_primary_and_alias_commands() {
+        let help = find_command_help("help").expect("help command");
+        assert_eq!(help.name, "help");
+
+        let clear_alias = find_command_help("cls").expect("clear alias");
+        assert_eq!(clear_alias.name, "clear");
+
+        let exit_alias = find_command_help("quit").expect("exit alias");
+        assert_eq!(exit_alias.name, "exit");
+    }
+
+    #[test]
+    fn help_lookup_rejects_unknown_command() {
+        assert!(find_command_help("nonexistent").is_none());
+    }
+
+    #[test]
+    fn command_tokens_include_clear_and_release_commands() {
+        let commands = command_tokens();
+        assert!(commands.contains(&"clear"));
+        assert!(commands.contains(&"cls"));
+        assert!(commands.contains(&"release"));
+    }
+
+    #[test]
+    fn help_topic_candidates_filter_by_prefix() {
+        let prefixed = help_topic_candidates("re");
+        assert!(prefixed.contains(&"release".to_string()));
+        assert!(!prefixed.contains(&"help".to_string()));
     }
 }

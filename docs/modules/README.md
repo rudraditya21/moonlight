@@ -23,6 +23,14 @@ setg session_drain_bytes 4096
 getg output_mode
 ```
 
+Console help utilities:
+
+```text
+help
+help <command>
+clear
+```
+
 ## Exploit Modules
 - `exploit/linux/telnet/gnu_inetutils_telnetd_auth_bypass`  
   See `docs/modules/exploit/linux/telnet/gnu_inetutils_telnetd_auth_bypass.md`.

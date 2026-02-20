@@ -9,6 +9,7 @@ Use `release` to inspect or enforce release discipline from the operator console
 
 ```text
 moonlight> release
+moonlight> help release
 ```
 
 What it does:

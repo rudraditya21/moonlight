@@ -121,6 +121,15 @@ moonlight> setg session_drain_bytes 4096
 moonlight> getg output_mode
 ```
 
+Command assistance:
+
+```
+moonlight> help
+moonlight> help run
+moonlight> help sessions
+moonlight> clear
+```
+
 Release-discipline commands:
 
 ```
