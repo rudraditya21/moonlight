@@ -615,6 +615,21 @@ fn build_search_text(metadata: &ModuleMetadata) -> String {
         out.push(' ');
         out.push_str(&platform.to_ascii_lowercase());
     }
+    for reference in &metadata.references {
+        let kind = reference.kind.to_ascii_lowercase();
+        let value = reference.value.to_ascii_lowercase();
+        out.push(' ');
+        out.push_str(&kind);
+        out.push(' ');
+        out.push_str(&value);
+
+        if kind == "cve" {
+            if let Some(suffix) = value.strip_prefix("cve-") {
+                out.push(' ');
+                out.push_str(suffix);
+            }
+        }
+    }
     out
 }
 
@@ -1354,14 +1369,34 @@ mod tests {
     use super::*;
 
     fn write_manifest(path: &Path, name: &str, category: &str, tags: &[&str]) {
+        write_manifest_with_references(path, name, category, tags, &[]);
+    }
+
+    fn write_manifest_with_references(
+        path: &Path,
+        name: &str,
+        category: &str,
+        tags: &[&str],
+        references: &[(&str, &str)],
+    ) {
         let tags_json = tags
             .iter()
             .map(|t| format!("\"{}\"", t))
             .collect::<Vec<String>>()
             .join(",");
+        let references_json = references
+            .iter()
+            .map(|(kind, value)| format!("{{\"kind\":\"{}\",\"value\":\"{}\"}}", kind, value))
+            .collect::<Vec<String>>()
+            .join(",");
+        let references_field = if references.is_empty() {
+            String::new()
+        } else {
+            format!(",\n  \"references\": [{}]", references_json)
+        };
         let content = format!(
-            "{{\n  \"manifest_version\": 1,\n  \"module_api_version\": 1,\n  \"runtime\": \"builtin\",\n  \"name\": \"{}\",\n  \"description\": \"{}\",\n  \"category\": \"{}\",\n  \"rank\": \"normal\",\n  \"author\": \"me\",\n  \"platforms\": [\"cross\"],\n  \"tags\": [{}],\n  \"entrypoint\": \"module.rs\"\n}}",
-            name, name, category, tags_json
+            "{{\n  \"manifest_version\": 1,\n  \"module_api_version\": 1,\n  \"runtime\": \"builtin\",\n  \"name\": \"{}\",\n  \"description\": \"{}\",\n  \"category\": \"{}\",\n  \"rank\": \"normal\",\n  \"author\": \"me\",\n  \"platforms\": [\"cross\"],\n  \"tags\": [{}],\n  \"entrypoint\": \"module.rs\"{}\n}}",
+            name, name, category, tags_json, references_field
         );
         std::fs::write(path, content).expect("write manifest");
     }
@@ -1452,6 +1487,55 @@ mod tests {
             "error: {}",
             catalog.validation_errors()[0]
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn search_includes_cve_references_from_manifest() {
+        let root = std::env::temp_dir().join("moonlight_catalog_cve_search_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        let mod_dir = root.join("mod");
+        std::fs::create_dir_all(&mod_dir).expect("create mod");
+        write_manifest_with_references(
+            &mod_dir.join("module.json"),
+            "exploit/linux/telnet/gnu_inetutils_telnetd_auth_bypass",
+            "exploit",
+            &["telnet"],
+            &[("cve", "CVE-2026-24061")],
+        );
+
+        let cache_dir = root.join(".cache");
+        let catalog = ModuleCatalog::load(&root, &cache_dir).expect("load catalog");
+        assert_eq!(catalog.len(), 1);
+        let record = catalog
+            .get_by_name("exploit/linux/telnet/gnu_inetutils_telnetd_auth_bypass")
+            .expect("module present");
+        assert!(
+            record.search_text.contains("cve-2026-24061"),
+            "search text did not include CVE reference: {}",
+            record.search_text
+        );
+
+        let mut query = SearchQuery::new();
+        query.term = Some("CVE-2026-24061".to_string());
+        let cve_results = catalog.search(&query);
+        assert_eq!(cve_results.len(), 1);
+        assert_eq!(
+            cve_results[0].metadata.name,
+            "exploit/linux/telnet/gnu_inetutils_telnetd_auth_bypass"
+        );
+
+        let mut number_only_query = SearchQuery::new();
+        number_only_query.term = Some("2026-24061".to_string());
+        let number_results = catalog.search(&number_only_query);
+        assert_eq!(number_results.len(), 1);
+
+        let mut kind_query = SearchQuery::new();
+        kind_query.term = Some("cve".to_string());
+        let kind_results = catalog.search(&kind_query);
+        assert_eq!(kind_results.len(), 1);
 
         std::fs::remove_dir_all(&root).ok();
     }
