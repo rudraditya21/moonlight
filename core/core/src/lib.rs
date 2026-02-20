@@ -1,3 +1,4 @@
+pub mod campaign;
 pub mod control;
 pub mod domain;
 pub mod error;
