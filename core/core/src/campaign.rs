@@ -12,6 +12,12 @@ pub enum CampaignModelError {
         from: &'static str,
         to: &'static str,
     },
+    MissingObjective {
+        objective_id: ObjectiveId,
+    },
+    PrerequisiteCycle {
+        objective_id: ObjectiveId,
+    },
 }
 
 impl fmt::Display for CampaignModelError {
@@ -23,11 +29,36 @@ impl fmt::Display for CampaignModelError {
             CampaignModelError::InvalidTransition { entity, from, to } => {
                 write!(f, "invalid {entity} transition: {from} -> {to}")
             }
+            CampaignModelError::MissingObjective { objective_id } => {
+                write!(
+                    f,
+                    "objective reference does not exist in campaign graph: {}",
+                    objective_id.as_str()
+                )
+            }
+            CampaignModelError::PrerequisiteCycle { objective_id } => {
+                write!(
+                    f,
+                    "objective prerequisite cycle detected near objective {}",
+                    objective_id.as_str()
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for CampaignModelError {}
+
+impl CampaignModelError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            CampaignModelError::InvalidField { .. } => "ML-CAMP-0001",
+            CampaignModelError::InvalidTransition { .. } => "ML-CAMP-0002",
+            CampaignModelError::MissingObjective { .. } => "ML-CAMP-0003",
+            CampaignModelError::PrerequisiteCycle { .. } => "ML-CAMP-0004",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Uuid(String);
@@ -891,6 +922,106 @@ pub struct CampaignEvent {
     pub payload: CampaignEventPayload,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisitState {
+    Visiting,
+    Visited,
+}
+
+pub fn validate_prerequisite_graph(objectives: &[Objective]) -> Result<(), CampaignModelError> {
+    let mut objective_map = BTreeMap::new();
+    for objective in objectives {
+        let previous = objective_map.insert(objective.id.clone(), objective);
+        if previous.is_some() {
+            return Err(CampaignModelError::InvalidField {
+                field: "objective.id",
+                reason: "duplicate objective id in campaign graph",
+            });
+        }
+    }
+
+    for objective in objectives {
+        for prerequisite in &objective.prerequisites {
+            if !objective_map.contains_key(prerequisite) {
+                return Err(CampaignModelError::MissingObjective {
+                    objective_id: prerequisite.clone(),
+                });
+            }
+        }
+    }
+
+    let mut visit_states = BTreeMap::<ObjectiveId, VisitState>::new();
+    for objective_id in objective_map.keys() {
+        if visit_states.contains_key(objective_id) {
+            continue;
+        }
+        detect_prerequisite_cycle(objective_id, &objective_map, &mut visit_states)?;
+    }
+    Ok(())
+}
+
+pub fn validate_prerequisite_link(
+    objectives: &[Objective],
+    objective_id: &ObjectiveId,
+    prerequisite_id: &ObjectiveId,
+) -> Result<(), CampaignModelError> {
+    let mut next_objectives = objectives.to_vec();
+    let mut found = false;
+    for objective in &mut next_objectives {
+        if &objective.id == objective_id {
+            found = true;
+            if &objective.id == prerequisite_id {
+                return Err(CampaignModelError::InvalidField {
+                    field: "objective.prerequisites",
+                    reason: "cannot include objective id itself",
+                });
+            }
+            if !objective.prerequisites.contains(prerequisite_id) {
+                objective.prerequisites.push(prerequisite_id.clone());
+            }
+            break;
+        }
+    }
+
+    if !found {
+        return Err(CampaignModelError::MissingObjective {
+            objective_id: objective_id.clone(),
+        });
+    }
+
+    validate_prerequisite_graph(&next_objectives)
+}
+
+fn detect_prerequisite_cycle(
+    objective_id: &ObjectiveId,
+    objective_map: &BTreeMap<ObjectiveId, &Objective>,
+    visit_states: &mut BTreeMap<ObjectiveId, VisitState>,
+) -> Result<(), CampaignModelError> {
+    visit_states.insert(objective_id.clone(), VisitState::Visiting);
+
+    let objective =
+        objective_map
+            .get(objective_id)
+            .ok_or_else(|| CampaignModelError::MissingObjective {
+                objective_id: objective_id.clone(),
+            })?;
+
+    for prerequisite_id in &objective.prerequisites {
+        match visit_states.get(prerequisite_id).copied() {
+            Some(VisitState::Visiting) => {
+                return Err(CampaignModelError::PrerequisiteCycle {
+                    objective_id: objective_id.clone(),
+                });
+            }
+            Some(VisitState::Visited) => {}
+            None => detect_prerequisite_cycle(prerequisite_id, objective_map, visit_states)?,
+        }
+    }
+
+    visit_states.insert(objective_id.clone(), VisitState::Visited);
+    Ok(())
+}
+
 fn dedupe_objective_ids(ids: Vec<ObjectiveId>) -> Vec<ObjectiveId> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
@@ -1048,6 +1179,11 @@ mod tests {
         assert!(objective
             .transition_status(ObjectiveStatus::Pending, 43)
             .is_err());
+
+        let transition_err = campaign
+            .transition_status(CampaignStatus::Active)
+            .expect_err("no-op transition must fail");
+        assert_eq!(transition_err.code(), "ML-CAMP-0002");
     }
 
     #[test]
@@ -1211,5 +1347,124 @@ mod tests {
         let a = predicate.stable_encoding();
         let b = predicate.stable_encoding();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn graph_validation_rejects_missing_prerequisites_with_stable_error_code() {
+        let objective = Objective::new_at(
+            objective_id("0f8fad5b-d9cb-469f-a165-70867728950e"),
+            campaign_id("de305d54-75b4-431b-adb2-eb6b9e546014"),
+            "Objective A",
+            "requires unknown objective",
+            vec![objective_id("9b2f4d6a-3aa4-41ba-91ed-6308a58186a1")],
+            vec![Predicate::FindingExists {
+                finding_type: "credential".to_string(),
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            10,
+        )
+        .expect("objective");
+
+        let err = validate_prerequisite_graph(&[objective]).expect_err("missing reference");
+        assert_eq!(err.code(), "ML-CAMP-0003");
+    }
+
+    #[test]
+    fn graph_validation_rejects_cycles_with_stable_error_code() {
+        let campaign_id = campaign_id("de305d54-75b4-431b-adb2-eb6b9e546014");
+        let objective_a_id = objective_id("0f8fad5b-d9cb-469f-a165-70867728950e");
+        let objective_b_id = objective_id("9b2f4d6a-3aa4-41ba-91ed-6308a58186a1");
+
+        let objective_a = Objective::new_at(
+            objective_a_id.clone(),
+            campaign_id.clone(),
+            "Objective A",
+            "depends on B",
+            vec![objective_b_id.clone()],
+            vec![Predicate::FindingExists {
+                finding_type: "credential".to_string(),
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            10,
+        )
+        .expect("objective A");
+
+        let objective_b = Objective::new_at(
+            objective_b_id,
+            campaign_id,
+            "Objective B",
+            "depends on A",
+            vec![objective_a_id],
+            vec![Predicate::FindingExists {
+                finding_type: "credential".to_string(),
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            10,
+        )
+        .expect("objective B");
+
+        let err = validate_prerequisite_graph(&[objective_a, objective_b]).expect_err("cycle");
+        assert_eq!(err.code(), "ML-CAMP-0004");
+    }
+
+    #[test]
+    fn prerequisite_link_validation_prevents_cycle_creation() {
+        let campaign_id = campaign_id("de305d54-75b4-431b-adb2-eb6b9e546014");
+        let objective_a_id = objective_id("0f8fad5b-d9cb-469f-a165-70867728950e");
+        let objective_b_id = objective_id("9b2f4d6a-3aa4-41ba-91ed-6308a58186a1");
+
+        let objective_a = Objective::new_at(
+            objective_a_id.clone(),
+            campaign_id.clone(),
+            "Objective A",
+            "valid",
+            vec![],
+            vec![Predicate::FindingExists {
+                finding_type: "credential".to_string(),
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            10,
+        )
+        .expect("objective A");
+
+        let objective_b = Objective::new_at(
+            objective_b_id.clone(),
+            campaign_id,
+            "Objective B",
+            "depends on A",
+            vec![objective_a_id.clone()],
+            vec![Predicate::FindingExists {
+                finding_type: "credential".to_string(),
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            10,
+        )
+        .expect("objective B");
+
+        let err = validate_prerequisite_link(
+            &[objective_a.clone(), objective_b.clone()],
+            &objective_a_id,
+            &objective_b_id,
+        )
+        .expect_err("would create A<->B cycle");
+        assert_eq!(err.code(), "ML-CAMP-0004");
+
+        let self_ref_err = validate_prerequisite_link(
+            &[objective_a, objective_b],
+            &objective_a_id,
+            &objective_a_id,
+        )
+        .expect_err("self prereq must fail");
+        assert_eq!(self_ref_err.code(), "ML-CAMP-0001");
     }
 }
