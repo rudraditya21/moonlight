@@ -1,12 +1,19 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::campaign::{
+    CampaignEvent as CampaignAuditEvent, CampaignEventPayload as CampaignPayload, CampaignId,
+    CampaignStatus, Objective, ObjectiveId, ObjectiveIngestionDispatch,
+    ObjectiveIngestionDispatcher, ObjectiveIngestionEvent, ObjectiveReevaluationTrigger,
+    ObjectiveStatus, PredicateSnapshot, RiskLevel,
+};
+use crate::control::ControlState;
 use crate::domain::{
-    CorrelationId, DomainError, EventId, ModuleVersionId, Run, RunId, RunState, SessionId,
-    TargetId, Task, TaskId, TaskState, WorkspaceId,
+    ArtifactId, CorrelationId, DomainError, EventId, FindingId, ModuleVersionId, Run, RunId,
+    RunState, SessionId, TargetId, Task, TaskId, TaskState, WorkspaceId,
 };
 use crate::ids::Id;
 use crate::time::now_secs;
@@ -274,6 +281,7 @@ pub enum AuditEventPayload {
     Task(TaskEvent),
     Session(SessionEvent),
     Module(ModuleEvent),
+    Campaign(CampaignAuditEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,6 +416,45 @@ pub struct ReconstructedTask {
     pub idempotency_key: String,
     pub error: Option<String>,
     pub deduplicated_from: Option<TaskId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayDiagnostic {
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayedObjective {
+    pub objective_id: ObjectiveId,
+    pub name: Option<String>,
+    pub risk_level: Option<RiskLevel>,
+    pub status: ObjectiveStatus,
+    pub prerequisites: BTreeSet<ObjectiveId>,
+    pub evaluation_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconstructedCampaign {
+    pub campaign_id: CampaignId,
+    pub correlation_id: CorrelationId,
+    pub sequence_high_watermark: u64,
+    pub name: Option<String>,
+    pub status: CampaignStatus,
+    pub objective_ids: BTreeSet<ObjectiveId>,
+    pub objectives: BTreeMap<ObjectiveId, ReplayedObjective>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CampaignReplayReport {
+    pub campaign: Option<ReconstructedCampaign>,
+    pub diagnostics: Vec<ReplayDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CampaignReplayConsistency {
+    pub report: CampaignReplayReport,
+    pub consistent: bool,
 }
 
 pub trait AuditLogStore {
@@ -1252,17 +1299,32 @@ pub struct ObservableExecutionOrchestrator<S: SnapshotStore, A: AuditLogStore> {
     inner: ExecutionOrchestrator<S>,
     audit_store: A,
     run_correlations: BTreeMap<RunId, CorrelationId>,
+    campaign_correlations: BTreeMap<CampaignId, CorrelationId>,
+    next_campaign_sequence: BTreeMap<CampaignId, u64>,
+    campaign_ingestion_dispatchers: BTreeMap<CampaignId, ObjectiveIngestionDispatcher>,
 }
 
 impl<S: SnapshotStore, A: AuditLogStore> ObservableExecutionOrchestrator<S, A> {
     pub fn new(store: S, mut audit_store: A) -> Result<Self, OrchestratorError> {
         let inner = ExecutionOrchestrator::new(store)?;
         let mut run_correlations = BTreeMap::new();
+        let mut campaign_correlations = BTreeMap::new();
+        let mut next_campaign_sequence = BTreeMap::new();
         for event in audit_store.load_events()? {
             if let Some(run_id) = event_run_id(&event.payload) {
                 run_correlations
                     .entry(run_id)
                     .or_insert(event.correlation_id);
+            }
+            if let Some((campaign_id, sequence)) = event_campaign_meta(&event.payload) {
+                campaign_correlations
+                    .entry(campaign_id.clone())
+                    .or_insert(event.correlation_id);
+                let candidate_next = sequence.saturating_add(1);
+                let entry = next_campaign_sequence.entry(campaign_id).or_insert(1);
+                if *entry < candidate_next {
+                    *entry = candidate_next;
+                }
             }
         }
         for run_id in inner.runs.keys() {
@@ -1274,6 +1336,9 @@ impl<S: SnapshotStore, A: AuditLogStore> ObservableExecutionOrchestrator<S, A> {
             inner,
             audit_store,
             run_correlations,
+            campaign_correlations,
+            next_campaign_sequence,
+            campaign_ingestion_dispatchers: BTreeMap::new(),
         })
     }
 
@@ -1551,6 +1616,157 @@ impl<S: SnapshotStore, A: AuditLogStore> ObservableExecutionOrchestrator<S, A> {
         Ok(effective)
     }
 
+    pub fn record_campaign_event(
+        &mut self,
+        payload: CampaignPayload,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<(CorrelationId, u64), OrchestratorError> {
+        let campaign_id = payload.campaign_id().clone();
+        let effective = match (
+            self.campaign_correlations.get(&campaign_id).copied(),
+            correlation_id,
+        ) {
+            (Some(existing), Some(provided)) if existing != provided => {
+                return Err(OrchestratorError::Validation(format!(
+                    "campaign {} already bound to lineage {} but {} was provided",
+                    campaign_id.as_str(),
+                    existing.0 .0,
+                    provided.0 .0
+                )));
+            }
+            (Some(existing), _) => existing,
+            (None, Some(provided)) => {
+                self.campaign_correlations
+                    .insert(campaign_id.clone(), provided);
+                provided
+            }
+            (None, None) => {
+                let generated = CorrelationId::next();
+                self.campaign_correlations
+                    .insert(campaign_id.clone(), generated);
+                generated
+            }
+        };
+
+        let sequence = *self
+            .next_campaign_sequence
+            .entry(campaign_id.clone())
+            .or_insert(1);
+        let occurred_at = now_secs();
+        let event = CampaignAuditEvent {
+            sequence,
+            occurred_at,
+            payload,
+        };
+        self.append_event(effective, AuditEventPayload::Campaign(event))?;
+        self.next_campaign_sequence
+            .insert(campaign_id, sequence.saturating_add(1));
+        Ok((effective, sequence))
+    }
+
+    pub fn record_campaign_events<I>(
+        &mut self,
+        payloads: I,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<CorrelationId, OrchestratorError>
+    where
+        I: IntoIterator<Item = CampaignPayload>,
+    {
+        let payloads = payloads.into_iter().collect::<Vec<_>>();
+        if payloads.is_empty() {
+            return Err(OrchestratorError::Validation(
+                "campaign payload batch cannot be empty".to_string(),
+            ));
+        }
+
+        let campaign_id = payloads[0].campaign_id().clone();
+        for payload in payloads.iter().skip(1) {
+            if payload.campaign_id() != &campaign_id {
+                return Err(OrchestratorError::Validation(
+                    "all campaign payloads in a batch must belong to one campaign".to_string(),
+                ));
+            }
+        }
+
+        let mut effective = correlation_id;
+        for payload in payloads {
+            let (lineage, _sequence) = self.record_campaign_event(payload, effective)?;
+            effective = Some(lineage);
+        }
+        Ok(effective.expect("non-empty payload batch must produce lineage"))
+    }
+
+    pub fn ingest_artifact_created(
+        &mut self,
+        campaign_id: CampaignId,
+        objectives: &mut BTreeMap<ObjectiveId, Objective>,
+        snapshot: &PredicateSnapshot,
+        artifact_id: ArtifactId,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<ObjectiveIngestionDispatch, OrchestratorError> {
+        let event = ObjectiveIngestionEvent::new(
+            campaign_id,
+            ObjectiveReevaluationTrigger::ArtifactCreated,
+            &format!("artifact_created:{}", artifact_id.0 .0),
+        )
+        .map_err(|err| OrchestratorError::Validation(err.to_string()))?;
+        self.ingest_campaign_trigger(event, objectives, snapshot, correlation_id)
+    }
+
+    pub fn ingest_finding_created(
+        &mut self,
+        campaign_id: CampaignId,
+        objectives: &mut BTreeMap<ObjectiveId, Objective>,
+        snapshot: &PredicateSnapshot,
+        finding_id: FindingId,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<ObjectiveIngestionDispatch, OrchestratorError> {
+        let event = ObjectiveIngestionEvent::new(
+            campaign_id,
+            ObjectiveReevaluationTrigger::FindingCreated,
+            &format!("finding_created:{}", finding_id.0 .0),
+        )
+        .map_err(|err| OrchestratorError::Validation(err.to_string()))?;
+        self.ingest_campaign_trigger(event, objectives, snapshot, correlation_id)
+    }
+
+    pub fn ingest_session_state_changed(
+        &mut self,
+        campaign_id: CampaignId,
+        objectives: &mut BTreeMap<ObjectiveId, Objective>,
+        snapshot: &PredicateSnapshot,
+        session_id: SessionId,
+        run_id: Option<RunId>,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<ObjectiveIngestionDispatch, OrchestratorError> {
+        let propagated = correlation_id.or(run_id.and_then(|id| self.correlation_id_for_run(id)));
+        let event = ObjectiveIngestionEvent::new(
+            campaign_id,
+            ObjectiveReevaluationTrigger::SessionStateChanged,
+            &format!("session_state_changed:{}", session_id.0 .0),
+        )
+        .map_err(|err| OrchestratorError::Validation(err.to_string()))?;
+        self.ingest_campaign_trigger(event, objectives, snapshot, propagated)
+    }
+
+    pub fn ingest_run_completed(
+        &mut self,
+        campaign_id: CampaignId,
+        objectives: &mut BTreeMap<ObjectiveId, Objective>,
+        snapshot: &PredicateSnapshot,
+        run_id: RunId,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<ObjectiveIngestionDispatch, OrchestratorError> {
+        let propagated = correlation_id.or(self.correlation_id_for_run(run_id));
+        let event = ObjectiveIngestionEvent::new(
+            campaign_id,
+            ObjectiveReevaluationTrigger::RunCompleted,
+            &format!("run_completed:{}", run_id.0 .0),
+        )
+        .map_err(|err| OrchestratorError::Validation(err.to_string()))?;
+        self.ingest_campaign_trigger(event, objectives, snapshot, propagated)
+    }
+
     pub fn load_audit_events(&mut self) -> Result<Vec<AuditEvent>, OrchestratorError> {
         self.audit_store.load_events()
     }
@@ -1559,12 +1775,75 @@ impl<S: SnapshotStore, A: AuditLogStore> ObservableExecutionOrchestrator<S, A> {
         self.run_correlations.get(&run_id).copied()
     }
 
+    pub fn correlation_id_for_campaign(&self, campaign_id: &CampaignId) -> Option<CorrelationId> {
+        self.campaign_correlations.get(campaign_id).copied()
+    }
+
+    fn ingest_campaign_trigger(
+        &mut self,
+        event: ObjectiveIngestionEvent,
+        objectives: &mut BTreeMap<ObjectiveId, Objective>,
+        snapshot: &PredicateSnapshot,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<ObjectiveIngestionDispatch, OrchestratorError> {
+        if objectives
+            .values()
+            .any(|objective| objective.campaign_id != event.campaign_id)
+        {
+            return Err(OrchestratorError::Validation(
+                "all objectives must belong to ingestion campaign".to_string(),
+            ));
+        }
+
+        let dispatcher = self
+            .campaign_ingestion_dispatchers
+            .entry(event.campaign_id.clone())
+            .or_default();
+        let dispatch = dispatcher
+            .dispatch(&event, objectives, snapshot, now_secs())
+            .map_err(|err| OrchestratorError::Validation(err.to_string()))?;
+
+        if dispatch.emitted_events.is_empty() {
+            return Ok(dispatch);
+        }
+
+        let _ = self.record_campaign_events(dispatch.emitted_events.clone(), correlation_id)?;
+        Ok(dispatch)
+    }
+
     pub fn reconstruct_run_from_history(
         &mut self,
         run_id: RunId,
     ) -> Result<Option<ReconstructedRun>, OrchestratorError> {
         let events = self.audit_store.load_events()?;
         Ok(reconstruct_run_from_events(&events, run_id))
+    }
+
+    pub fn reconstruct_campaign_from_history(
+        &mut self,
+        campaign_id: &CampaignId,
+    ) -> Result<CampaignReplayReport, OrchestratorError> {
+        let events = self.audit_store.load_events()?;
+        Ok(reconstruct_campaign_from_events(&events, campaign_id))
+    }
+
+    pub fn replay_campaign_consistency(
+        &mut self,
+        campaign_id: &CampaignId,
+        snapshot: &ControlState,
+    ) -> Result<CampaignReplayConsistency, OrchestratorError> {
+        let report = self.reconstruct_campaign_from_history(campaign_id)?;
+        let diagnostics = compare_campaign_replay_to_snapshot(&report, snapshot, campaign_id);
+        let mut merged = report.diagnostics.clone();
+        merged.extend(diagnostics);
+        let consistent = merged.is_empty();
+        Ok(CampaignReplayConsistency {
+            report: CampaignReplayReport {
+                campaign: report.campaign,
+                diagnostics: merged,
+            },
+            consistent,
+        })
     }
 
     pub fn run_state(&self, run_id: RunId) -> Option<RunState> {
@@ -2060,6 +2339,99 @@ fn encode_audit_event(event: &AuditEvent) -> String {
             parts.push(encode_hex(module_path));
             parts.push(run_id.0 .0.to_string());
         }
+        AuditEventPayload::Campaign(event) => match &event.payload {
+            CampaignPayload::CampaignCreated { campaign_id, name } => {
+                parts.push("campaign_created".to_string());
+                parts.push(event.sequence.to_string());
+                parts.push(campaign_id.as_str().to_string());
+                parts.push(encode_hex(name));
+            }
+            CampaignPayload::CampaignStatusChanged {
+                campaign_id,
+                from,
+                to,
+                reason,
+            } => {
+                parts.push("campaign_status_changed".to_string());
+                parts.push(event.sequence.to_string());
+                parts.push(campaign_id.as_str().to_string());
+                parts.push(from.as_str().to_string());
+                parts.push(to.as_str().to_string());
+                parts.push(encode_opt_string(reason.as_deref()));
+            }
+            CampaignPayload::ObjectiveCreated {
+                campaign_id,
+                objective_id,
+                name,
+                risk_level,
+            } => {
+                parts.push("objective_created".to_string());
+                parts.push(event.sequence.to_string());
+                parts.push(campaign_id.as_str().to_string());
+                parts.push(objective_id.as_str().to_string());
+                parts.push(encode_hex(name));
+                parts.push(risk_level.as_str().to_string());
+            }
+            CampaignPayload::ObjectivePrereqLinked {
+                campaign_id,
+                objective_id,
+                prerequisite_id,
+            } => {
+                parts.push("objective_prereq_linked".to_string());
+                parts.push(event.sequence.to_string());
+                parts.push(campaign_id.as_str().to_string());
+                parts.push(objective_id.as_str().to_string());
+                parts.push(prerequisite_id.as_str().to_string());
+            }
+            CampaignPayload::ObjectiveStatusChanged {
+                campaign_id,
+                objective_id,
+                from,
+                to,
+                reason,
+            } => {
+                parts.push("objective_status_changed".to_string());
+                parts.push(event.sequence.to_string());
+                parts.push(campaign_id.as_str().to_string());
+                parts.push(objective_id.as_str().to_string());
+                parts.push(from.as_str().to_string());
+                parts.push(to.as_str().to_string());
+                parts.push(encode_opt_string(reason.as_deref()));
+            }
+            CampaignPayload::ObjectiveEvaluated {
+                campaign_id,
+                objective_id,
+                trigger,
+                prerequisites_satisfied,
+                success_criteria_satisfied,
+                failure_criteria_satisfied,
+                resulting_status,
+            } => {
+                parts.push("objective_evaluated".to_string());
+                parts.push(event.sequence.to_string());
+                parts.push(campaign_id.as_str().to_string());
+                parts.push(objective_id.as_str().to_string());
+                parts.push(trigger.as_str().to_string());
+                parts.push(if *prerequisites_satisfied { "1" } else { "0" }.to_string());
+                parts.push(
+                    if *success_criteria_satisfied {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .to_string(),
+                );
+                parts.push(
+                    if *failure_criteria_satisfied {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .to_string(),
+                );
+                parts.push(resulting_status.as_str().to_string());
+            }
+        },
     }
     parts.join("|")
 }
@@ -2332,6 +2704,115 @@ fn decode_audit_event(line: &str) -> Result<AuditEvent, OrchestratorError> {
                 run_id: RunId(Id(parse_u64(parts[6])?)),
             })
         }
+        "campaign_created" => {
+            if parts.len() != 8 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid campaign_created event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Campaign(CampaignAuditEvent {
+                sequence: parse_u64(parts[5])?,
+                occurred_at,
+                payload: CampaignPayload::CampaignCreated {
+                    campaign_id: parse_campaign_id(parts[6])?,
+                    name: decode_hex(parts[7])?,
+                },
+            })
+        }
+        "campaign_status_changed" => {
+            if parts.len() != 10 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid campaign_status_changed event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Campaign(CampaignAuditEvent {
+                sequence: parse_u64(parts[5])?,
+                occurred_at,
+                payload: CampaignPayload::CampaignStatusChanged {
+                    campaign_id: parse_campaign_id(parts[6])?,
+                    from: parse_campaign_status(parts[7])?,
+                    to: parse_campaign_status(parts[8])?,
+                    reason: decode_opt_string(parts[9])?,
+                },
+            })
+        }
+        "objective_created" => {
+            if parts.len() != 10 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid objective_created event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Campaign(CampaignAuditEvent {
+                sequence: parse_u64(parts[5])?,
+                occurred_at,
+                payload: CampaignPayload::ObjectiveCreated {
+                    campaign_id: parse_campaign_id(parts[6])?,
+                    objective_id: parse_objective_id(parts[7])?,
+                    name: decode_hex(parts[8])?,
+                    risk_level: parse_risk_level(parts[9])?,
+                },
+            })
+        }
+        "objective_prereq_linked" => {
+            if parts.len() != 9 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid objective_prereq_linked event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Campaign(CampaignAuditEvent {
+                sequence: parse_u64(parts[5])?,
+                occurred_at,
+                payload: CampaignPayload::ObjectivePrereqLinked {
+                    campaign_id: parse_campaign_id(parts[6])?,
+                    objective_id: parse_objective_id(parts[7])?,
+                    prerequisite_id: parse_objective_id(parts[8])?,
+                },
+            })
+        }
+        "objective_status_changed" => {
+            if parts.len() != 11 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid objective_status_changed event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Campaign(CampaignAuditEvent {
+                sequence: parse_u64(parts[5])?,
+                occurred_at,
+                payload: CampaignPayload::ObjectiveStatusChanged {
+                    campaign_id: parse_campaign_id(parts[6])?,
+                    objective_id: parse_objective_id(parts[7])?,
+                    from: parse_objective_status(parts[8])?,
+                    to: parse_objective_status(parts[9])?,
+                    reason: decode_opt_string(parts[10])?,
+                },
+            })
+        }
+        "objective_evaluated" => {
+            if parts.len() != 13 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid objective_evaluated event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Campaign(CampaignAuditEvent {
+                sequence: parse_u64(parts[5])?,
+                occurred_at,
+                payload: CampaignPayload::ObjectiveEvaluated {
+                    campaign_id: parse_campaign_id(parts[6])?,
+                    objective_id: parse_objective_id(parts[7])?,
+                    trigger: parse_objective_trigger(parts[8])?,
+                    prerequisites_satisfied: parse_bool_01(parts[9])?,
+                    success_criteria_satisfied: parse_bool_01(parts[10])?,
+                    failure_criteria_satisfied: parse_bool_01(parts[11])?,
+                    resulting_status: parse_objective_status(parts[12])?,
+                },
+            })
+        }
         _ => {
             return Err(OrchestratorError::Parse(format!(
                 "unknown audit event kind '{}'",
@@ -2363,6 +2844,15 @@ fn event_run_id(payload: &AuditEventPayload) -> Option<RunId> {
             ..
         }) => Some(*run_id),
         AuditEventPayload::Module(ModuleEvent::Executed { run_id, .. }) => Some(*run_id),
+        _ => None,
+    }
+}
+
+fn event_campaign_meta(payload: &AuditEventPayload) -> Option<(CampaignId, u64)> {
+    match payload {
+        AuditEventPayload::Campaign(event) => {
+            Some((event.payload.campaign_id().clone(), event.sequence))
+        }
         _ => None,
     }
 }
@@ -2553,6 +3043,399 @@ fn reconstruct_run_from_events(events: &[AuditEvent], run_id: RunId) -> Option<R
     reconstructed
 }
 
+fn reconstruct_campaign_from_events(
+    events: &[AuditEvent],
+    campaign_id: &CampaignId,
+) -> CampaignReplayReport {
+    let mut diagnostics = Vec::<ReplayDiagnostic>::new();
+    let mut reconstructed: Option<ReconstructedCampaign> = None;
+
+    for event in events {
+        let AuditEventPayload::Campaign(campaign_event) = &event.payload else {
+            continue;
+        };
+        let payload_campaign_id = campaign_event.payload.campaign_id();
+        if payload_campaign_id != campaign_id {
+            continue;
+        }
+
+        let Some(campaign) = reconstructed.as_mut() else {
+            reconstructed = Some(ReconstructedCampaign {
+                campaign_id: campaign_id.clone(),
+                correlation_id: event.correlation_id,
+                sequence_high_watermark: 0,
+                name: None,
+                status: CampaignStatus::Active,
+                objective_ids: BTreeSet::new(),
+                objectives: BTreeMap::new(),
+            });
+            continue;
+        };
+
+        if campaign.correlation_id != event.correlation_id {
+            diagnostics.push(ReplayDiagnostic {
+                code: "ML-REPLAY-0001",
+                message: format!(
+                    "campaign {} has mixed lineage correlations {} and {}",
+                    campaign_id.as_str(),
+                    campaign.correlation_id.0 .0,
+                    event.correlation_id.0 .0
+                ),
+            });
+        }
+    }
+
+    for event in events {
+        let AuditEventPayload::Campaign(campaign_event) = &event.payload else {
+            continue;
+        };
+        let payload_campaign_id = campaign_event.payload.campaign_id();
+        if payload_campaign_id != campaign_id {
+            continue;
+        }
+        let Some(campaign) = reconstructed.as_mut() else {
+            continue;
+        };
+
+        let expected_next = campaign.sequence_high_watermark.saturating_add(1);
+        if campaign_event.sequence != expected_next {
+            diagnostics.push(ReplayDiagnostic {
+                code: "ML-REPLAY-0002",
+                message: format!(
+                    "campaign {} sequence mismatch: expected {}, found {}",
+                    campaign_id.as_str(),
+                    expected_next,
+                    campaign_event.sequence
+                ),
+            });
+        }
+        campaign.sequence_high_watermark = campaign_event.sequence;
+
+        match &campaign_event.payload {
+            CampaignPayload::CampaignCreated { name, .. } => {
+                if campaign.name.is_some() {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0003",
+                        message: format!(
+                            "campaign {} contains duplicate CampaignCreated event",
+                            campaign_id.as_str()
+                        ),
+                    });
+                }
+                campaign.name = Some(name.clone());
+                campaign.status = CampaignStatus::Active;
+            }
+            CampaignPayload::CampaignStatusChanged { from, to, .. } => {
+                if campaign.status != *from {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0004",
+                        message: format!(
+                            "campaign {} status mismatch during replay: event from={} but current={}",
+                            campaign_id.as_str(),
+                            from.as_str(),
+                            campaign.status.as_str()
+                        ),
+                    });
+                }
+                if !campaign.status.can_transition_to(*to) {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0005",
+                        message: format!(
+                            "campaign {} invalid transition during replay: {} -> {}",
+                            campaign_id.as_str(),
+                            campaign.status.as_str(),
+                            to.as_str()
+                        ),
+                    });
+                }
+                campaign.status = *to;
+            }
+            CampaignPayload::ObjectiveCreated {
+                objective_id,
+                name,
+                risk_level,
+                ..
+            } => {
+                campaign.objective_ids.insert(objective_id.clone());
+                let entry = campaign
+                    .objectives
+                    .entry(objective_id.clone())
+                    .or_insert_with(|| ReplayedObjective {
+                        objective_id: objective_id.clone(),
+                        name: None,
+                        risk_level: None,
+                        status: ObjectiveStatus::Pending,
+                        prerequisites: BTreeSet::new(),
+                        evaluation_count: 0,
+                    });
+                entry.name = Some(name.clone());
+                entry.risk_level = Some(*risk_level);
+            }
+            CampaignPayload::ObjectivePrereqLinked {
+                objective_id,
+                prerequisite_id,
+                ..
+            } => {
+                campaign.objective_ids.insert(objective_id.clone());
+                campaign.objective_ids.insert(prerequisite_id.clone());
+                let entry = campaign
+                    .objectives
+                    .entry(objective_id.clone())
+                    .or_insert_with(|| ReplayedObjective {
+                        objective_id: objective_id.clone(),
+                        name: None,
+                        risk_level: None,
+                        status: ObjectiveStatus::Pending,
+                        prerequisites: BTreeSet::new(),
+                        evaluation_count: 0,
+                    });
+                entry.prerequisites.insert(prerequisite_id.clone());
+            }
+            CampaignPayload::ObjectiveStatusChanged {
+                objective_id,
+                from,
+                to,
+                ..
+            } => {
+                let entry = campaign
+                    .objectives
+                    .entry(objective_id.clone())
+                    .or_insert_with(|| ReplayedObjective {
+                        objective_id: objective_id.clone(),
+                        name: None,
+                        risk_level: None,
+                        status: ObjectiveStatus::Pending,
+                        prerequisites: BTreeSet::new(),
+                        evaluation_count: 0,
+                    });
+                if entry.status != *from {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0006",
+                        message: format!(
+                            "objective {} status mismatch during replay: event from={} current={}",
+                            objective_id.as_str(),
+                            from.as_str(),
+                            entry.status.as_str()
+                        ),
+                    });
+                }
+                if !entry.status.can_transition_to(*to) {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0007",
+                        message: format!(
+                            "objective {} invalid transition during replay: {} -> {}",
+                            objective_id.as_str(),
+                            entry.status.as_str(),
+                            to.as_str()
+                        ),
+                    });
+                }
+                entry.status = *to;
+                campaign.objective_ids.insert(objective_id.clone());
+            }
+            CampaignPayload::ObjectiveEvaluated {
+                objective_id,
+                prerequisites_satisfied,
+                success_criteria_satisfied,
+                failure_criteria_satisfied,
+                resulting_status,
+                ..
+            } => {
+                let entry = campaign
+                    .objectives
+                    .entry(objective_id.clone())
+                    .or_insert_with(|| ReplayedObjective {
+                        objective_id: objective_id.clone(),
+                        name: None,
+                        risk_level: None,
+                        status: ObjectiveStatus::Pending,
+                        prerequisites: BTreeSet::new(),
+                        evaluation_count: 0,
+                    });
+                entry.evaluation_count = entry.evaluation_count.saturating_add(1);
+
+                if entry.status != *resulting_status {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0008",
+                        message: format!(
+                            "objective {} evaluated status mismatch: replay={} event={}",
+                            objective_id.as_str(),
+                            entry.status.as_str(),
+                            resulting_status.as_str()
+                        ),
+                    });
+                }
+                if *resulting_status == ObjectiveStatus::Eligible && !*prerequisites_satisfied {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0009",
+                        message: format!(
+                            "objective {} marked eligible without prerequisite satisfaction",
+                            objective_id.as_str()
+                        ),
+                    });
+                }
+                if *resulting_status == ObjectiveStatus::Achieved && !*success_criteria_satisfied {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0010",
+                        message: format!(
+                            "objective {} marked achieved without success criteria",
+                            objective_id.as_str()
+                        ),
+                    });
+                }
+                if *resulting_status == ObjectiveStatus::Failed && !*failure_criteria_satisfied {
+                    diagnostics.push(ReplayDiagnostic {
+                        code: "ML-REPLAY-0011",
+                        message: format!(
+                            "objective {} marked failed without failure criteria",
+                            objective_id.as_str()
+                        ),
+                    });
+                }
+
+                campaign.objective_ids.insert(objective_id.clone());
+            }
+        }
+    }
+
+    if reconstructed.is_none() {
+        diagnostics.push(ReplayDiagnostic {
+            code: "ML-REPLAY-0012",
+            message: format!(
+                "campaign {} not found in audit event history",
+                campaign_id.as_str()
+            ),
+        });
+    }
+
+    CampaignReplayReport {
+        campaign: reconstructed,
+        diagnostics,
+    }
+}
+
+fn compare_campaign_replay_to_snapshot(
+    report: &CampaignReplayReport,
+    snapshot: &ControlState,
+    campaign_id: &CampaignId,
+) -> Vec<ReplayDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let Some(replayed) = report.campaign.as_ref() else {
+        diagnostics.push(ReplayDiagnostic {
+            code: "ML-REPLAY-0013",
+            message: format!(
+                "cannot compare snapshot for campaign {} because replay produced no campaign state",
+                campaign_id.as_str()
+            ),
+        });
+        return diagnostics;
+    };
+
+    let Some(snapshot_campaign) = snapshot.campaigns.get(campaign_id) else {
+        diagnostics.push(ReplayDiagnostic {
+            code: "ML-REPLAY-0014",
+            message: format!(
+                "snapshot missing campaign {} while replay produced one",
+                campaign_id.as_str()
+            ),
+        });
+        return diagnostics;
+    };
+
+    if replayed.status != snapshot_campaign.status {
+        diagnostics.push(ReplayDiagnostic {
+            code: "ML-REPLAY-0015",
+            message: format!(
+                "campaign {} status mismatch replay={} snapshot={}",
+                campaign_id.as_str(),
+                replayed.status.as_str(),
+                snapshot_campaign.status.as_str()
+            ),
+        });
+    }
+
+    let snapshot_objective_ids = snapshot_campaign
+        .objective_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if replayed.objective_ids != snapshot_objective_ids {
+        diagnostics.push(ReplayDiagnostic {
+            code: "ML-REPLAY-0016",
+            message: format!(
+                "campaign {} objective id set mismatch replay={} snapshot={}",
+                campaign_id.as_str(),
+                replayed.objective_ids.len(),
+                snapshot_objective_ids.len()
+            ),
+        });
+    }
+
+    for objective_id in &replayed.objective_ids {
+        let Some(snapshot_objective) = snapshot.objectives.get(objective_id) else {
+            diagnostics.push(ReplayDiagnostic {
+                code: "ML-REPLAY-0017",
+                message: format!(
+                    "snapshot missing objective {} present in replay for campaign {}",
+                    objective_id.as_str(),
+                    campaign_id.as_str()
+                ),
+            });
+            continue;
+        };
+        if snapshot_objective.campaign_id != *campaign_id {
+            diagnostics.push(ReplayDiagnostic {
+                code: "ML-REPLAY-0018",
+                message: format!(
+                    "snapshot objective {} belongs to campaign {} instead of {}",
+                    objective_id.as_str(),
+                    snapshot_objective.campaign_id.as_str(),
+                    campaign_id.as_str()
+                ),
+            });
+        }
+        let Some(replayed_objective) = replayed.objectives.get(objective_id) else {
+            diagnostics.push(ReplayDiagnostic {
+                code: "ML-REPLAY-0019",
+                message: format!(
+                    "replay missing objective {} listed in replay objective id set",
+                    objective_id.as_str()
+                ),
+            });
+            continue;
+        };
+        if replayed_objective.status != snapshot_objective.status {
+            diagnostics.push(ReplayDiagnostic {
+                code: "ML-REPLAY-0020",
+                message: format!(
+                    "objective {} status mismatch replay={} snapshot={}",
+                    objective_id.as_str(),
+                    replayed_objective.status.as_str(),
+                    snapshot_objective.status.as_str()
+                ),
+            });
+        }
+    }
+
+    for objective in snapshot.objectives.values() {
+        if &objective.campaign_id != campaign_id {
+            continue;
+        }
+        if !replayed.objective_ids.contains(&objective.id) {
+            diagnostics.push(ReplayDiagnostic {
+                code: "ML-REPLAY-0021",
+                message: format!(
+                    "snapshot objective {} for campaign {} missing from replay",
+                    objective.id.as_str(),
+                    campaign_id.as_str()
+                ),
+            });
+        }
+    }
+
+    diagnostics
+}
+
 fn parse_u64(input: &str) -> Result<u64, OrchestratorError> {
     input
         .parse::<u64>()
@@ -2682,9 +3565,87 @@ fn parse_task_state(state: &str) -> Result<TaskState, OrchestratorError> {
     }
 }
 
+fn parse_bool_01(input: &str) -> Result<bool, OrchestratorError> {
+    match input {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(OrchestratorError::Parse(format!(
+            "invalid boolean flag '{}' (expected 0 or 1)",
+            input
+        ))),
+    }
+}
+
+fn parse_campaign_id(input: &str) -> Result<CampaignId, OrchestratorError> {
+    CampaignId::parse(input).map_err(|err| {
+        OrchestratorError::Parse(format!("invalid campaign id '{}': {}", input, err))
+    })
+}
+
+fn parse_objective_id(input: &str) -> Result<ObjectiveId, OrchestratorError> {
+    ObjectiveId::parse(input).map_err(|err| {
+        OrchestratorError::Parse(format!("invalid objective id '{}': {}", input, err))
+    })
+}
+
+fn parse_campaign_status(input: &str) -> Result<CampaignStatus, OrchestratorError> {
+    match input {
+        "active" => Ok(CampaignStatus::Active),
+        "paused" => Ok(CampaignStatus::Paused),
+        "completed" => Ok(CampaignStatus::Completed),
+        "failed" => Ok(CampaignStatus::Failed),
+        _ => Err(OrchestratorError::Parse(format!(
+            "invalid campaign status '{}'",
+            input
+        ))),
+    }
+}
+
+fn parse_objective_status(input: &str) -> Result<ObjectiveStatus, OrchestratorError> {
+    match input {
+        "pending" => Ok(ObjectiveStatus::Pending),
+        "eligible" => Ok(ObjectiveStatus::Eligible),
+        "in_progress" => Ok(ObjectiveStatus::InProgress),
+        "achieved" => Ok(ObjectiveStatus::Achieved),
+        "failed" => Ok(ObjectiveStatus::Failed),
+        _ => Err(OrchestratorError::Parse(format!(
+            "invalid objective status '{}'",
+            input
+        ))),
+    }
+}
+
+fn parse_risk_level(input: &str) -> Result<RiskLevel, OrchestratorError> {
+    match input {
+        "low" => Ok(RiskLevel::Low),
+        "medium" => Ok(RiskLevel::Medium),
+        "high" => Ok(RiskLevel::High),
+        _ => Err(OrchestratorError::Parse(format!(
+            "invalid risk level '{}'",
+            input
+        ))),
+    }
+}
+
+fn parse_objective_trigger(input: &str) -> Result<ObjectiveReevaluationTrigger, OrchestratorError> {
+    match input {
+        "artifact_created" => Ok(ObjectiveReevaluationTrigger::ArtifactCreated),
+        "finding_created" => Ok(ObjectiveReevaluationTrigger::FindingCreated),
+        "session_state_changed" => Ok(ObjectiveReevaluationTrigger::SessionStateChanged),
+        "run_completed" => Ok(ObjectiveReevaluationTrigger::RunCompleted),
+        "replay_recovery" => Ok(ObjectiveReevaluationTrigger::ReplayRecovery),
+        "manual_request" => Ok(ObjectiveReevaluationTrigger::ManualRequest),
+        _ => Err(OrchestratorError::Parse(format!(
+            "invalid objective trigger '{}'",
+            input
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::campaign::Predicate as CampaignPredicate;
     use crate::performance::{PerformanceBudget, PerformanceSample};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
@@ -3405,5 +4366,656 @@ mod tests {
             )
             .expect("module event");
         assert_eq!(module_corr, run_correlation);
+    }
+
+    #[test]
+    fn campaign_events_use_single_lineage_and_gapless_sequence() {
+        let snapshot_shared = Arc::new(Mutex::new(None));
+        let audit_shared = Arc::new(Mutex::new(Vec::<AuditEvent>::new()));
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_a =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective a");
+        let objective_b =
+            ObjectiveId::parse("9b2f4d6a-3aa4-41ba-91ed-6308a58186a1").expect("objective b");
+
+        let first_lineage = {
+            let snapshot_store = InMemorySnapshotStore::from_shared(Arc::clone(&snapshot_shared));
+            let audit_store = InMemoryAuditLogStore::from_shared(Arc::clone(&audit_shared));
+            let mut orchestrator =
+                ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("new");
+
+            let (lineage, seq1) = orchestrator
+                .record_campaign_event(
+                    CampaignPayload::CampaignCreated {
+                        campaign_id: campaign_id.clone(),
+                        name: "operation".to_string(),
+                    },
+                    None,
+                )
+                .expect("campaign create");
+            assert_eq!(seq1, 1);
+
+            let (lineage2, seq2) = orchestrator
+                .record_campaign_event(
+                    CampaignPayload::ObjectiveCreated {
+                        campaign_id: campaign_id.clone(),
+                        objective_id: objective_a.clone(),
+                        name: "initial access".to_string(),
+                        risk_level: RiskLevel::Medium,
+                    },
+                    None,
+                )
+                .expect("objective create");
+            assert_eq!(lineage2, lineage);
+            assert_eq!(seq2, 2);
+
+            let (lineage3, seq3) = orchestrator
+                .record_campaign_event(
+                    CampaignPayload::ObjectivePrereqLinked {
+                        campaign_id: campaign_id.clone(),
+                        objective_id: objective_b.clone(),
+                        prerequisite_id: objective_a.clone(),
+                    },
+                    None,
+                )
+                .expect("prereq link");
+            assert_eq!(lineage3, lineage);
+            assert_eq!(seq3, 3);
+
+            let explicit_mismatch = CorrelationId::next();
+            let err = orchestrator
+                .record_campaign_event(
+                    CampaignPayload::CampaignStatusChanged {
+                        campaign_id: campaign_id.clone(),
+                        from: CampaignStatus::Active,
+                        to: CampaignStatus::Paused,
+                        reason: None,
+                    },
+                    Some(explicit_mismatch),
+                )
+                .expect_err("lineage mismatch must fail");
+            assert!(
+                err.to_string().contains("already bound to lineage"),
+                "unexpected error: {err}"
+            );
+
+            lineage
+        };
+
+        let snapshot_store = InMemorySnapshotStore::from_shared(Arc::clone(&snapshot_shared));
+        let audit_store = InMemoryAuditLogStore::from_shared(Arc::clone(&audit_shared));
+        let mut recovered =
+            ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("recover");
+        let (lineage_after_restart, seq4) = recovered
+            .record_campaign_event(
+                CampaignPayload::ObjectiveStatusChanged {
+                    campaign_id: campaign_id.clone(),
+                    objective_id: objective_a,
+                    from: ObjectiveStatus::Eligible,
+                    to: ObjectiveStatus::InProgress,
+                    reason: Some("operator start".to_string()),
+                },
+                None,
+            )
+            .expect("status change");
+        assert_eq!(lineage_after_restart, first_lineage);
+        assert_eq!(seq4, 4);
+
+        let events = recovered.load_audit_events().expect("events");
+        let campaign_events = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                AuditEventPayload::Campaign(campaign_event) => {
+                    Some((event.correlation_id, campaign_event.sequence))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(campaign_events.len(), 4);
+        for (idx, (correlation, sequence)) in campaign_events.iter().enumerate() {
+            assert_eq!(*correlation, first_lineage);
+            assert_eq!(*sequence, (idx as u64) + 1);
+        }
+    }
+
+    #[test]
+    fn campaign_events_round_trip_in_file_audit_log() {
+        let path =
+            std::env::temp_dir().join(format!("moonlight-campaign-audit-{}.log", Id::next().0));
+        let mut store = FileAuditLogStore::new(&path);
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_id =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective");
+
+        let event = AuditEvent {
+            id: EventId::next(),
+            correlation_id: CorrelationId::next(),
+            occurred_at: now_secs(),
+            payload: AuditEventPayload::Campaign(CampaignAuditEvent {
+                sequence: 7,
+                occurred_at: now_secs(),
+                payload: CampaignPayload::ObjectiveEvaluated {
+                    campaign_id,
+                    objective_id,
+                    trigger: ObjectiveReevaluationTrigger::RunCompleted,
+                    prerequisites_satisfied: true,
+                    success_criteria_satisfied: true,
+                    failure_criteria_satisfied: false,
+                    resulting_status: ObjectiveStatus::Achieved,
+                },
+            }),
+        };
+
+        store.append_event(&event).expect("append");
+        let loaded = store.load_events().expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].payload, event.payload);
+        assert_eq!(loaded[0].correlation_id, event.correlation_id);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ingestion_run_completed_propagates_correlation_and_deduplicates() {
+        let snapshot_store = InMemorySnapshotStore::default();
+        let audit_store = InMemoryAuditLogStore::default();
+        let mut orchestrator =
+            ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("new");
+
+        let run_id = orchestrator
+            .submit_run(
+                basic_request(),
+                RunPlan::new(vec![
+                    PlannedTask::new("evt", 1, 100, "ingest-run").expect("task")
+                ])
+                .expect("plan"),
+            )
+            .expect("submit");
+        let run_correlation = orchestrator
+            .correlation_id_for_run(run_id)
+            .expect("run correlation");
+
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_id =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective id");
+        let mut objective = Objective::new_at(
+            objective_id.clone(),
+            campaign_id.clone(),
+            "run objective",
+            "run completion should satisfy",
+            vec![],
+            vec![CampaignPredicate::RunSucceeded {
+                module_name: "exploit/linux/example".to_string(),
+            }],
+            vec![],
+            RiskLevel::Medium,
+            None,
+            1,
+        )
+        .expect("objective");
+        objective.status = ObjectiveStatus::InProgress;
+        let mut objectives = BTreeMap::from([(objective_id, objective)]);
+
+        let workspace = crate::domain::Workspace::new_at("ws", "test", 1).expect("workspace");
+        let module = crate::domain::ModuleVersion::new_at(
+            "exploit/linux/example",
+            "1.0.0",
+            1,
+            "entrypoint",
+            "sha256",
+            1,
+        )
+        .expect("module");
+        let mut run =
+            crate::domain::Run::new_at(workspace.id, module.id, None, "operator", 2).expect("run");
+        run.transition_state(RunState::Running, 3).expect("running");
+        run.transition_state(RunState::Succeeded, 4)
+            .expect("succeeded");
+        let snapshot = PredicateSnapshot::new().with_run(
+            crate::campaign::RunSnapshot::new(run, "exploit/linux/example").expect("run snapshot"),
+        );
+
+        let first = orchestrator
+            .ingest_run_completed(
+                campaign_id.clone(),
+                &mut objectives,
+                &snapshot,
+                run_id,
+                None,
+            )
+            .expect("first ingestion");
+        assert!(!first.skipped_duplicate);
+        assert!(!first.emitted_events.is_empty());
+        assert_eq!(
+            orchestrator.correlation_id_for_campaign(&campaign_id),
+            Some(run_correlation)
+        );
+
+        let second = orchestrator
+            .ingest_run_completed(
+                campaign_id.clone(),
+                &mut objectives,
+                &snapshot,
+                run_id,
+                None,
+            )
+            .expect("duplicate ingestion");
+        assert!(second.skipped_duplicate);
+        assert!(second.emitted_events.is_empty());
+
+        let campaign_event_count = orchestrator
+            .load_audit_events()
+            .expect("events")
+            .into_iter()
+            .filter(|event| matches!(event.payload, AuditEventPayload::Campaign(_)))
+            .count();
+        assert_eq!(campaign_event_count, first.emitted_events.len());
+        assert_eq!(
+            objectives.values().next().expect("objective").status,
+            ObjectiveStatus::Achieved
+        );
+    }
+
+    #[test]
+    fn ingestion_artifact_finding_session_triggers_evaluate_relevant_objectives() {
+        let snapshot_store = InMemorySnapshotStore::default();
+        let audit_store = InMemoryAuditLogStore::default();
+        let mut orchestrator =
+            ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("new");
+
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_artifact =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective");
+        let objective_finding =
+            ObjectiveId::parse("9b2f4d6a-3aa4-41ba-91ed-6308a58186a1").expect("objective");
+        let objective_session =
+            ObjectiveId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d479").expect("objective");
+
+        let mut obj_a = Objective::new_at(
+            objective_artifact.clone(),
+            campaign_id.clone(),
+            "artifact objective",
+            "artifact trigger",
+            vec![],
+            vec![CampaignPredicate::ArtifactTagMatch {
+                tag: "loot".to_string(),
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            1,
+        )
+        .expect("objective");
+        obj_a.status = ObjectiveStatus::InProgress;
+
+        let mut obj_b = Objective::new_at(
+            objective_finding.clone(),
+            campaign_id.clone(),
+            "finding objective",
+            "finding trigger",
+            vec![],
+            vec![CampaignPredicate::FindingExists {
+                finding_type: "credential".to_string(),
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            1,
+        )
+        .expect("objective");
+        obj_b.status = ObjectiveStatus::InProgress;
+
+        let mut obj_c = Objective::new_at(
+            objective_session.clone(),
+            campaign_id.clone(),
+            "session objective",
+            "session trigger",
+            vec![],
+            vec![CampaignPredicate::SessionPrivilege {
+                level: crate::campaign::SessionPrivilegeLevel::Root,
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            1,
+        )
+        .expect("objective");
+        obj_c.status = ObjectiveStatus::InProgress;
+
+        let mut objectives = BTreeMap::from([
+            (objective_artifact.clone(), obj_a),
+            (objective_finding.clone(), obj_b),
+            (objective_session.clone(), obj_c),
+        ]);
+
+        let workspace = crate::domain::Workspace::new_at("ws", "test", 1).expect("workspace");
+        let module = crate::domain::ModuleVersion::new_at(
+            "exploit/linux/example",
+            "1.0.0",
+            1,
+            "entrypoint",
+            "sha256",
+            1,
+        )
+        .expect("module");
+        let run =
+            crate::domain::Run::new_at(workspace.id, module.id, None, "operator", 2).expect("run");
+        let session = crate::domain::Session::new_at(run.id, None, "shell", "127.0.0.1:23", 3)
+            .expect("session");
+        let artifact = crate::domain::Artifact::new_at(
+            run.id,
+            None,
+            Some(session.id),
+            crate::domain::ArtifactKind::CommandOutput,
+            "loot",
+            "memory://loot",
+            4,
+        )
+        .expect("artifact");
+        let finding = crate::domain::Finding::new_at(
+            run.id,
+            None,
+            Some(session.id),
+            "Credential",
+            "found secret",
+            crate::domain::FindingSeverity::High,
+            5,
+        )
+        .expect("finding");
+
+        let snapshot = PredicateSnapshot::new()
+            .with_artifact(crate::campaign::ArtifactSnapshot::new(artifact).with_tag("loot"))
+            .with_finding(
+                crate::campaign::FindingSnapshot::new(finding, "credential").expect("snapshot"),
+            )
+            .with_session(
+                crate::campaign::SessionSnapshot::new(session)
+                    .with_privilege(crate::campaign::SessionPrivilegeLevel::Root),
+            );
+
+        orchestrator
+            .ingest_artifact_created(
+                campaign_id.clone(),
+                &mut objectives,
+                &snapshot,
+                ArtifactId::next(),
+                None,
+            )
+            .expect("artifact trigger");
+        orchestrator
+            .ingest_finding_created(
+                campaign_id.clone(),
+                &mut objectives,
+                &snapshot,
+                FindingId::next(),
+                None,
+            )
+            .expect("finding trigger");
+        orchestrator
+            .ingest_session_state_changed(
+                campaign_id.clone(),
+                &mut objectives,
+                &snapshot,
+                SessionId::next(),
+                None,
+                None,
+            )
+            .expect("session trigger");
+
+        assert_eq!(
+            objectives[&objective_artifact].status,
+            ObjectiveStatus::Achieved
+        );
+        assert_eq!(
+            objectives[&objective_finding].status,
+            ObjectiveStatus::Achieved
+        );
+        assert_eq!(
+            objectives[&objective_session].status,
+            ObjectiveStatus::Achieved
+        );
+    }
+
+    #[test]
+    fn campaign_cold_replay_reconstructs_identical_objective_outcomes() {
+        let snapshot_shared = Arc::new(Mutex::new(None));
+        let audit_shared = Arc::new(Mutex::new(Vec::<AuditEvent>::new()));
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_id =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective id");
+
+        {
+            let snapshot_store = InMemorySnapshotStore::from_shared(Arc::clone(&snapshot_shared));
+            let audit_store = InMemoryAuditLogStore::from_shared(Arc::clone(&audit_shared));
+            let mut orchestrator =
+                ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("new");
+
+            orchestrator
+                .record_campaign_events(
+                    vec![
+                        CampaignPayload::CampaignCreated {
+                            campaign_id: campaign_id.clone(),
+                            name: "operation".to_string(),
+                        },
+                        CampaignPayload::ObjectiveCreated {
+                            campaign_id: campaign_id.clone(),
+                            objective_id: objective_id.clone(),
+                            name: "escalate".to_string(),
+                            risk_level: RiskLevel::High,
+                        },
+                        CampaignPayload::ObjectiveStatusChanged {
+                            campaign_id: campaign_id.clone(),
+                            objective_id: objective_id.clone(),
+                            from: ObjectiveStatus::Pending,
+                            to: ObjectiveStatus::Eligible,
+                            reason: Some("prerequisites".to_string()),
+                        },
+                        CampaignPayload::ObjectiveStatusChanged {
+                            campaign_id: campaign_id.clone(),
+                            objective_id: objective_id.clone(),
+                            from: ObjectiveStatus::Eligible,
+                            to: ObjectiveStatus::InProgress,
+                            reason: Some("operator start".to_string()),
+                        },
+                        CampaignPayload::ObjectiveStatusChanged {
+                            campaign_id: campaign_id.clone(),
+                            objective_id: objective_id.clone(),
+                            from: ObjectiveStatus::InProgress,
+                            to: ObjectiveStatus::Achieved,
+                            reason: Some("criteria met".to_string()),
+                        },
+                        CampaignPayload::ObjectiveEvaluated {
+                            campaign_id: campaign_id.clone(),
+                            objective_id: objective_id.clone(),
+                            trigger: ObjectiveReevaluationTrigger::RunCompleted,
+                            prerequisites_satisfied: true,
+                            success_criteria_satisfied: true,
+                            failure_criteria_satisfied: false,
+                            resulting_status: ObjectiveStatus::Achieved,
+                        },
+                    ],
+                    None,
+                )
+                .expect("record campaign events");
+
+            let report = orchestrator
+                .reconstruct_campaign_from_history(&campaign_id)
+                .expect("replay");
+            assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+            let campaign = report.campaign.expect("campaign");
+            assert_eq!(campaign.objective_ids.len(), 1);
+            assert_eq!(
+                campaign
+                    .objectives
+                    .get(&objective_id)
+                    .expect("objective")
+                    .status,
+                ObjectiveStatus::Achieved
+            );
+        }
+
+        let snapshot_store = InMemorySnapshotStore::from_shared(Arc::clone(&snapshot_shared));
+        let audit_store = InMemoryAuditLogStore::from_shared(Arc::clone(&audit_shared));
+        let mut recovered =
+            ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("recover");
+        let replay = recovered
+            .reconstruct_campaign_from_history(&campaign_id)
+            .expect("replay");
+        assert!(replay.diagnostics.is_empty(), "{:?}", replay.diagnostics);
+        let campaign = replay.campaign.expect("campaign");
+        assert_eq!(
+            campaign
+                .objectives
+                .get(&objective_id)
+                .expect("objective")
+                .status,
+            ObjectiveStatus::Achieved
+        );
+    }
+
+    #[test]
+    fn campaign_replay_consistency_reports_snapshot_mismatches() {
+        let snapshot_store = InMemorySnapshotStore::default();
+        let audit_store = InMemoryAuditLogStore::default();
+        let mut orchestrator =
+            ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("new");
+
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_id =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective id");
+
+        orchestrator
+            .record_campaign_events(
+                vec![
+                    CampaignPayload::CampaignCreated {
+                        campaign_id: campaign_id.clone(),
+                        name: "operation".to_string(),
+                    },
+                    CampaignPayload::ObjectiveCreated {
+                        campaign_id: campaign_id.clone(),
+                        objective_id: objective_id.clone(),
+                        name: "escalate".to_string(),
+                        risk_level: RiskLevel::High,
+                    },
+                    CampaignPayload::ObjectiveEvaluated {
+                        campaign_id: campaign_id.clone(),
+                        objective_id: objective_id.clone(),
+                        trigger: ObjectiveReevaluationTrigger::ManualRequest,
+                        prerequisites_satisfied: true,
+                        success_criteria_satisfied: false,
+                        failure_criteria_satisfied: false,
+                        resulting_status: ObjectiveStatus::Pending,
+                    },
+                ],
+                None,
+            )
+            .expect("record events");
+
+        let mut snapshot = ControlState::default();
+        let mut campaign =
+            crate::campaign::Campaign::new_at(campaign_id.clone(), "operation", "", 1, None)
+                .expect("campaign");
+        campaign.add_objective(objective_id.clone());
+        let mut objective = crate::campaign::Objective::new_at(
+            objective_id,
+            campaign_id.clone(),
+            "escalate",
+            "",
+            vec![],
+            vec![crate::campaign::Predicate::RunSucceeded {
+                module_name: "exploit/linux/example".to_string(),
+            }],
+            vec![],
+            RiskLevel::High,
+            None,
+            1,
+        )
+        .expect("objective");
+        objective.status = ObjectiveStatus::Failed;
+        snapshot.campaigns.insert(campaign_id.clone(), campaign);
+        snapshot
+            .objectives
+            .insert(objective.id.clone(), objective.clone());
+
+        let consistency = orchestrator
+            .replay_campaign_consistency(&campaign_id, &snapshot)
+            .expect("consistency");
+        assert!(!consistency.consistent);
+        assert!(consistency
+            .report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "ML-REPLAY-0020"));
+    }
+
+    #[test]
+    fn campaign_replay_emits_diagnostics_for_invalid_event_sequences() {
+        let mut store = InMemoryAuditLogStore::default();
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_id =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective id");
+        let correlation = CorrelationId::next();
+
+        store
+            .append_event(&AuditEvent {
+                id: EventId::next(),
+                correlation_id: correlation,
+                occurred_at: now_secs(),
+                payload: AuditEventPayload::Campaign(CampaignAuditEvent {
+                    sequence: 1,
+                    occurred_at: now_secs(),
+                    payload: CampaignPayload::CampaignCreated {
+                        campaign_id: campaign_id.clone(),
+                        name: "operation".to_string(),
+                    },
+                }),
+            })
+            .expect("append 1");
+        store
+            .append_event(&AuditEvent {
+                id: EventId::next(),
+                correlation_id: CorrelationId::next(),
+                occurred_at: now_secs(),
+                payload: AuditEventPayload::Campaign(CampaignAuditEvent {
+                    sequence: 3,
+                    occurred_at: now_secs(),
+                    payload: CampaignPayload::ObjectiveEvaluated {
+                        campaign_id: campaign_id.clone(),
+                        objective_id,
+                        trigger: ObjectiveReevaluationTrigger::ManualRequest,
+                        prerequisites_satisfied: false,
+                        success_criteria_satisfied: false,
+                        failure_criteria_satisfied: false,
+                        resulting_status: ObjectiveStatus::Achieved,
+                    },
+                }),
+            })
+            .expect("append 2");
+
+        let snapshot_store = InMemorySnapshotStore::default();
+        let mut orchestrator =
+            ObservableExecutionOrchestrator::new(snapshot_store, store).expect("new");
+        let report = orchestrator
+            .reconstruct_campaign_from_history(&campaign_id)
+            .expect("replay");
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "ML-REPLAY-0001"));
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "ML-REPLAY-0002"));
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "ML-REPLAY-0010"));
     }
 }

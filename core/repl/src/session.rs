@@ -1,8 +1,13 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{self, Write};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use corelib::campaign::{
+    validate_prerequisite_graph, Campaign, CampaignId, MetadataValue, Objective,
+    ObjectiveEvaluationEngine, ObjectiveId, ObjectiveReevaluationTrigger, Predicate,
+    PredicateSnapshot, RiskLevel, SessionPrivilegeLevel,
+};
 use corelib::ids::Id;
 use corelib::policy::{
     Capability, DecisionKind, ModuleContext as PolicyModuleContext, PolicyEngine, PolicyRequest,
@@ -60,6 +65,8 @@ pub struct Repl {
     release_rollback: RollbackRegistry,
     release_doc_gates: DocumentationGateSuite,
     release_checklist: ReleaseChecklistTemplate,
+    campaigns: BTreeMap<CampaignId, Campaign>,
+    objectives: BTreeMap<ObjectiveId, Objective>,
     palette: Palette,
 }
 
@@ -79,7 +86,7 @@ const COMMAND_HELP: &[CommandHelpSpec] = &[
         summary: "Show general help or help for one command",
         usage: "help [command]",
         aliases: &[],
-        examples: &["help", "help run", "help release"],
+        examples: &["help", "help run", "help campaign", "help objective"],
         notes: &[],
     },
     CommandHelpSpec {
@@ -197,6 +204,33 @@ const COMMAND_HELP: &[CommandHelpSpec] = &[
         notes: &[],
     },
     CommandHelpSpec {
+        name: "campaign",
+        summary: "Manage campaigns",
+        usage: "campaign create <name> [description] [--yes] | campaign list | campaign show <campaign-id> | campaign status [campaign-id [active|paused|completed|failed] [--yes]]",
+        aliases: &[],
+        examples: &[
+            "campaign create operation-alpha \"Internal validation operation\"",
+            "campaign list",
+            "campaign status <campaign-id> paused --yes",
+        ],
+        notes: &["See docs/guide/campaign_objective_operations.md for full operator workflow."],
+    },
+    CommandHelpSpec {
+        name: "objective",
+        summary: "Manage objectives",
+        usage: "objective create <campaign-id> <name> --success <predicate[,predicate...]> [--failure <predicate[,predicate...]>] [--risk <low|medium|high>] [--noise-budget <n>] [--description <text>] [--yes] | objective link-prereq <objective-id> <prerequisite-id> [--yes] | objective list [campaign-id] | objective status [objective-id [start|evaluate] [--yes]]",
+        aliases: &[],
+        examples: &[
+            "objective create <campaign-id> foothold --success finding_exists:shell_access --risk high",
+            "objective link-prereq <objective-id> <prerequisite-id>",
+            "objective status <objective-id> start --yes",
+        ],
+        notes: &[
+            "Predicate formats: finding_exists:<type>, session_privilege:<user|elevated|root>, artifact_tag_match:<tag>, run_succeeded:<module>, custom_metadata_match:<key>=<value>",
+            "See docs/guide/campaign_objective_operations.md for detailed examples and troubleshooting.",
+        ],
+    },
+    CommandHelpSpec {
         name: "sessions",
         summary: "List/read/close sessions",
         usage: "sessions | sessions -r <id> | sessions -R | sessions -k <id> [--yes] | sessions -K [--yes]",
@@ -233,6 +267,7 @@ const COMMAND_HELP: &[CommandHelpSpec] = &[
 impl Repl {
     pub fn new(prompt: String, registry: ModuleRegistry, catalog: Option<ModuleCatalog>) -> Self {
         let module_compat = ModuleCompatibilityPolicy::catalog_default();
+        let release_migration_policy = MigrationPolicy::default_control_plane();
         let release_compat_policy = ReleaseCompatibilityPolicy::new(
             VersionWindow::new(
                 module_compat.min_manifest_version,
@@ -244,13 +279,16 @@ impl Repl {
                 module_compat.max_module_api_version,
             )
             .expect("fixed module API range"),
-            VersionWindow::new(1, 3).expect("fixed control-state range"),
+            VersionWindow::new(
+                release_migration_policy.supported_min_version,
+                release_migration_policy.latest_version,
+            )
+            .expect("fixed control-state range"),
             vec!["human".to_string(), "json".to_string()],
             vec!["builtin".to_string(), "dynlib".to_string()],
         )
         .expect("fixed release compatibility policy");
 
-        let release_migration_policy = MigrationPolicy::default_control_plane();
         let release_state =
             VersionedControlState::new(release_migration_policy.supported_min_version)
                 .expect("default schema version");
@@ -295,6 +333,8 @@ impl Repl {
             release_rollback: RollbackRegistry::default(),
             release_doc_gates,
             release_checklist: ReleaseChecklistTemplate::default_control_plane(),
+            campaigns: BTreeMap::new(),
+            objectives: BTreeMap::new(),
             palette: Palette::new(),
         }
     }
@@ -392,6 +432,8 @@ impl Repl {
             "output" => self.cmd_output(tokens),
             "policy" => self.cmd_policy(tokens),
             "release" => self.cmd_release(tokens),
+            "campaign" => self.cmd_campaign(tokens),
+            "objective" => self.cmd_objective(tokens),
             "info" => self.cmd_info(tokens),
             "sessions" => self.cmd_sessions(tokens),
             "interact" => self.cmd_interact(tokens),
@@ -1431,7 +1473,18 @@ impl Repl {
                 self.release_migration_policy.latest_version,
             )
             .is_ok();
-        let rollback_snapshot_ok = self.release_rollback.has_snapshots();
+        let rollback_snapshots = self.release_rollback.list_snapshots();
+        let rollback_snapshot_ok = !rollback_snapshots.is_empty();
+        let rollback_payload_compatibility_ok = rollback_snapshots
+            .first()
+            .map(|snapshot| {
+                VersionedControlState::validate_snapshot_payload_compatibility(
+                    snapshot.schema_version,
+                    &snapshot.payload,
+                )
+                .is_ok()
+            })
+            .unwrap_or(false);
         let docs_usage_ok = docs_report
             .results
             .iter()
@@ -1446,6 +1499,10 @@ impl Repl {
         );
         checklist_status.insert("migration_path".to_string(), migration_path_ok);
         checklist_status.insert("rollback_snapshot".to_string(), rollback_snapshot_ok);
+        checklist_status.insert(
+            "rollback_payload_compatibility".to_string(),
+            rollback_payload_compatibility_ok,
+        );
         checklist_status.insert("documentation_gates".to_string(), docs_report.all_passed);
         checklist_status.insert("usage_notes".to_string(), docs_usage_ok);
 
@@ -1456,7 +1513,11 @@ impl Repl {
                 .with_field("compatibility_ok", matrix_report.tests_passed)
                 .with_field("docs_ok", docs_report.all_passed)
                 .with_field("migration_path_ok", migration_path_ok)
-                .with_field("rollback_snapshot_ok", rollback_snapshot_ok),
+                .with_field("rollback_snapshot_ok", rollback_snapshot_ok)
+                .with_field(
+                    "rollback_payload_compatibility_ok",
+                    rollback_payload_compatibility_ok,
+                ),
         );
 
         if self.output_mode.is_json() || checklist_report.ready {
@@ -1645,7 +1706,12 @@ impl Repl {
                 let snapshot = match self.release_rollback.create_snapshot(
                     &format!("pre-migrate-v{}-to-v{}", from_version, target_version),
                     self.release_state.schema_version,
-                    &self.release_state.snapshot_payload(),
+                    &self
+                        .release_state
+                        .snapshot_payload_with_campaign_objective_state(
+                            self.campaigns.len(),
+                            self.objectives.len(),
+                        ),
                     now_secs(),
                 ) {
                     Ok(snapshot) => snapshot,
@@ -1699,7 +1765,12 @@ impl Repl {
                 match self.release_rollback.create_snapshot(
                     &label,
                     self.release_state.schema_version,
-                    &self.release_state.snapshot_payload(),
+                    &self
+                        .release_state
+                        .snapshot_payload_with_campaign_objective_state(
+                            self.campaigns.len(),
+                            self.objectives.len(),
+                        ),
                     now_secs(),
                 ) {
                     Ok(snapshot) => self.emit_response(
@@ -1809,14 +1880,26 @@ impl Repl {
 
                 match self.release_rollback.restore(snapshot_id) {
                     Ok(restore) => {
-                        self.release_state
-                            .apply_rollback_restore(&restore, now_secs());
-                        self.emit_response(
-                            CommandResponse::ok("release", "rollback restore applied")
-                                .with_field("snapshot_id", restore.snapshot_id)
-                                .with_field("schema_version", restore.schema_version)
-                                .with_field("label", restore.label),
-                        );
+                        match self
+                            .release_state
+                            .apply_rollback_restore(&restore, now_secs())
+                        {
+                            Ok(()) => {
+                                self.emit_response(
+                                    CommandResponse::ok("release", "rollback restore applied")
+                                        .with_field("snapshot_id", restore.snapshot_id)
+                                        .with_field("schema_version", restore.schema_version)
+                                        .with_field("label", restore.label),
+                                );
+                            }
+                            Err(err) => {
+                                self.emit_error(
+                                    "release",
+                                    CliCode::Execution,
+                                    &format!("rollback restore compatibility check failed: {err}"),
+                                );
+                            }
+                        }
                     }
                     Err(err) => self.emit_error("release", CliCode::Execution, &err.to_string()),
                 }
@@ -1847,6 +1930,1083 @@ impl Repl {
             }
             _ => self.emit_error("release", CliCode::Usage, &release_usage_string()),
         }
+    }
+
+    fn cmd_campaign(&mut self, tokens: &[String]) {
+        if tokens.len() < 2 {
+            self.emit_error(
+                "campaign",
+                CliCode::Usage,
+                "usage: campaign create <name> [description] | campaign list | campaign show <campaign-id> | campaign status [campaign-id [active|paused|completed|failed]]",
+            );
+            return;
+        }
+        match tokens[1].as_str() {
+            "create" => self.cmd_campaign_create(tokens),
+            "list" => self.cmd_campaign_list(),
+            "show" => self.cmd_campaign_show(tokens),
+            "status" => self.cmd_campaign_status(tokens),
+            _ => self.emit_error(
+                "campaign",
+                CliCode::Usage,
+                "usage: campaign create <name> [description] | campaign list | campaign show <campaign-id> | campaign status [campaign-id [active|paused|completed|failed]]",
+            ),
+        }
+    }
+
+    fn cmd_campaign_create(&mut self, tokens: &[String]) {
+        if tokens.len() < 3 {
+            self.emit_error(
+                "campaign",
+                CliCode::Usage,
+                "usage: campaign create <name> [description]",
+            );
+            return;
+        }
+        let explicit_yes = has_yes_flag(tokens);
+        let campaign_id = next_campaign_id();
+        let name = &tokens[2];
+        let description_parts = tokens[3..]
+            .iter()
+            .filter(|token| !is_yes_flag(token))
+            .cloned()
+            .collect::<Vec<_>>();
+        let description = if !description_parts.is_empty() {
+            description_parts.join(" ")
+        } else {
+            String::new()
+        };
+        let now = now_secs();
+        let campaign = match Campaign::new_at(campaign_id.clone(), name, &description, now, None) {
+            Ok(value) => value,
+            Err(err) => {
+                self.emit_error("campaign", CliCode::Validation, &err.to_string());
+                return;
+            }
+        };
+        let decision = self
+            .policy
+            .evaluate(&PolicyRequest::create_campaign(campaign_id.as_str()));
+        if !self.enforce_policy_decision(
+            "campaign",
+            decision,
+            explicit_yes,
+            "campaign creation canceled by confirmation",
+        ) {
+            return;
+        }
+        self.campaigns.insert(campaign_id.clone(), campaign.clone());
+        self.emit_response(
+            CommandResponse::ok("campaign", "campaign created")
+                .with_field("campaign_id", campaign_id.as_str())
+                .with_field("name", campaign.name)
+                .with_field("status", campaign.status.as_str()),
+        );
+    }
+
+    fn cmd_campaign_list(&self) {
+        if self.campaigns.is_empty() {
+            self.emit_response(
+                CommandResponse::ok("campaign", "no campaigns").with_field("count", 0),
+            );
+            return;
+        }
+        if self.output_mode.is_json() {
+            let campaigns_json = self
+                .campaigns
+                .values()
+                .map(|campaign| {
+                    format!(
+                        "{{\"id\":\"{}\",\"name\":\"{}\",\"status\":\"{}\",\"objective_count\":{},\"created_at\":{}}}",
+                        escape_json(campaign.id.as_str()),
+                        escape_json(&campaign.name),
+                        campaign.status.as_str(),
+                        campaign.objective_ids.len(),
+                        campaign.created_at
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            println!(
+                "{{\"command\":\"campaign\",\"ok\":true,\"code\":\"{}\",\"message\":\"listed campaigns\",\"count\":{},\"campaigns\":[{}]}}",
+                CliCode::Ok.as_str(),
+                self.campaigns.len(),
+                campaigns_json
+            );
+            return;
+        }
+        self.emit_response(
+            CommandResponse::ok("campaign", "listed campaigns")
+                .with_field("count", self.campaigns.len()),
+        );
+
+        let headers = ["Id", "Status", "Objectives", "Created", "Name"];
+        let mut rows = Vec::with_capacity(self.campaigns.len());
+        let mut widths = [
+            headers[0].len(),
+            headers[1].len(),
+            headers[2].len(),
+            headers[3].len(),
+            headers[4].len(),
+        ];
+        for campaign in self.campaigns.values() {
+            let row = [
+                campaign.id.as_str().to_string(),
+                campaign.status.as_str().to_string(),
+                campaign.objective_ids.len().to_string(),
+                campaign.created_at.to_string(),
+                campaign.name.clone(),
+            ];
+            for (idx, col) in row.iter().enumerate() {
+                widths[idx] = widths[idx].max(col.len());
+            }
+            rows.push(row);
+        }
+
+        println!(
+            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}",
+            headers[0],
+            headers[1],
+            headers[2],
+            headers[3],
+            headers[4],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3],
+            w4 = widths[4]
+        );
+        println!(
+            "{:-<w0$}  {:-<w1$}  {:-<w2$}  {:-<w3$}  {:-<w4$}",
+            "",
+            "",
+            "",
+            "",
+            "",
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3],
+            w4 = widths[4]
+        );
+        for row in rows {
+            println!(
+                "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}",
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                w0 = widths[0],
+                w1 = widths[1],
+                w2 = widths[2],
+                w3 = widths[3],
+                w4 = widths[4]
+            );
+        }
+    }
+
+    fn cmd_campaign_show(&self, tokens: &[String]) {
+        if tokens.len() != 3 {
+            self.emit_error(
+                "campaign",
+                CliCode::Usage,
+                "usage: campaign show <campaign-id>",
+            );
+            return;
+        }
+        let campaign_id = match CampaignId::parse(&tokens[2]) {
+            Ok(value) => value,
+            Err(err) => {
+                self.emit_error("campaign", CliCode::Validation, &err.to_string());
+                return;
+            }
+        };
+        let Some(campaign) = self.campaigns.get(&campaign_id) else {
+            self.emit_error(
+                "campaign",
+                CliCode::NotFound,
+                &format!("campaign not found: {}", campaign_id.as_str()),
+            );
+            return;
+        };
+        self.emit_response(
+            CommandResponse::ok("campaign", "campaign details")
+                .with_field("campaign_id", campaign.id.as_str())
+                .with_field("name", &campaign.name)
+                .with_field("status", campaign.status.as_str())
+                .with_field("objective_count", campaign.objective_ids.len()),
+        );
+        if self.output_mode.is_json() {
+            return;
+        }
+        println!("Description: {}", campaign.description);
+        println!("Created At:  {}", campaign.created_at);
+        if campaign.objective_ids.is_empty() {
+            println!("Objectives:  <none>");
+        } else {
+            let objectives = campaign
+                .objective_ids
+                .iter()
+                .map(|id| id.as_str().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("Objectives:  {objectives}");
+        }
+    }
+
+    fn cmd_campaign_status(&mut self, tokens: &[String]) {
+        match tokens.len() {
+            2 => {
+                if self.campaigns.is_empty() {
+                    self.emit_response(
+                        CommandResponse::ok("campaign", "no campaigns").with_field("count", 0),
+                    );
+                    return;
+                }
+                if self.output_mode.is_json() {
+                    let statuses = self
+                        .campaigns
+                        .values()
+                        .map(|campaign| {
+                            format!(
+                                "{{\"campaign_id\":\"{}\",\"status\":\"{}\"}}",
+                                escape_json(campaign.id.as_str()),
+                                campaign.status.as_str()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    println!(
+                        "{{\"command\":\"campaign\",\"ok\":true,\"code\":\"{}\",\"message\":\"campaign statuses\",\"count\":{},\"statuses\":[{}]}}",
+                        CliCode::Ok.as_str(),
+                        self.campaigns.len(),
+                        statuses
+                    );
+                    return;
+                }
+                self.emit_response(
+                    CommandResponse::ok("campaign", "campaign statuses")
+                        .with_field("count", self.campaigns.len()),
+                );
+                for campaign in self.campaigns.values() {
+                    println!("{} {}", campaign.id.as_str(), campaign.status.as_str());
+                }
+            }
+            3 => {
+                let campaign_id = match CampaignId::parse(&tokens[2]) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.emit_error("campaign", CliCode::Validation, &err.to_string());
+                        return;
+                    }
+                };
+                let Some(campaign) = self.campaigns.get(&campaign_id) else {
+                    self.emit_error(
+                        "campaign",
+                        CliCode::NotFound,
+                        &format!("campaign not found: {}", campaign_id.as_str()),
+                    );
+                    return;
+                };
+                self.emit_response(
+                    CommandResponse::ok("campaign", "campaign status")
+                        .with_field("campaign_id", campaign.id.as_str())
+                        .with_field("status", campaign.status.as_str()),
+                );
+            }
+            4 | 5 => {
+                if tokens.len() == 5 && !is_yes_flag(&tokens[4]) {
+                    self.emit_error(
+                        "campaign",
+                        CliCode::Usage,
+                        "usage: campaign status [campaign-id [active|paused|completed|failed]]",
+                    );
+                    return;
+                }
+                let explicit_yes = has_yes_flag(tokens);
+                let campaign_id = match CampaignId::parse(&tokens[2]) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.emit_error("campaign", CliCode::Validation, &err.to_string());
+                        return;
+                    }
+                };
+                let Some(next_status) = parse_campaign_status_token(&tokens[3]) else {
+                    self.emit_error(
+                        "campaign",
+                        CliCode::Validation,
+                        "status must be one of: active|paused|completed|failed",
+                    );
+                    return;
+                };
+                let Some(current_status) = self.campaigns.get(&campaign_id).map(|c| c.status)
+                else {
+                    self.emit_error(
+                        "campaign",
+                        CliCode::NotFound,
+                        &format!("campaign not found: {}", campaign_id.as_str()),
+                    );
+                    return;
+                };
+                let decision = self.policy.evaluate(&PolicyRequest::change_campaign_status(
+                    campaign_id.as_str(),
+                    current_status.as_str(),
+                    next_status.as_str(),
+                ));
+                if !self.enforce_policy_decision(
+                    "campaign",
+                    decision,
+                    explicit_yes,
+                    "campaign status update canceled by confirmation",
+                ) {
+                    return;
+                }
+
+                let (campaign_id_text, from_status, to_status) = {
+                    let Some(campaign) = self.campaigns.get_mut(&campaign_id) else {
+                        self.emit_error(
+                            "campaign",
+                            CliCode::NotFound,
+                            &format!("campaign not found: {}", campaign_id.as_str()),
+                        );
+                        return;
+                    };
+                    let from = campaign.status;
+                    if let Err(err) = campaign.transition_status(next_status) {
+                        self.emit_error("campaign", CliCode::Validation, &err.to_string());
+                        return;
+                    }
+                    (
+                        campaign.id.as_str().to_string(),
+                        from.as_str().to_string(),
+                        campaign.status.as_str().to_string(),
+                    )
+                };
+                self.emit_response(
+                    CommandResponse::ok("campaign", "campaign status updated")
+                        .with_field("campaign_id", campaign_id_text)
+                        .with_field("from", from_status)
+                        .with_field("to", to_status),
+                );
+            }
+            _ => self.emit_error(
+                "campaign",
+                CliCode::Usage,
+                "usage: campaign status [campaign-id [active|paused|completed|failed]]",
+            ),
+        }
+    }
+
+    fn cmd_objective(&mut self, tokens: &[String]) {
+        if tokens.len() < 2 {
+            self.emit_error(
+                "objective",
+                CliCode::Usage,
+                "usage: objective create <campaign-id> <name> --success <predicate[,predicate...]> [--failure <predicate[,predicate...]>] [--risk <low|medium|high>] [--noise-budget <n>] [--description <text>] | objective link-prereq <objective-id> <prerequisite-id> | objective list [campaign-id] | objective status [objective-id [start|evaluate]]",
+            );
+            return;
+        }
+        match tokens[1].as_str() {
+            "create" => self.cmd_objective_create(tokens),
+            "link-prereq" => self.cmd_objective_link_prereq(tokens),
+            "list" => self.cmd_objective_list(tokens),
+            "status" => self.cmd_objective_status(tokens),
+            _ => self.emit_error(
+                "objective",
+                CliCode::Usage,
+                "usage: objective create <campaign-id> <name> --success <predicate[,predicate...]> [--failure <predicate[,predicate...]>] [--risk <low|medium|high>] [--noise-budget <n>] [--description <text>] | objective link-prereq <objective-id> <prerequisite-id> | objective list [campaign-id] | objective status [objective-id [start|evaluate]]",
+            ),
+        }
+    }
+
+    fn cmd_objective_create(&mut self, tokens: &[String]) {
+        if tokens.len() < 5 {
+            self.emit_error(
+                "objective",
+                CliCode::Usage,
+                "usage: objective create <campaign-id> <name> --success <predicate[,predicate...]> [--failure <predicate[,predicate...]>] [--risk <low|medium|high>] [--noise-budget <n>] [--description <text>]",
+            );
+            return;
+        }
+        let explicit_yes = has_yes_flag(tokens);
+        let campaign_id = match CampaignId::parse(&tokens[2]) {
+            Ok(value) => value,
+            Err(err) => {
+                self.emit_error("objective", CliCode::Validation, &err.to_string());
+                return;
+            }
+        };
+        let Some(campaign) = self.campaigns.get(&campaign_id) else {
+            self.emit_error(
+                "objective",
+                CliCode::NotFound,
+                &format!("campaign not found: {}", campaign_id.as_str()),
+            );
+            return;
+        };
+        if campaign.status.is_terminal() {
+            self.emit_error(
+                "objective",
+                CliCode::Validation,
+                "cannot add objectives to terminal campaign",
+            );
+            return;
+        }
+
+        let name = &tokens[3];
+        let mut description = String::new();
+        let mut risk_level = RiskLevel::Medium;
+        let mut noise_budget = None;
+        let mut success_criteria = Vec::new();
+        let mut failure_criteria = Vec::new();
+
+        let mut idx = 4;
+        while idx < tokens.len() {
+            match tokens[idx].as_str() {
+                "--description" | "-d" => {
+                    idx = idx.saturating_add(1);
+                    let Some(value) = tokens.get(idx) else {
+                        self.emit_error("objective", CliCode::Usage, "usage: --description <text>");
+                        return;
+                    };
+                    description = value.clone();
+                }
+                "--risk" => {
+                    idx = idx.saturating_add(1);
+                    let Some(value) = tokens.get(idx) else {
+                        self.emit_error("objective", CliCode::Usage, "usage: --risk <level>");
+                        return;
+                    };
+                    let Some(parsed) = parse_risk_level_token(value) else {
+                        self.emit_error(
+                            "objective",
+                            CliCode::Validation,
+                            "risk must be one of: low|medium|high",
+                        );
+                        return;
+                    };
+                    risk_level = parsed;
+                }
+                "--noise-budget" => {
+                    idx = idx.saturating_add(1);
+                    let Some(value) = tokens.get(idx) else {
+                        self.emit_error("objective", CliCode::Usage, "usage: --noise-budget <n>");
+                        return;
+                    };
+                    let Ok(parsed) = value.parse::<u32>() else {
+                        self.emit_error(
+                            "objective",
+                            CliCode::Validation,
+                            "noise-budget must be a positive integer",
+                        );
+                        return;
+                    };
+                    if parsed == 0 {
+                        self.emit_error(
+                            "objective",
+                            CliCode::Validation,
+                            "noise-budget must be greater than zero",
+                        );
+                        return;
+                    }
+                    noise_budget = Some(parsed);
+                }
+                "--success" => {
+                    idx = idx.saturating_add(1);
+                    let Some(value) = tokens.get(idx) else {
+                        self.emit_error(
+                            "objective",
+                            CliCode::Usage,
+                            "usage: --success <predicate[,predicate...]>",
+                        );
+                        return;
+                    };
+                    match parse_predicates(value) {
+                        Ok(parsed) => success_criteria.extend(parsed),
+                        Err(err) => {
+                            self.emit_error("objective", CliCode::Validation, &err);
+                            return;
+                        }
+                    }
+                }
+                "--failure" => {
+                    idx = idx.saturating_add(1);
+                    let Some(value) = tokens.get(idx) else {
+                        self.emit_error(
+                            "objective",
+                            CliCode::Usage,
+                            "usage: --failure <predicate[,predicate...]>",
+                        );
+                        return;
+                    };
+                    match parse_predicates(value) {
+                        Ok(parsed) => failure_criteria.extend(parsed),
+                        Err(err) => {
+                            self.emit_error("objective", CliCode::Validation, &err);
+                            return;
+                        }
+                    }
+                }
+                "--yes" | "-y" => {}
+                unknown => {
+                    self.emit_error(
+                        "objective",
+                        CliCode::Usage,
+                        &format!("unknown argument: {unknown}"),
+                    );
+                    return;
+                }
+            }
+            idx = idx.saturating_add(1);
+        }
+
+        if success_criteria.is_empty() {
+            self.emit_error(
+                "objective",
+                CliCode::Validation,
+                "objective requires at least one success predicate (--success)",
+            );
+            return;
+        }
+
+        let objective_id = next_objective_id();
+        let objective = match Objective::new_at(
+            objective_id.clone(),
+            campaign_id.clone(),
+            name,
+            &description,
+            Vec::new(),
+            success_criteria,
+            failure_criteria,
+            risk_level,
+            noise_budget,
+            now_secs(),
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                self.emit_error("objective", CliCode::Validation, &err.to_string());
+                return;
+            }
+        };
+        let decision = self.policy.evaluate(&PolicyRequest::create_objective(
+            campaign_id.as_str(),
+            objective_id.as_str(),
+            objective.risk_level.as_str(),
+        ));
+        if !self.enforce_policy_decision(
+            "objective",
+            decision,
+            explicit_yes,
+            "objective creation canceled by confirmation",
+        ) {
+            return;
+        }
+
+        self.objectives
+            .insert(objective_id.clone(), objective.clone());
+        if let Some(campaign) = self.campaigns.get_mut(&campaign_id) {
+            campaign.add_objective(objective_id.clone());
+        }
+
+        self.emit_response(
+            CommandResponse::ok("objective", "objective created")
+                .with_field("objective_id", objective_id.as_str())
+                .with_field("campaign_id", campaign_id.as_str())
+                .with_field("status", objective.status.as_str())
+                .with_field("risk_level", objective.risk_level.as_str()),
+        );
+    }
+
+    fn cmd_objective_link_prereq(&mut self, tokens: &[String]) {
+        if tokens.len() != 4 && tokens.len() != 5 {
+            self.emit_error(
+                "objective",
+                CliCode::Usage,
+                "usage: objective link-prereq <objective-id> <prerequisite-id>",
+            );
+            return;
+        }
+        if tokens.len() == 5 && !is_yes_flag(&tokens[4]) {
+            self.emit_error(
+                "objective",
+                CliCode::Usage,
+                "usage: objective link-prereq <objective-id> <prerequisite-id>",
+            );
+            return;
+        }
+        let explicit_yes = has_yes_flag(tokens);
+        let objective_id = match ObjectiveId::parse(&tokens[2]) {
+            Ok(value) => value,
+            Err(err) => {
+                self.emit_error("objective", CliCode::Validation, &err.to_string());
+                return;
+            }
+        };
+        let prerequisite_id = match ObjectiveId::parse(&tokens[3]) {
+            Ok(value) => value,
+            Err(err) => {
+                self.emit_error("objective", CliCode::Validation, &err.to_string());
+                return;
+            }
+        };
+        if objective_id == prerequisite_id {
+            self.emit_error(
+                "objective",
+                CliCode::Validation,
+                "objective cannot depend on itself",
+            );
+            return;
+        }
+
+        let Some(objective) = self.objectives.get(&objective_id) else {
+            self.emit_error(
+                "objective",
+                CliCode::NotFound,
+                &format!("objective not found: {}", objective_id.as_str()),
+            );
+            return;
+        };
+        let Some(prerequisite) = self.objectives.get(&prerequisite_id) else {
+            self.emit_error(
+                "objective",
+                CliCode::NotFound,
+                &format!("objective not found: {}", prerequisite_id.as_str()),
+            );
+            return;
+        };
+        if objective.campaign_id != prerequisite.campaign_id {
+            self.emit_error(
+                "objective",
+                CliCode::Validation,
+                "objective and prerequisite must belong to same campaign",
+            );
+            return;
+        }
+
+        let campaign_id = objective.campaign_id.clone();
+        let decision = self
+            .policy
+            .evaluate(&PolicyRequest::link_objective_prerequisite(
+                campaign_id.as_str(),
+                objective_id.as_str(),
+                prerequisite_id.as_str(),
+            ));
+        if !self.enforce_policy_decision(
+            "objective",
+            decision,
+            explicit_yes,
+            "objective prerequisite link canceled by confirmation",
+        ) {
+            return;
+        }
+        let mut already_linked = false;
+        let mut inserted = false;
+        if let Some(editable) = self.objectives.get_mut(&objective_id) {
+            if editable.prerequisites.contains(&prerequisite_id) {
+                already_linked = true;
+            } else {
+                editable.prerequisites.push(prerequisite_id.clone());
+                editable.updated_at = now_secs();
+                inserted = true;
+            }
+        }
+
+        if already_linked {
+            self.emit_response(
+                CommandResponse::ok("objective", "prerequisite already linked")
+                    .with_field("objective_id", objective_id.as_str())
+                    .with_field("prerequisite_id", prerequisite_id.as_str()),
+            );
+            return;
+        }
+
+        let validation = self.validate_campaign_objective_graph(&campaign_id);
+        if let Err(err) = validation {
+            if inserted {
+                if let Some(editable) = self.objectives.get_mut(&objective_id) {
+                    editable.prerequisites.retain(|id| id != &prerequisite_id);
+                    editable.updated_at = now_secs();
+                }
+            }
+            self.emit_error("objective", CliCode::Validation, &err.to_string());
+            return;
+        }
+
+        self.emit_response(
+            CommandResponse::ok("objective", "prerequisite linked")
+                .with_field("objective_id", objective_id.as_str())
+                .with_field("prerequisite_id", prerequisite_id.as_str()),
+        );
+    }
+
+    fn cmd_objective_list(&self, tokens: &[String]) {
+        if tokens.len() > 3 {
+            self.emit_error(
+                "objective",
+                CliCode::Usage,
+                "usage: objective list [campaign-id]",
+            );
+            return;
+        }
+        let filter_campaign = if tokens.len() == 3 {
+            match CampaignId::parse(&tokens[2]) {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    self.emit_error("objective", CliCode::Validation, &err.to_string());
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        let objectives = self
+            .objectives
+            .values()
+            .filter(|objective| {
+                filter_campaign
+                    .as_ref()
+                    .map(|campaign_id| &objective.campaign_id == campaign_id)
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
+
+        if objectives.is_empty() {
+            self.emit_response(
+                CommandResponse::ok("objective", "no objectives")
+                    .with_field("count", 0)
+                    .with_field(
+                        "campaign_id",
+                        filter_campaign
+                            .as_ref()
+                            .map(|id| id.as_str().to_string())
+                            .unwrap_or_default(),
+                    ),
+            );
+            return;
+        }
+        if self.output_mode.is_json() {
+            let objectives_json = objectives
+                .iter()
+                .map(|objective| {
+                    format!(
+                        "{{\"id\":\"{}\",\"campaign_id\":\"{}\",\"name\":\"{}\",\"status\":\"{}\",\"risk\":\"{}\",\"prerequisites\":{}}}",
+                        escape_json(objective.id.as_str()),
+                        escape_json(objective.campaign_id.as_str()),
+                        escape_json(&objective.name),
+                        objective.status.as_str(),
+                        objective.risk_level.as_str(),
+                        objective.prerequisites.len()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            println!(
+                "{{\"command\":\"objective\",\"ok\":true,\"code\":\"{}\",\"message\":\"listed objectives\",\"count\":{},\"objectives\":[{}]}}",
+                CliCode::Ok.as_str(),
+                objectives.len(),
+                objectives_json
+            );
+            return;
+        }
+        self.emit_response(
+            CommandResponse::ok("objective", "listed objectives")
+                .with_field("count", objectives.len()),
+        );
+
+        let headers = ["Id", "Campaign", "Status", "Risk", "Prereq", "Name"];
+        let mut rows = Vec::with_capacity(objectives.len());
+        let mut widths = [
+            headers[0].len(),
+            headers[1].len(),
+            headers[2].len(),
+            headers[3].len(),
+            headers[4].len(),
+            headers[5].len(),
+        ];
+        for objective in objectives {
+            let row = [
+                objective.id.as_str().to_string(),
+                objective.campaign_id.as_str().to_string(),
+                objective.status.as_str().to_string(),
+                objective.risk_level.as_str().to_string(),
+                objective.prerequisites.len().to_string(),
+                objective.name.clone(),
+            ];
+            for (idx, col) in row.iter().enumerate() {
+                widths[idx] = widths[idx].max(col.len());
+            }
+            rows.push(row);
+        }
+
+        println!(
+            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {:<w5$}",
+            headers[0],
+            headers[1],
+            headers[2],
+            headers[3],
+            headers[4],
+            headers[5],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3],
+            w4 = widths[4],
+            w5 = widths[5]
+        );
+        println!(
+            "{:-<w0$}  {:-<w1$}  {:-<w2$}  {:-<w3$}  {:-<w4$}  {:-<w5$}",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3],
+            w4 = widths[4],
+            w5 = widths[5]
+        );
+        for row in rows {
+            println!(
+                "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {:<w5$}",
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                row[5],
+                w0 = widths[0],
+                w1 = widths[1],
+                w2 = widths[2],
+                w3 = widths[3],
+                w4 = widths[4],
+                w5 = widths[5]
+            );
+        }
+    }
+
+    fn cmd_objective_status(&mut self, tokens: &[String]) {
+        match tokens.len() {
+            2 => {
+                let mut counts = BTreeMap::<&'static str, usize>::new();
+                counts.insert("pending", 0);
+                counts.insert("eligible", 0);
+                counts.insert("in_progress", 0);
+                counts.insert("achieved", 0);
+                counts.insert("failed", 0);
+                for objective in self.objectives.values() {
+                    let key = objective.status.as_str();
+                    if let Some(counter) = counts.get_mut(key) {
+                        *counter = counter.saturating_add(1);
+                    }
+                }
+                self.emit_response(
+                    CommandResponse::ok("objective", "objective status counts")
+                        .with_field("total", self.objectives.len())
+                        .with_field("pending", counts["pending"])
+                        .with_field("eligible", counts["eligible"])
+                        .with_field("in_progress", counts["in_progress"])
+                        .with_field("achieved", counts["achieved"])
+                        .with_field("failed", counts["failed"]),
+                );
+            }
+            3 => {
+                let objective_id = match ObjectiveId::parse(&tokens[2]) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.emit_error("objective", CliCode::Validation, &err.to_string());
+                        return;
+                    }
+                };
+                let Some(objective) = self.objectives.get(&objective_id) else {
+                    self.emit_error(
+                        "objective",
+                        CliCode::NotFound,
+                        &format!("objective not found: {}", objective_id.as_str()),
+                    );
+                    return;
+                };
+                self.emit_response(
+                    CommandResponse::ok("objective", "objective status")
+                        .with_field("objective_id", objective.id.as_str())
+                        .with_field("campaign_id", objective.campaign_id.as_str())
+                        .with_field("status", objective.status.as_str()),
+                );
+            }
+            4 | 5 => {
+                if tokens.len() == 5 && !is_yes_flag(&tokens[4]) {
+                    self.emit_error(
+                        "objective",
+                        CliCode::Usage,
+                        "usage: objective status [objective-id [start|evaluate]]",
+                    );
+                    return;
+                }
+                let explicit_yes = has_yes_flag(tokens);
+                let objective_id = match ObjectiveId::parse(&tokens[2]) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.emit_error("objective", CliCode::Validation, &err.to_string());
+                        return;
+                    }
+                };
+                match tokens[3].as_str() {
+                    "start" => self.cmd_objective_start(objective_id, explicit_yes),
+                    "evaluate" => self.cmd_objective_evaluate(objective_id, explicit_yes),
+                    _ => self.emit_error(
+                        "objective",
+                        CliCode::Usage,
+                        "usage: objective status [objective-id [start|evaluate]]",
+                    ),
+                }
+            }
+            _ => self.emit_error(
+                "objective",
+                CliCode::Usage,
+                "usage: objective status [objective-id [start|evaluate]]",
+            ),
+        }
+    }
+
+    fn cmd_objective_start(&mut self, objective_id: ObjectiveId, explicit_yes: bool) {
+        let Some(objective) = self.objectives.get(&objective_id) else {
+            self.emit_error(
+                "objective",
+                CliCode::NotFound,
+                &format!("objective not found: {}", objective_id.as_str()),
+            );
+            return;
+        };
+        let campaign_id = objective.campaign_id.clone();
+        let decision = self.policy.evaluate(&PolicyRequest::start_objective(
+            campaign_id.as_str(),
+            objective.id.as_str(),
+            objective.risk_level.as_str(),
+        ));
+        if !self.enforce_policy_decision(
+            "objective",
+            decision,
+            explicit_yes,
+            "objective start canceled by confirmation",
+        ) {
+            return;
+        }
+        let objective_statuses = self
+            .objectives
+            .values()
+            .filter(|objective| objective.campaign_id == campaign_id)
+            .map(|objective| (objective.id.clone(), objective.status))
+            .collect::<BTreeMap<_, _>>();
+
+        let Some(editable) = self.objectives.get_mut(&objective_id) else {
+            self.emit_error(
+                "objective",
+                CliCode::NotFound,
+                &format!("objective not found: {}", objective_id.as_str()),
+            );
+            return;
+        };
+        let mut events = Vec::new();
+        let transition = match ObjectiveEvaluationEngine::start_objective(
+            editable,
+            &objective_statuses,
+            now_secs(),
+            &mut events,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                self.emit_error("objective", CliCode::Validation, &err.to_string());
+                return;
+            }
+        };
+        self.emit_response(
+            CommandResponse::ok("objective", "objective started")
+                .with_field("objective_id", transition.objective_id.as_str())
+                .with_field("from", transition.from.as_str())
+                .with_field("to", transition.to.as_str())
+                .with_field("campaign_id", campaign_id.as_str()),
+        );
+    }
+
+    fn cmd_objective_evaluate(&mut self, objective_id: ObjectiveId, explicit_yes: bool) {
+        let Some(objective) = self.objectives.get(&objective_id) else {
+            self.emit_error(
+                "objective",
+                CliCode::NotFound,
+                &format!("objective not found: {}", objective_id.as_str()),
+            );
+            return;
+        };
+        let campaign_id = objective.campaign_id.clone();
+        let decision = self.policy.evaluate(&PolicyRequest::evaluate_objective(
+            campaign_id.as_str(),
+            objective.id.as_str(),
+            objective.risk_level.as_str(),
+        ));
+        if !self.enforce_policy_decision(
+            "objective",
+            decision,
+            explicit_yes,
+            "objective evaluation canceled by confirmation",
+        ) {
+            return;
+        }
+        let mut scoped = self
+            .objectives
+            .iter()
+            .filter(|(_, objective)| objective.campaign_id == campaign_id)
+            .map(|(id, objective)| (id.clone(), objective.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let selected = BTreeSet::from([objective_id.clone()]);
+        let snapshot = PredicateSnapshot::default();
+        let mut events = Vec::new();
+        let records = match ObjectiveEvaluationEngine::evaluate_selected(
+            &mut scoped,
+            &selected,
+            &snapshot,
+            ObjectiveReevaluationTrigger::ManualRequest,
+            now_secs(),
+            &mut events,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                self.emit_error("objective", CliCode::Validation, &err.to_string());
+                return;
+            }
+        };
+
+        for (id, objective) in scoped {
+            self.objectives.insert(id, objective);
+        }
+
+        let Some(updated) = self.objectives.get(&objective_id) else {
+            self.emit_error("objective", CliCode::Execution, "objective evaluate failed");
+            return;
+        };
+        let evaluations = records.len();
+        self.emit_response(
+            CommandResponse::ok("objective", "objective evaluated")
+                .with_field("objective_id", updated.id.as_str())
+                .with_field("status", updated.status.as_str())
+                .with_field("evaluations", evaluations),
+        );
+    }
+
+    fn validate_campaign_objective_graph(
+        &self,
+        campaign_id: &CampaignId,
+    ) -> Result<(), corelib::campaign::CampaignModelError> {
+        let objectives = self
+            .objectives
+            .values()
+            .filter(|objective| &objective.campaign_id == campaign_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_prerequisite_graph(&objectives)
     }
 
     fn build_release_matrix(&self) -> CompatibilityMatrix {
@@ -2199,6 +3359,36 @@ impl Repl {
         Ok(matches!(answer.as_str(), "yes" | "y"))
     }
 
+    fn enforce_policy_decision(
+        &self,
+        command: &str,
+        decision: corelib::policy::PolicyDecision,
+        explicit_yes: bool,
+        confirm_cancel_message: &str,
+    ) -> bool {
+        match decision.kind {
+            DecisionKind::Deny => {
+                self.emit_error(
+                    command,
+                    CliCode::PolicyDenied,
+                    &format!("policy blocked {command}: {}", decision.reason),
+                );
+                false
+            }
+            DecisionKind::RequireConfirmation if !explicit_yes => {
+                let confirmed = self
+                    .confirm_intent(&format!("{} [yes/no]: ", decision.reason))
+                    .unwrap_or(false);
+                if !confirmed {
+                    self.emit_error(command, CliCode::PolicyDenied, confirm_cancel_message);
+                    return false;
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
     fn emit_response(&self, response: CommandResponse) {
         if self.output_mode.is_json() {
             println!("{}", response.render_json());
@@ -2484,6 +3674,163 @@ impl Repl {
                             .collect();
                     }
                 }
+                "campaign" => {
+                    if token_index == 1 {
+                        candidates = ["create", "list", "show", "status"]
+                            .iter()
+                            .filter(|v| v.starts_with(current))
+                            .map(|v| v.to_string())
+                            .collect();
+                    } else if token_index == 2 {
+                        if matches!(tokens.get(1), Some(&"show")) {
+                            candidates = campaign_id_candidates(self, current);
+                        } else if matches!(tokens.get(1), Some(&"status")) {
+                            let mut status_candidates = ["active", "paused", "completed", "failed"]
+                                .iter()
+                                .filter(|v| v.starts_with(current))
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>();
+                            let mut id_candidates = campaign_id_candidates(self, current);
+                            status_candidates.append(&mut id_candidates);
+                            candidates = status_candidates;
+                        }
+                    } else if token_index == 3 && matches!(tokens.get(1), Some(&"status")) {
+                        if tokens
+                            .get(2)
+                            .and_then(|value| CampaignId::parse(value).ok())
+                            .is_some()
+                        {
+                            candidates = ["active", "paused", "completed", "failed"]
+                                .iter()
+                                .filter(|v| v.starts_with(current))
+                                .map(|v| v.to_string())
+                                .collect();
+                        }
+                    } else if token_index == 4
+                        && matches!(tokens.get(1), Some(&"status"))
+                        && tokens
+                            .get(2)
+                            .and_then(|value| CampaignId::parse(value).ok())
+                            .is_some()
+                        && matches!(
+                            tokens.get(3),
+                            Some(&"active")
+                                | Some(&"paused")
+                                | Some(&"completed")
+                                | Some(&"failed")
+                        )
+                    {
+                        candidates = ["--yes", "-y"]
+                            .iter()
+                            .filter(|v| v.starts_with(current))
+                            .map(|v| v.to_string())
+                            .collect();
+                    }
+                }
+                "objective" => {
+                    if token_index == 1 {
+                        candidates = ["create", "link-prereq", "list", "status"]
+                            .iter()
+                            .filter(|v| v.starts_with(current))
+                            .map(|v| v.to_string())
+                            .collect();
+                    } else if token_index == 2 {
+                        if matches!(tokens.get(1), Some(&"create") | Some(&"list")) {
+                            candidates = campaign_id_candidates(self, current);
+                        } else if matches!(tokens.get(1), Some(&"link-prereq") | Some(&"status")) {
+                            candidates = objective_id_candidates(self, current);
+                        }
+                    } else if token_index == 3 {
+                        if matches!(tokens.get(1), Some(&"link-prereq")) {
+                            candidates = objective_id_candidates(self, current);
+                        } else if matches!(tokens.get(1), Some(&"status")) {
+                            if tokens
+                                .get(2)
+                                .and_then(|value| ObjectiveId::parse(value).ok())
+                                .is_some()
+                            {
+                                candidates = ["start", "evaluate"]
+                                    .iter()
+                                    .filter(|v| v.starts_with(current))
+                                    .map(|v| v.to_string())
+                                    .collect();
+                            }
+                        } else if matches!(tokens.get(1), Some(&"create")) {
+                            candidates = [
+                                "--success",
+                                "--failure",
+                                "--risk",
+                                "--noise-budget",
+                                "--description",
+                                "-d",
+                            ]
+                            .iter()
+                            .filter(|v| v.starts_with(current))
+                            .map(|v| v.to_string())
+                            .collect();
+                        }
+                    } else if token_index >= 4 && matches!(tokens.get(1), Some(&"create")) {
+                        match tokens.get(token_index.saturating_sub(1)) {
+                            Some(&"--risk") => {
+                                candidates = ["low", "medium", "high"]
+                                    .iter()
+                                    .filter(|v| v.starts_with(current))
+                                    .map(|v| v.to_string())
+                                    .collect();
+                            }
+                            Some(&"--noise-budget") => {
+                                candidates = ["1", "10", "100"]
+                                    .iter()
+                                    .filter(|v| v.starts_with(current))
+                                    .map(|v| v.to_string())
+                                    .collect();
+                            }
+                            _ => {
+                                candidates = [
+                                    "--success",
+                                    "--failure",
+                                    "--risk",
+                                    "--noise-budget",
+                                    "--description",
+                                    "-d",
+                                ]
+                                .iter()
+                                .filter(|v| v.starts_with(current))
+                                .map(|v| v.to_string())
+                                .collect();
+                            }
+                        }
+                    } else if token_index == 4 && matches!(tokens.get(1), Some(&"status")) {
+                        if tokens
+                            .get(2)
+                            .and_then(|value| ObjectiveId::parse(value).ok())
+                            .is_some()
+                            && matches!(tokens.get(3), Some(&"start") | Some(&"evaluate"))
+                        {
+                            candidates = ["--yes", "-y"]
+                                .iter()
+                                .filter(|v| v.starts_with(current))
+                                .map(|v| v.to_string())
+                                .collect();
+                        }
+                    } else if token_index == 4 && matches!(tokens.get(1), Some(&"link-prereq")) {
+                        if tokens
+                            .get(2)
+                            .and_then(|value| ObjectiveId::parse(value).ok())
+                            .is_some()
+                            && tokens
+                                .get(3)
+                                .and_then(|value| ObjectiveId::parse(value).ok())
+                                .is_some()
+                        {
+                            candidates = ["--yes", "-y"]
+                                .iter()
+                                .filter(|v| v.starts_with(current))
+                                .map(|v| v.to_string())
+                                .collect();
+                        }
+                    }
+                }
                 "interact" => {
                     if token_index == 1 {
                         candidates = session_id_candidates(self, current);
@@ -2620,6 +3967,22 @@ fn session_id_candidates(repl: &Repl, prefix: &str) -> Vec<String> {
         .collect()
 }
 
+fn campaign_id_candidates(repl: &Repl, prefix: &str) -> Vec<String> {
+    repl.campaigns
+        .keys()
+        .map(|id| id.as_str().to_string())
+        .filter(|id| id.starts_with(prefix))
+        .collect()
+}
+
+fn objective_id_candidates(repl: &Repl, prefix: &str) -> Vec<String> {
+    repl.objectives
+        .keys()
+        .map(|id| id.as_str().to_string())
+        .filter(|id| id.starts_with(prefix))
+        .collect()
+}
+
 fn release_snapshot_id_candidates(repl: &Repl, prefix: &str) -> Vec<String> {
     repl.release_rollback
         .list_snapshots()
@@ -2643,6 +4006,156 @@ fn search_flag_candidates(prefix: &str) -> Vec<String> {
         .filter(|flag| flag.starts_with(prefix))
         .map(|flag| flag.to_string())
         .collect()
+}
+
+fn is_yes_flag(token: &str) -> bool {
+    token.eq_ignore_ascii_case("--yes") || token.eq_ignore_ascii_case("-y")
+}
+
+fn has_yes_flag(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| is_yes_flag(token))
+}
+
+fn next_campaign_id() -> CampaignId {
+    let left = Id::next().0;
+    let right = Id::next().0;
+    let hex = format!("{left:016x}{right:016x}");
+    let raw = format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    );
+    CampaignId::parse(&raw).expect("generated campaign id must be valid")
+}
+
+fn next_objective_id() -> ObjectiveId {
+    let left = Id::next().0;
+    let right = Id::next().0;
+    let hex = format!("{left:016x}{right:016x}");
+    let raw = format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    );
+    ObjectiveId::parse(&raw).expect("generated objective id must be valid")
+}
+
+fn parse_campaign_status_token(raw: &str) -> Option<corelib::campaign::CampaignStatus> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "active" => Some(corelib::campaign::CampaignStatus::Active),
+        "paused" => Some(corelib::campaign::CampaignStatus::Paused),
+        "completed" => Some(corelib::campaign::CampaignStatus::Completed),
+        "failed" => Some(corelib::campaign::CampaignStatus::Failed),
+        _ => None,
+    }
+}
+
+fn parse_risk_level_token(raw: &str) -> Option<RiskLevel> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "low" => Some(RiskLevel::Low),
+        "medium" => Some(RiskLevel::Medium),
+        "high" => Some(RiskLevel::High),
+        _ => None,
+    }
+}
+
+fn parse_predicates(raw: &str) -> Result<Vec<Predicate>, String> {
+    let mut predicates = Vec::new();
+    for item in raw.split(',') {
+        let token = item.trim();
+        if token.is_empty() {
+            continue;
+        }
+        predicates.push(parse_predicate(token)?);
+    }
+    if predicates.is_empty() {
+        return Err("predicate list cannot be empty".to_string());
+    }
+    Ok(predicates)
+}
+
+fn parse_predicate(raw: &str) -> Result<Predicate, String> {
+    if let Some(rest) = raw.strip_prefix("finding_exists:") {
+        let finding_type = rest.trim();
+        if finding_type.is_empty() {
+            return Err("finding_exists requires finding type".to_string());
+        }
+        return Ok(Predicate::FindingExists {
+            finding_type: finding_type.to_string(),
+        });
+    }
+
+    if let Some(rest) = raw.strip_prefix("session_privilege:") {
+        let level = match rest.trim().to_ascii_lowercase().as_str() {
+            "user" => SessionPrivilegeLevel::User,
+            "elevated" => SessionPrivilegeLevel::Elevated,
+            "root" => SessionPrivilegeLevel::Root,
+            _ => {
+                return Err("session_privilege must be one of: user|elevated|root".to_string());
+            }
+        };
+        return Ok(Predicate::SessionPrivilege { level });
+    }
+
+    if let Some(rest) = raw.strip_prefix("artifact_tag_match:") {
+        let tag = rest.trim();
+        if tag.is_empty() {
+            return Err("artifact_tag_match requires a tag".to_string());
+        }
+        return Ok(Predicate::ArtifactTagMatch {
+            tag: tag.to_string(),
+        });
+    }
+
+    if let Some(rest) = raw.strip_prefix("run_succeeded:") {
+        let module_name = rest.trim();
+        if module_name.is_empty() {
+            return Err("run_succeeded requires a module path".to_string());
+        }
+        return Ok(Predicate::RunSucceeded {
+            module_name: module_name.to_string(),
+        });
+    }
+
+    if let Some(rest) = raw.strip_prefix("custom_metadata_match:") {
+        let (key, value) = rest
+            .split_once('=')
+            .ok_or_else(|| "custom_metadata_match requires key=value".to_string())?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err("custom_metadata_match requires non-empty key".to_string());
+        }
+        let value = parse_metadata_value(value.trim());
+        return Ok(Predicate::CustomMetadataMatch {
+            key: key.to_string(),
+            value,
+        });
+    }
+
+    Err(
+        "unsupported predicate format; supported: finding_exists, session_privilege, artifact_tag_match, run_succeeded, custom_metadata_match"
+            .to_string(),
+    )
+}
+
+fn parse_metadata_value(raw: &str) -> MetadataValue {
+    match raw.to_ascii_lowercase().as_str() {
+        "null" => MetadataValue::Null,
+        "true" => MetadataValue::Bool(true),
+        "false" => MetadataValue::Bool(false),
+        _ => {
+            if let Ok(integer) = raw.parse::<i64>() {
+                return MetadataValue::Integer(integer);
+            }
+            MetadataValue::Text(raw.to_string())
+        }
+    }
 }
 
 fn bool_word(value: bool) -> String {
@@ -2809,11 +4322,13 @@ mod tests {
     }
 
     #[test]
-    fn command_tokens_include_clear_and_release_commands() {
+    fn command_tokens_include_core_and_campaign_commands() {
         let commands = command_tokens();
         assert!(commands.contains(&"clear"));
         assert!(commands.contains(&"cls"));
         assert!(commands.contains(&"release"));
+        assert!(commands.contains(&"campaign"));
+        assert!(commands.contains(&"objective"));
     }
 
     #[test]
@@ -2821,5 +4336,69 @@ mod tests {
         let prefixed = help_topic_candidates("re");
         assert!(prefixed.contains(&"release".to_string()));
         assert!(!prefixed.contains(&"help".to_string()));
+    }
+
+    #[test]
+    fn predicate_parser_supports_all_contract_variants() {
+        let parsed = parse_predicates(
+            "finding_exists:shell,session_privilege:root,artifact_tag_match:loot,run_succeeded:exploit/linux/telnet,test",
+        );
+        assert!(parsed.is_err(), "invalid mixed predicate list should fail");
+
+        assert!(parse_predicate("finding_exists:shell").is_ok());
+        assert!(parse_predicate("session_privilege:root").is_ok());
+        assert!(parse_predicate("artifact_tag_match:loot").is_ok());
+        assert!(parse_predicate("run_succeeded:exploit/linux/telnet").is_ok());
+        assert!(parse_predicate("custom_metadata_match:owner=red").is_ok());
+    }
+
+    #[test]
+    fn completion_suggests_campaign_objective_commands_and_ids() {
+        let registry = modules::ModuleRegistryBuilder::new()
+            .build()
+            .expect("empty registry");
+        let mut repl = Repl::new("moonlight".to_string(), registry, None);
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_id =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective id");
+        let mut campaign =
+            Campaign::new_at(campaign_id.clone(), "operation", "", 1, None).expect("campaign");
+        campaign.add_objective(objective_id.clone());
+        repl.campaigns.insert(campaign_id.clone(), campaign);
+        let objective = Objective::new_at(
+            objective_id.clone(),
+            campaign_id.clone(),
+            "foothold",
+            "",
+            vec![],
+            vec![Predicate::FindingExists {
+                finding_type: "shell".to_string(),
+            }],
+            vec![],
+            RiskLevel::High,
+            None,
+            1,
+        )
+        .expect("objective");
+        repl.objectives.insert(objective_id.clone(), objective);
+
+        let root = repl.complete("");
+        assert!(root.candidates.contains(&"campaign".to_string()));
+        assert!(root.candidates.contains(&"objective".to_string()));
+
+        let campaign_sub = repl.complete("campaign ");
+        assert!(campaign_sub.candidates.contains(&"create".to_string()));
+        assert!(campaign_sub.candidates.contains(&"status".to_string()));
+
+        let campaign_status = repl.complete("campaign status ");
+        assert!(campaign_status
+            .candidates
+            .contains(&campaign_id.as_str().to_string()));
+
+        let objective_status = repl.complete("objective status ");
+        assert!(objective_status
+            .candidates
+            .contains(&objective_id.as_str().to_string()));
     }
 }
