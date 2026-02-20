@@ -4,6 +4,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::campaign::{
+    CampaignEvent as CampaignAuditEvent, CampaignEventPayload as CampaignPayload, CampaignId,
+    CampaignStatus, ObjectiveId, ObjectiveReevaluationTrigger, ObjectiveStatus, RiskLevel,
+};
 use crate::domain::{
     CorrelationId, DomainError, EventId, ModuleVersionId, Run, RunId, RunState, SessionId,
     TargetId, Task, TaskId, TaskState, WorkspaceId,
@@ -274,6 +278,7 @@ pub enum AuditEventPayload {
     Task(TaskEvent),
     Session(SessionEvent),
     Module(ModuleEvent),
+    Campaign(CampaignAuditEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1252,17 +1257,31 @@ pub struct ObservableExecutionOrchestrator<S: SnapshotStore, A: AuditLogStore> {
     inner: ExecutionOrchestrator<S>,
     audit_store: A,
     run_correlations: BTreeMap<RunId, CorrelationId>,
+    campaign_correlations: BTreeMap<CampaignId, CorrelationId>,
+    next_campaign_sequence: BTreeMap<CampaignId, u64>,
 }
 
 impl<S: SnapshotStore, A: AuditLogStore> ObservableExecutionOrchestrator<S, A> {
     pub fn new(store: S, mut audit_store: A) -> Result<Self, OrchestratorError> {
         let inner = ExecutionOrchestrator::new(store)?;
         let mut run_correlations = BTreeMap::new();
+        let mut campaign_correlations = BTreeMap::new();
+        let mut next_campaign_sequence = BTreeMap::new();
         for event in audit_store.load_events()? {
             if let Some(run_id) = event_run_id(&event.payload) {
                 run_correlations
                     .entry(run_id)
                     .or_insert(event.correlation_id);
+            }
+            if let Some((campaign_id, sequence)) = event_campaign_meta(&event.payload) {
+                campaign_correlations
+                    .entry(campaign_id.clone())
+                    .or_insert(event.correlation_id);
+                let candidate_next = sequence.saturating_add(1);
+                let entry = next_campaign_sequence.entry(campaign_id).or_insert(1);
+                if *entry < candidate_next {
+                    *entry = candidate_next;
+                }
             }
         }
         for run_id in inner.runs.keys() {
@@ -1274,6 +1293,8 @@ impl<S: SnapshotStore, A: AuditLogStore> ObservableExecutionOrchestrator<S, A> {
             inner,
             audit_store,
             run_correlations,
+            campaign_correlations,
+            next_campaign_sequence,
         })
     }
 
@@ -1551,12 +1572,96 @@ impl<S: SnapshotStore, A: AuditLogStore> ObservableExecutionOrchestrator<S, A> {
         Ok(effective)
     }
 
+    pub fn record_campaign_event(
+        &mut self,
+        payload: CampaignPayload,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<(CorrelationId, u64), OrchestratorError> {
+        let campaign_id = payload.campaign_id().clone();
+        let effective = match (
+            self.campaign_correlations.get(&campaign_id).copied(),
+            correlation_id,
+        ) {
+            (Some(existing), Some(provided)) if existing != provided => {
+                return Err(OrchestratorError::Validation(format!(
+                    "campaign {} already bound to lineage {} but {} was provided",
+                    campaign_id.as_str(),
+                    existing.0 .0,
+                    provided.0 .0
+                )));
+            }
+            (Some(existing), _) => existing,
+            (None, Some(provided)) => {
+                self.campaign_correlations
+                    .insert(campaign_id.clone(), provided);
+                provided
+            }
+            (None, None) => {
+                let generated = CorrelationId::next();
+                self.campaign_correlations
+                    .insert(campaign_id.clone(), generated);
+                generated
+            }
+        };
+
+        let sequence = *self
+            .next_campaign_sequence
+            .entry(campaign_id.clone())
+            .or_insert(1);
+        let occurred_at = now_secs();
+        let event = CampaignAuditEvent {
+            sequence,
+            occurred_at,
+            payload,
+        };
+        self.append_event(effective, AuditEventPayload::Campaign(event))?;
+        self.next_campaign_sequence
+            .insert(campaign_id, sequence.saturating_add(1));
+        Ok((effective, sequence))
+    }
+
+    pub fn record_campaign_events<I>(
+        &mut self,
+        payloads: I,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<CorrelationId, OrchestratorError>
+    where
+        I: IntoIterator<Item = CampaignPayload>,
+    {
+        let payloads = payloads.into_iter().collect::<Vec<_>>();
+        if payloads.is_empty() {
+            return Err(OrchestratorError::Validation(
+                "campaign payload batch cannot be empty".to_string(),
+            ));
+        }
+
+        let campaign_id = payloads[0].campaign_id().clone();
+        for payload in payloads.iter().skip(1) {
+            if payload.campaign_id() != &campaign_id {
+                return Err(OrchestratorError::Validation(
+                    "all campaign payloads in a batch must belong to one campaign".to_string(),
+                ));
+            }
+        }
+
+        let mut effective = correlation_id;
+        for payload in payloads {
+            let (lineage, _sequence) = self.record_campaign_event(payload, effective)?;
+            effective = Some(lineage);
+        }
+        Ok(effective.expect("non-empty payload batch must produce lineage"))
+    }
+
     pub fn load_audit_events(&mut self) -> Result<Vec<AuditEvent>, OrchestratorError> {
         self.audit_store.load_events()
     }
 
     pub fn correlation_id_for_run(&self, run_id: RunId) -> Option<CorrelationId> {
         self.run_correlations.get(&run_id).copied()
+    }
+
+    pub fn correlation_id_for_campaign(&self, campaign_id: &CampaignId) -> Option<CorrelationId> {
+        self.campaign_correlations.get(campaign_id).copied()
     }
 
     pub fn reconstruct_run_from_history(
@@ -2060,6 +2165,99 @@ fn encode_audit_event(event: &AuditEvent) -> String {
             parts.push(encode_hex(module_path));
             parts.push(run_id.0 .0.to_string());
         }
+        AuditEventPayload::Campaign(event) => match &event.payload {
+            CampaignPayload::CampaignCreated { campaign_id, name } => {
+                parts.push("campaign_created".to_string());
+                parts.push(event.sequence.to_string());
+                parts.push(campaign_id.as_str().to_string());
+                parts.push(encode_hex(name));
+            }
+            CampaignPayload::CampaignStatusChanged {
+                campaign_id,
+                from,
+                to,
+                reason,
+            } => {
+                parts.push("campaign_status_changed".to_string());
+                parts.push(event.sequence.to_string());
+                parts.push(campaign_id.as_str().to_string());
+                parts.push(from.as_str().to_string());
+                parts.push(to.as_str().to_string());
+                parts.push(encode_opt_string(reason.as_deref()));
+            }
+            CampaignPayload::ObjectiveCreated {
+                campaign_id,
+                objective_id,
+                name,
+                risk_level,
+            } => {
+                parts.push("objective_created".to_string());
+                parts.push(event.sequence.to_string());
+                parts.push(campaign_id.as_str().to_string());
+                parts.push(objective_id.as_str().to_string());
+                parts.push(encode_hex(name));
+                parts.push(risk_level.as_str().to_string());
+            }
+            CampaignPayload::ObjectivePrereqLinked {
+                campaign_id,
+                objective_id,
+                prerequisite_id,
+            } => {
+                parts.push("objective_prereq_linked".to_string());
+                parts.push(event.sequence.to_string());
+                parts.push(campaign_id.as_str().to_string());
+                parts.push(objective_id.as_str().to_string());
+                parts.push(prerequisite_id.as_str().to_string());
+            }
+            CampaignPayload::ObjectiveStatusChanged {
+                campaign_id,
+                objective_id,
+                from,
+                to,
+                reason,
+            } => {
+                parts.push("objective_status_changed".to_string());
+                parts.push(event.sequence.to_string());
+                parts.push(campaign_id.as_str().to_string());
+                parts.push(objective_id.as_str().to_string());
+                parts.push(from.as_str().to_string());
+                parts.push(to.as_str().to_string());
+                parts.push(encode_opt_string(reason.as_deref()));
+            }
+            CampaignPayload::ObjectiveEvaluated {
+                campaign_id,
+                objective_id,
+                trigger,
+                prerequisites_satisfied,
+                success_criteria_satisfied,
+                failure_criteria_satisfied,
+                resulting_status,
+            } => {
+                parts.push("objective_evaluated".to_string());
+                parts.push(event.sequence.to_string());
+                parts.push(campaign_id.as_str().to_string());
+                parts.push(objective_id.as_str().to_string());
+                parts.push(trigger.as_str().to_string());
+                parts.push(if *prerequisites_satisfied { "1" } else { "0" }.to_string());
+                parts.push(
+                    if *success_criteria_satisfied {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .to_string(),
+                );
+                parts.push(
+                    if *failure_criteria_satisfied {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .to_string(),
+                );
+                parts.push(resulting_status.as_str().to_string());
+            }
+        },
     }
     parts.join("|")
 }
@@ -2332,6 +2530,115 @@ fn decode_audit_event(line: &str) -> Result<AuditEvent, OrchestratorError> {
                 run_id: RunId(Id(parse_u64(parts[6])?)),
             })
         }
+        "campaign_created" => {
+            if parts.len() != 8 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid campaign_created event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Campaign(CampaignAuditEvent {
+                sequence: parse_u64(parts[5])?,
+                occurred_at,
+                payload: CampaignPayload::CampaignCreated {
+                    campaign_id: parse_campaign_id(parts[6])?,
+                    name: decode_hex(parts[7])?,
+                },
+            })
+        }
+        "campaign_status_changed" => {
+            if parts.len() != 10 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid campaign_status_changed event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Campaign(CampaignAuditEvent {
+                sequence: parse_u64(parts[5])?,
+                occurred_at,
+                payload: CampaignPayload::CampaignStatusChanged {
+                    campaign_id: parse_campaign_id(parts[6])?,
+                    from: parse_campaign_status(parts[7])?,
+                    to: parse_campaign_status(parts[8])?,
+                    reason: decode_opt_string(parts[9])?,
+                },
+            })
+        }
+        "objective_created" => {
+            if parts.len() != 10 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid objective_created event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Campaign(CampaignAuditEvent {
+                sequence: parse_u64(parts[5])?,
+                occurred_at,
+                payload: CampaignPayload::ObjectiveCreated {
+                    campaign_id: parse_campaign_id(parts[6])?,
+                    objective_id: parse_objective_id(parts[7])?,
+                    name: decode_hex(parts[8])?,
+                    risk_level: parse_risk_level(parts[9])?,
+                },
+            })
+        }
+        "objective_prereq_linked" => {
+            if parts.len() != 9 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid objective_prereq_linked event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Campaign(CampaignAuditEvent {
+                sequence: parse_u64(parts[5])?,
+                occurred_at,
+                payload: CampaignPayload::ObjectivePrereqLinked {
+                    campaign_id: parse_campaign_id(parts[6])?,
+                    objective_id: parse_objective_id(parts[7])?,
+                    prerequisite_id: parse_objective_id(parts[8])?,
+                },
+            })
+        }
+        "objective_status_changed" => {
+            if parts.len() != 11 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid objective_status_changed event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Campaign(CampaignAuditEvent {
+                sequence: parse_u64(parts[5])?,
+                occurred_at,
+                payload: CampaignPayload::ObjectiveStatusChanged {
+                    campaign_id: parse_campaign_id(parts[6])?,
+                    objective_id: parse_objective_id(parts[7])?,
+                    from: parse_objective_status(parts[8])?,
+                    to: parse_objective_status(parts[9])?,
+                    reason: decode_opt_string(parts[10])?,
+                },
+            })
+        }
+        "objective_evaluated" => {
+            if parts.len() != 13 {
+                return Err(OrchestratorError::Parse(format!(
+                    "invalid objective_evaluated event '{}'",
+                    line
+                )));
+            }
+            AuditEventPayload::Campaign(CampaignAuditEvent {
+                sequence: parse_u64(parts[5])?,
+                occurred_at,
+                payload: CampaignPayload::ObjectiveEvaluated {
+                    campaign_id: parse_campaign_id(parts[6])?,
+                    objective_id: parse_objective_id(parts[7])?,
+                    trigger: parse_objective_trigger(parts[8])?,
+                    prerequisites_satisfied: parse_bool_01(parts[9])?,
+                    success_criteria_satisfied: parse_bool_01(parts[10])?,
+                    failure_criteria_satisfied: parse_bool_01(parts[11])?,
+                    resulting_status: parse_objective_status(parts[12])?,
+                },
+            })
+        }
         _ => {
             return Err(OrchestratorError::Parse(format!(
                 "unknown audit event kind '{}'",
@@ -2363,6 +2670,15 @@ fn event_run_id(payload: &AuditEventPayload) -> Option<RunId> {
             ..
         }) => Some(*run_id),
         AuditEventPayload::Module(ModuleEvent::Executed { run_id, .. }) => Some(*run_id),
+        _ => None,
+    }
+}
+
+fn event_campaign_meta(payload: &AuditEventPayload) -> Option<(CampaignId, u64)> {
+    match payload {
+        AuditEventPayload::Campaign(event) => {
+            Some((event.payload.campaign_id().clone(), event.sequence))
+        }
         _ => None,
     }
 }
@@ -2678,6 +2994,83 @@ fn parse_task_state(state: &str) -> Result<TaskState, OrchestratorError> {
         _ => Err(OrchestratorError::Parse(format!(
             "invalid task state '{}'",
             state
+        ))),
+    }
+}
+
+fn parse_bool_01(input: &str) -> Result<bool, OrchestratorError> {
+    match input {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(OrchestratorError::Parse(format!(
+            "invalid boolean flag '{}' (expected 0 or 1)",
+            input
+        ))),
+    }
+}
+
+fn parse_campaign_id(input: &str) -> Result<CampaignId, OrchestratorError> {
+    CampaignId::parse(input).map_err(|err| {
+        OrchestratorError::Parse(format!("invalid campaign id '{}': {}", input, err))
+    })
+}
+
+fn parse_objective_id(input: &str) -> Result<ObjectiveId, OrchestratorError> {
+    ObjectiveId::parse(input).map_err(|err| {
+        OrchestratorError::Parse(format!("invalid objective id '{}': {}", input, err))
+    })
+}
+
+fn parse_campaign_status(input: &str) -> Result<CampaignStatus, OrchestratorError> {
+    match input {
+        "active" => Ok(CampaignStatus::Active),
+        "paused" => Ok(CampaignStatus::Paused),
+        "completed" => Ok(CampaignStatus::Completed),
+        "failed" => Ok(CampaignStatus::Failed),
+        _ => Err(OrchestratorError::Parse(format!(
+            "invalid campaign status '{}'",
+            input
+        ))),
+    }
+}
+
+fn parse_objective_status(input: &str) -> Result<ObjectiveStatus, OrchestratorError> {
+    match input {
+        "pending" => Ok(ObjectiveStatus::Pending),
+        "eligible" => Ok(ObjectiveStatus::Eligible),
+        "in_progress" => Ok(ObjectiveStatus::InProgress),
+        "achieved" => Ok(ObjectiveStatus::Achieved),
+        "failed" => Ok(ObjectiveStatus::Failed),
+        _ => Err(OrchestratorError::Parse(format!(
+            "invalid objective status '{}'",
+            input
+        ))),
+    }
+}
+
+fn parse_risk_level(input: &str) -> Result<RiskLevel, OrchestratorError> {
+    match input {
+        "low" => Ok(RiskLevel::Low),
+        "medium" => Ok(RiskLevel::Medium),
+        "high" => Ok(RiskLevel::High),
+        _ => Err(OrchestratorError::Parse(format!(
+            "invalid risk level '{}'",
+            input
+        ))),
+    }
+}
+
+fn parse_objective_trigger(input: &str) -> Result<ObjectiveReevaluationTrigger, OrchestratorError> {
+    match input {
+        "artifact_created" => Ok(ObjectiveReevaluationTrigger::ArtifactCreated),
+        "finding_created" => Ok(ObjectiveReevaluationTrigger::FindingCreated),
+        "session_state_changed" => Ok(ObjectiveReevaluationTrigger::SessionStateChanged),
+        "run_completed" => Ok(ObjectiveReevaluationTrigger::RunCompleted),
+        "replay_recovery" => Ok(ObjectiveReevaluationTrigger::ReplayRecovery),
+        "manual_request" => Ok(ObjectiveReevaluationTrigger::ManualRequest),
+        _ => Err(OrchestratorError::Parse(format!(
+            "invalid objective trigger '{}'",
+            input
         ))),
     }
 }
@@ -3405,5 +3798,154 @@ mod tests {
             )
             .expect("module event");
         assert_eq!(module_corr, run_correlation);
+    }
+
+    #[test]
+    fn campaign_events_use_single_lineage_and_gapless_sequence() {
+        let snapshot_shared = Arc::new(Mutex::new(None));
+        let audit_shared = Arc::new(Mutex::new(Vec::<AuditEvent>::new()));
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_a =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective a");
+        let objective_b =
+            ObjectiveId::parse("9b2f4d6a-3aa4-41ba-91ed-6308a58186a1").expect("objective b");
+
+        let first_lineage = {
+            let snapshot_store = InMemorySnapshotStore::from_shared(Arc::clone(&snapshot_shared));
+            let audit_store = InMemoryAuditLogStore::from_shared(Arc::clone(&audit_shared));
+            let mut orchestrator =
+                ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("new");
+
+            let (lineage, seq1) = orchestrator
+                .record_campaign_event(
+                    CampaignPayload::CampaignCreated {
+                        campaign_id: campaign_id.clone(),
+                        name: "operation".to_string(),
+                    },
+                    None,
+                )
+                .expect("campaign create");
+            assert_eq!(seq1, 1);
+
+            let (lineage2, seq2) = orchestrator
+                .record_campaign_event(
+                    CampaignPayload::ObjectiveCreated {
+                        campaign_id: campaign_id.clone(),
+                        objective_id: objective_a.clone(),
+                        name: "initial access".to_string(),
+                        risk_level: RiskLevel::Medium,
+                    },
+                    None,
+                )
+                .expect("objective create");
+            assert_eq!(lineage2, lineage);
+            assert_eq!(seq2, 2);
+
+            let (lineage3, seq3) = orchestrator
+                .record_campaign_event(
+                    CampaignPayload::ObjectivePrereqLinked {
+                        campaign_id: campaign_id.clone(),
+                        objective_id: objective_b.clone(),
+                        prerequisite_id: objective_a.clone(),
+                    },
+                    None,
+                )
+                .expect("prereq link");
+            assert_eq!(lineage3, lineage);
+            assert_eq!(seq3, 3);
+
+            let explicit_mismatch = CorrelationId::next();
+            let err = orchestrator
+                .record_campaign_event(
+                    CampaignPayload::CampaignStatusChanged {
+                        campaign_id: campaign_id.clone(),
+                        from: CampaignStatus::Active,
+                        to: CampaignStatus::Paused,
+                        reason: None,
+                    },
+                    Some(explicit_mismatch),
+                )
+                .expect_err("lineage mismatch must fail");
+            assert!(
+                err.to_string().contains("already bound to lineage"),
+                "unexpected error: {err}"
+            );
+
+            lineage
+        };
+
+        let snapshot_store = InMemorySnapshotStore::from_shared(Arc::clone(&snapshot_shared));
+        let audit_store = InMemoryAuditLogStore::from_shared(Arc::clone(&audit_shared));
+        let mut recovered =
+            ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("recover");
+        let (lineage_after_restart, seq4) = recovered
+            .record_campaign_event(
+                CampaignPayload::ObjectiveStatusChanged {
+                    campaign_id: campaign_id.clone(),
+                    objective_id: objective_a,
+                    from: ObjectiveStatus::Eligible,
+                    to: ObjectiveStatus::InProgress,
+                    reason: Some("operator start".to_string()),
+                },
+                None,
+            )
+            .expect("status change");
+        assert_eq!(lineage_after_restart, first_lineage);
+        assert_eq!(seq4, 4);
+
+        let events = recovered.load_audit_events().expect("events");
+        let campaign_events = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                AuditEventPayload::Campaign(campaign_event) => {
+                    Some((event.correlation_id, campaign_event.sequence))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(campaign_events.len(), 4);
+        for (idx, (correlation, sequence)) in campaign_events.iter().enumerate() {
+            assert_eq!(*correlation, first_lineage);
+            assert_eq!(*sequence, (idx as u64) + 1);
+        }
+    }
+
+    #[test]
+    fn campaign_events_round_trip_in_file_audit_log() {
+        let path =
+            std::env::temp_dir().join(format!("moonlight-campaign-audit-{}.log", Id::next().0));
+        let mut store = FileAuditLogStore::new(&path);
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_id =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective");
+
+        let event = AuditEvent {
+            id: EventId::next(),
+            correlation_id: CorrelationId::next(),
+            occurred_at: now_secs(),
+            payload: AuditEventPayload::Campaign(CampaignAuditEvent {
+                sequence: 7,
+                occurred_at: now_secs(),
+                payload: CampaignPayload::ObjectiveEvaluated {
+                    campaign_id,
+                    objective_id,
+                    trigger: ObjectiveReevaluationTrigger::RunCompleted,
+                    prerequisites_satisfied: true,
+                    success_criteria_satisfied: true,
+                    failure_criteria_satisfied: false,
+                    resulting_status: ObjectiveStatus::Achieved,
+                },
+            }),
+        };
+
+        store.append_event(&event).expect("append");
+        let loaded = store.load_events().expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].payload, event.payload);
+        assert_eq!(loaded[0].correlation_id, event.correlation_id);
+
+        let _ = std::fs::remove_file(path);
     }
 }

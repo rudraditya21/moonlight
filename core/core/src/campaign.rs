@@ -1456,7 +1456,7 @@ pub enum CampaignEventPayload {
         name: String,
         risk_level: RiskLevel,
     },
-    ObjectivePrerequisiteLinked {
+    ObjectivePrereqLinked {
         campaign_id: CampaignId,
         objective_id: ObjectiveId,
         prerequisite_id: ObjectiveId,
@@ -1484,7 +1484,7 @@ pub enum CampaignEventType {
     CampaignCreated,
     CampaignStatusChanged,
     ObjectiveCreated,
-    ObjectivePrerequisiteLinked,
+    ObjectivePrereqLinked,
     ObjectiveStatusChanged,
     ObjectiveEvaluated,
 }
@@ -1495,7 +1495,7 @@ impl CampaignEventType {
             CampaignEventType::CampaignCreated => "campaign_created",
             CampaignEventType::CampaignStatusChanged => "campaign_status_changed",
             CampaignEventType::ObjectiveCreated => "objective_created",
-            CampaignEventType::ObjectivePrerequisiteLinked => "objective_prerequisite_linked",
+            CampaignEventType::ObjectivePrereqLinked => "objective_prereq_linked",
             CampaignEventType::ObjectiveStatusChanged => "objective_status_changed",
             CampaignEventType::ObjectiveEvaluated => "objective_evaluated",
         }
@@ -1506,7 +1506,7 @@ pub const CAMPAIGN_EVENT_TAXONOMY: &[CampaignEventType] = &[
     CampaignEventType::CampaignCreated,
     CampaignEventType::CampaignStatusChanged,
     CampaignEventType::ObjectiveCreated,
-    CampaignEventType::ObjectivePrerequisiteLinked,
+    CampaignEventType::ObjectivePrereqLinked,
     CampaignEventType::ObjectiveStatusChanged,
     CampaignEventType::ObjectiveEvaluated,
 ];
@@ -1519,8 +1519,8 @@ impl CampaignEventPayload {
                 CampaignEventType::CampaignStatusChanged
             }
             CampaignEventPayload::ObjectiveCreated { .. } => CampaignEventType::ObjectiveCreated,
-            CampaignEventPayload::ObjectivePrerequisiteLinked { .. } => {
-                CampaignEventType::ObjectivePrerequisiteLinked
+            CampaignEventPayload::ObjectivePrereqLinked { .. } => {
+                CampaignEventType::ObjectivePrereqLinked
             }
             CampaignEventPayload::ObjectiveStatusChanged { .. } => {
                 CampaignEventType::ObjectiveStatusChanged
@@ -1530,7 +1530,43 @@ impl CampaignEventPayload {
             }
         }
     }
+
+    pub fn campaign_id(&self) -> &CampaignId {
+        match self {
+            CampaignEventPayload::CampaignCreated { campaign_id, .. } => campaign_id,
+            CampaignEventPayload::CampaignStatusChanged { campaign_id, .. } => campaign_id,
+            CampaignEventPayload::ObjectiveCreated { campaign_id, .. } => campaign_id,
+            CampaignEventPayload::ObjectivePrereqLinked { campaign_id, .. } => campaign_id,
+            CampaignEventPayload::ObjectiveStatusChanged { campaign_id, .. } => campaign_id,
+            CampaignEventPayload::ObjectiveEvaluated { campaign_id, .. } => campaign_id,
+        }
+    }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CampaignEventSequenceRule {
+    AppendOnly,
+    MonotonicPerCampaignLineage,
+    GaplessPerCampaignLineage,
+}
+
+impl CampaignEventSequenceRule {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CampaignEventSequenceRule::AppendOnly => "append_only",
+            CampaignEventSequenceRule::MonotonicPerCampaignLineage => {
+                "monotonic_per_campaign_lineage"
+            }
+            CampaignEventSequenceRule::GaplessPerCampaignLineage => "gapless_per_campaign_lineage",
+        }
+    }
+}
+
+pub const CAMPAIGN_EVENT_SEQUENCE_RULES: &[CampaignEventSequenceRule] = &[
+    CampaignEventSequenceRule::AppendOnly,
+    CampaignEventSequenceRule::MonotonicPerCampaignLineage,
+    CampaignEventSequenceRule::GaplessPerCampaignLineage,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CampaignEvent {
