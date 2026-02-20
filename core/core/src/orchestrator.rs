@@ -6,11 +6,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::campaign::{
     CampaignEvent as CampaignAuditEvent, CampaignEventPayload as CampaignPayload, CampaignId,
-    CampaignStatus, ObjectiveId, ObjectiveReevaluationTrigger, ObjectiveStatus, RiskLevel,
+    CampaignStatus, Objective, ObjectiveId, ObjectiveIngestionDispatch,
+    ObjectiveIngestionDispatcher, ObjectiveIngestionEvent, ObjectiveReevaluationTrigger,
+    ObjectiveStatus, PredicateSnapshot, RiskLevel,
 };
 use crate::domain::{
-    CorrelationId, DomainError, EventId, ModuleVersionId, Run, RunId, RunState, SessionId,
-    TargetId, Task, TaskId, TaskState, WorkspaceId,
+    ArtifactId, CorrelationId, DomainError, EventId, FindingId, ModuleVersionId, Run, RunId,
+    RunState, SessionId, TargetId, Task, TaskId, TaskState, WorkspaceId,
 };
 use crate::ids::Id;
 use crate::time::now_secs;
@@ -1259,6 +1261,7 @@ pub struct ObservableExecutionOrchestrator<S: SnapshotStore, A: AuditLogStore> {
     run_correlations: BTreeMap<RunId, CorrelationId>,
     campaign_correlations: BTreeMap<CampaignId, CorrelationId>,
     next_campaign_sequence: BTreeMap<CampaignId, u64>,
+    campaign_ingestion_dispatchers: BTreeMap<CampaignId, ObjectiveIngestionDispatcher>,
 }
 
 impl<S: SnapshotStore, A: AuditLogStore> ObservableExecutionOrchestrator<S, A> {
@@ -1295,6 +1298,7 @@ impl<S: SnapshotStore, A: AuditLogStore> ObservableExecutionOrchestrator<S, A> {
             run_correlations,
             campaign_correlations,
             next_campaign_sequence,
+            campaign_ingestion_dispatchers: BTreeMap::new(),
         })
     }
 
@@ -1652,6 +1656,77 @@ impl<S: SnapshotStore, A: AuditLogStore> ObservableExecutionOrchestrator<S, A> {
         Ok(effective.expect("non-empty payload batch must produce lineage"))
     }
 
+    pub fn ingest_artifact_created(
+        &mut self,
+        campaign_id: CampaignId,
+        objectives: &mut BTreeMap<ObjectiveId, Objective>,
+        snapshot: &PredicateSnapshot,
+        artifact_id: ArtifactId,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<ObjectiveIngestionDispatch, OrchestratorError> {
+        let event = ObjectiveIngestionEvent::new(
+            campaign_id,
+            ObjectiveReevaluationTrigger::ArtifactCreated,
+            &format!("artifact_created:{}", artifact_id.0 .0),
+        )
+        .map_err(|err| OrchestratorError::Validation(err.to_string()))?;
+        self.ingest_campaign_trigger(event, objectives, snapshot, correlation_id)
+    }
+
+    pub fn ingest_finding_created(
+        &mut self,
+        campaign_id: CampaignId,
+        objectives: &mut BTreeMap<ObjectiveId, Objective>,
+        snapshot: &PredicateSnapshot,
+        finding_id: FindingId,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<ObjectiveIngestionDispatch, OrchestratorError> {
+        let event = ObjectiveIngestionEvent::new(
+            campaign_id,
+            ObjectiveReevaluationTrigger::FindingCreated,
+            &format!("finding_created:{}", finding_id.0 .0),
+        )
+        .map_err(|err| OrchestratorError::Validation(err.to_string()))?;
+        self.ingest_campaign_trigger(event, objectives, snapshot, correlation_id)
+    }
+
+    pub fn ingest_session_state_changed(
+        &mut self,
+        campaign_id: CampaignId,
+        objectives: &mut BTreeMap<ObjectiveId, Objective>,
+        snapshot: &PredicateSnapshot,
+        session_id: SessionId,
+        run_id: Option<RunId>,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<ObjectiveIngestionDispatch, OrchestratorError> {
+        let propagated = correlation_id.or(run_id.and_then(|id| self.correlation_id_for_run(id)));
+        let event = ObjectiveIngestionEvent::new(
+            campaign_id,
+            ObjectiveReevaluationTrigger::SessionStateChanged,
+            &format!("session_state_changed:{}", session_id.0 .0),
+        )
+        .map_err(|err| OrchestratorError::Validation(err.to_string()))?;
+        self.ingest_campaign_trigger(event, objectives, snapshot, propagated)
+    }
+
+    pub fn ingest_run_completed(
+        &mut self,
+        campaign_id: CampaignId,
+        objectives: &mut BTreeMap<ObjectiveId, Objective>,
+        snapshot: &PredicateSnapshot,
+        run_id: RunId,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<ObjectiveIngestionDispatch, OrchestratorError> {
+        let propagated = correlation_id.or(self.correlation_id_for_run(run_id));
+        let event = ObjectiveIngestionEvent::new(
+            campaign_id,
+            ObjectiveReevaluationTrigger::RunCompleted,
+            &format!("run_completed:{}", run_id.0 .0),
+        )
+        .map_err(|err| OrchestratorError::Validation(err.to_string()))?;
+        self.ingest_campaign_trigger(event, objectives, snapshot, propagated)
+    }
+
     pub fn load_audit_events(&mut self) -> Result<Vec<AuditEvent>, OrchestratorError> {
         self.audit_store.load_events()
     }
@@ -1662,6 +1737,38 @@ impl<S: SnapshotStore, A: AuditLogStore> ObservableExecutionOrchestrator<S, A> {
 
     pub fn correlation_id_for_campaign(&self, campaign_id: &CampaignId) -> Option<CorrelationId> {
         self.campaign_correlations.get(campaign_id).copied()
+    }
+
+    fn ingest_campaign_trigger(
+        &mut self,
+        event: ObjectiveIngestionEvent,
+        objectives: &mut BTreeMap<ObjectiveId, Objective>,
+        snapshot: &PredicateSnapshot,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<ObjectiveIngestionDispatch, OrchestratorError> {
+        if objectives
+            .values()
+            .any(|objective| objective.campaign_id != event.campaign_id)
+        {
+            return Err(OrchestratorError::Validation(
+                "all objectives must belong to ingestion campaign".to_string(),
+            ));
+        }
+
+        let dispatcher = self
+            .campaign_ingestion_dispatchers
+            .entry(event.campaign_id.clone())
+            .or_default();
+        let dispatch = dispatcher
+            .dispatch(&event, objectives, snapshot, now_secs())
+            .map_err(|err| OrchestratorError::Validation(err.to_string()))?;
+
+        if dispatch.emitted_events.is_empty() {
+            return Ok(dispatch);
+        }
+
+        let _ = self.record_campaign_events(dispatch.emitted_events.clone(), correlation_id)?;
+        Ok(dispatch)
     }
 
     pub fn reconstruct_run_from_history(
@@ -3078,6 +3185,7 @@ fn parse_objective_trigger(input: &str) -> Result<ObjectiveReevaluationTrigger, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::campaign::Predicate as CampaignPredicate;
     use crate::performance::{PerformanceBudget, PerformanceSample};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
@@ -3947,5 +4055,268 @@ mod tests {
         assert_eq!(loaded[0].correlation_id, event.correlation_id);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ingestion_run_completed_propagates_correlation_and_deduplicates() {
+        let snapshot_store = InMemorySnapshotStore::default();
+        let audit_store = InMemoryAuditLogStore::default();
+        let mut orchestrator =
+            ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("new");
+
+        let run_id = orchestrator
+            .submit_run(
+                basic_request(),
+                RunPlan::new(vec![
+                    PlannedTask::new("evt", 1, 100, "ingest-run").expect("task")
+                ])
+                .expect("plan"),
+            )
+            .expect("submit");
+        let run_correlation = orchestrator
+            .correlation_id_for_run(run_id)
+            .expect("run correlation");
+
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_id =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective id");
+        let mut objective = Objective::new_at(
+            objective_id.clone(),
+            campaign_id.clone(),
+            "run objective",
+            "run completion should satisfy",
+            vec![],
+            vec![CampaignPredicate::RunSucceeded {
+                module_name: "exploit/linux/example".to_string(),
+            }],
+            vec![],
+            RiskLevel::Medium,
+            None,
+            1,
+        )
+        .expect("objective");
+        objective.status = ObjectiveStatus::InProgress;
+        let mut objectives = BTreeMap::from([(objective_id, objective)]);
+
+        let workspace = crate::domain::Workspace::new_at("ws", "test", 1).expect("workspace");
+        let module = crate::domain::ModuleVersion::new_at(
+            "exploit/linux/example",
+            "1.0.0",
+            1,
+            "entrypoint",
+            "sha256",
+            1,
+        )
+        .expect("module");
+        let mut run =
+            crate::domain::Run::new_at(workspace.id, module.id, None, "operator", 2).expect("run");
+        run.transition_state(RunState::Running, 3).expect("running");
+        run.transition_state(RunState::Succeeded, 4)
+            .expect("succeeded");
+        let snapshot = PredicateSnapshot::new().with_run(
+            crate::campaign::RunSnapshot::new(run, "exploit/linux/example").expect("run snapshot"),
+        );
+
+        let first = orchestrator
+            .ingest_run_completed(
+                campaign_id.clone(),
+                &mut objectives,
+                &snapshot,
+                run_id,
+                None,
+            )
+            .expect("first ingestion");
+        assert!(!first.skipped_duplicate);
+        assert!(!first.emitted_events.is_empty());
+        assert_eq!(
+            orchestrator.correlation_id_for_campaign(&campaign_id),
+            Some(run_correlation)
+        );
+
+        let second = orchestrator
+            .ingest_run_completed(
+                campaign_id.clone(),
+                &mut objectives,
+                &snapshot,
+                run_id,
+                None,
+            )
+            .expect("duplicate ingestion");
+        assert!(second.skipped_duplicate);
+        assert!(second.emitted_events.is_empty());
+
+        let campaign_event_count = orchestrator
+            .load_audit_events()
+            .expect("events")
+            .into_iter()
+            .filter(|event| matches!(event.payload, AuditEventPayload::Campaign(_)))
+            .count();
+        assert_eq!(campaign_event_count, first.emitted_events.len());
+        assert_eq!(
+            objectives.values().next().expect("objective").status,
+            ObjectiveStatus::Achieved
+        );
+    }
+
+    #[test]
+    fn ingestion_artifact_finding_session_triggers_evaluate_relevant_objectives() {
+        let snapshot_store = InMemorySnapshotStore::default();
+        let audit_store = InMemoryAuditLogStore::default();
+        let mut orchestrator =
+            ObservableExecutionOrchestrator::new(snapshot_store, audit_store).expect("new");
+
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_artifact =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective");
+        let objective_finding =
+            ObjectiveId::parse("9b2f4d6a-3aa4-41ba-91ed-6308a58186a1").expect("objective");
+        let objective_session =
+            ObjectiveId::parse("f47ac10b-58cc-4372-a567-0e02b2c3d479").expect("objective");
+
+        let mut obj_a = Objective::new_at(
+            objective_artifact.clone(),
+            campaign_id.clone(),
+            "artifact objective",
+            "artifact trigger",
+            vec![],
+            vec![CampaignPredicate::ArtifactTagMatch {
+                tag: "loot".to_string(),
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            1,
+        )
+        .expect("objective");
+        obj_a.status = ObjectiveStatus::InProgress;
+
+        let mut obj_b = Objective::new_at(
+            objective_finding.clone(),
+            campaign_id.clone(),
+            "finding objective",
+            "finding trigger",
+            vec![],
+            vec![CampaignPredicate::FindingExists {
+                finding_type: "credential".to_string(),
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            1,
+        )
+        .expect("objective");
+        obj_b.status = ObjectiveStatus::InProgress;
+
+        let mut obj_c = Objective::new_at(
+            objective_session.clone(),
+            campaign_id.clone(),
+            "session objective",
+            "session trigger",
+            vec![],
+            vec![CampaignPredicate::SessionPrivilege {
+                level: crate::campaign::SessionPrivilegeLevel::Root,
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            1,
+        )
+        .expect("objective");
+        obj_c.status = ObjectiveStatus::InProgress;
+
+        let mut objectives = BTreeMap::from([
+            (objective_artifact.clone(), obj_a),
+            (objective_finding.clone(), obj_b),
+            (objective_session.clone(), obj_c),
+        ]);
+
+        let workspace = crate::domain::Workspace::new_at("ws", "test", 1).expect("workspace");
+        let module = crate::domain::ModuleVersion::new_at(
+            "exploit/linux/example",
+            "1.0.0",
+            1,
+            "entrypoint",
+            "sha256",
+            1,
+        )
+        .expect("module");
+        let run =
+            crate::domain::Run::new_at(workspace.id, module.id, None, "operator", 2).expect("run");
+        let session = crate::domain::Session::new_at(run.id, None, "shell", "127.0.0.1:23", 3)
+            .expect("session");
+        let artifact = crate::domain::Artifact::new_at(
+            run.id,
+            None,
+            Some(session.id),
+            crate::domain::ArtifactKind::CommandOutput,
+            "loot",
+            "memory://loot",
+            4,
+        )
+        .expect("artifact");
+        let finding = crate::domain::Finding::new_at(
+            run.id,
+            None,
+            Some(session.id),
+            "Credential",
+            "found secret",
+            crate::domain::FindingSeverity::High,
+            5,
+        )
+        .expect("finding");
+
+        let snapshot = PredicateSnapshot::new()
+            .with_artifact(crate::campaign::ArtifactSnapshot::new(artifact).with_tag("loot"))
+            .with_finding(
+                crate::campaign::FindingSnapshot::new(finding, "credential").expect("snapshot"),
+            )
+            .with_session(
+                crate::campaign::SessionSnapshot::new(session)
+                    .with_privilege(crate::campaign::SessionPrivilegeLevel::Root),
+            );
+
+        orchestrator
+            .ingest_artifact_created(
+                campaign_id.clone(),
+                &mut objectives,
+                &snapshot,
+                ArtifactId::next(),
+                None,
+            )
+            .expect("artifact trigger");
+        orchestrator
+            .ingest_finding_created(
+                campaign_id.clone(),
+                &mut objectives,
+                &snapshot,
+                FindingId::next(),
+                None,
+            )
+            .expect("finding trigger");
+        orchestrator
+            .ingest_session_state_changed(
+                campaign_id.clone(),
+                &mut objectives,
+                &snapshot,
+                SessionId::next(),
+                None,
+                None,
+            )
+            .expect("session trigger");
+
+        assert_eq!(
+            objectives[&objective_artifact].status,
+            ObjectiveStatus::Achieved
+        );
+        assert_eq!(
+            objectives[&objective_finding].status,
+            ObjectiveStatus::Achieved
+        );
+        assert_eq!(
+            objectives[&objective_session].status,
+            ObjectiveStatus::Achieved
+        );
     }
 }

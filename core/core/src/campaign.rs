@@ -1252,6 +1252,59 @@ impl ObjectiveEvaluationEngine {
         })
     }
 
+    pub fn evaluate_selected<H: ObjectiveEventHook>(
+        objectives: &mut BTreeMap<ObjectiveId, Objective>,
+        selected: &BTreeSet<ObjectiveId>,
+        snapshot: &PredicateSnapshot,
+        trigger: ObjectiveReevaluationTrigger,
+        now: u64,
+        hook: &mut H,
+    ) -> Result<Vec<ObjectiveEvaluationRecord>, CampaignModelError> {
+        validate_prerequisite_graph(&objectives.values().cloned().collect::<Vec<_>>())?;
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut records = Vec::new();
+        let max_iterations = selected.len().saturating_mul(4).max(1);
+        for _ in 0..max_iterations {
+            let status_index = objectives
+                .iter()
+                .map(|(id, objective)| (id.clone(), objective.status))
+                .collect::<BTreeMap<_, _>>();
+
+            let mut changed = false;
+            for objective_id in selected {
+                let objective = objectives.get_mut(objective_id).ok_or_else(|| {
+                    CampaignModelError::MissingObjective {
+                        objective_id: objective_id.clone(),
+                    }
+                })?;
+                let result = Self::evaluate_objective(
+                    objective,
+                    &status_index,
+                    snapshot,
+                    trigger,
+                    now,
+                    hook,
+                )?;
+                changed |= result.next_status.is_some();
+                records.push(ObjectiveEvaluationRecord {
+                    objective_id: objective_id.clone(),
+                    result,
+                });
+            }
+            if !changed {
+                return Ok(records);
+            }
+        }
+
+        Err(CampaignModelError::InvalidField {
+            field: "objective.evaluation",
+            reason: "selected evaluation exceeded deterministic iteration budget",
+        })
+    }
+
     pub fn start_objective<H: ObjectiveEventHook>(
         objective: &mut Objective,
         objective_statuses: &BTreeMap<ObjectiveId, ObjectiveStatus>,
@@ -1298,6 +1351,168 @@ impl ObjectiveEvaluationEngine {
             }
         }
         Ok(true)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveIngestionEvent {
+    pub campaign_id: CampaignId,
+    pub trigger: ObjectiveReevaluationTrigger,
+    pub source_event_key: String,
+}
+
+impl ObjectiveIngestionEvent {
+    pub fn new(
+        campaign_id: CampaignId,
+        trigger: ObjectiveReevaluationTrigger,
+        source_event_key: &str,
+    ) -> Result<Self, CampaignModelError> {
+        ensure_non_empty(source_event_key, "objective_ingestion.source_event_key")?;
+        Ok(Self {
+            campaign_id,
+            trigger,
+            source_event_key: source_event_key.trim().to_string(),
+        })
+    }
+
+    pub fn dedupe_key(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.campaign_id.as_str(),
+            self.trigger.as_str(),
+            normalize_token(&self.source_event_key)
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveIngestionDispatch {
+    pub skipped_duplicate: bool,
+    pub selected_objectives: Vec<ObjectiveId>,
+    pub records: Vec<ObjectiveEvaluationRecord>,
+    pub emitted_events: Vec<CampaignEventPayload>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectiveIngestionDispatcher {
+    seen_event_keys: BTreeSet<String>,
+}
+
+impl ObjectiveIngestionDispatcher {
+    pub fn dispatch(
+        &mut self,
+        event: &ObjectiveIngestionEvent,
+        objectives: &mut BTreeMap<ObjectiveId, Objective>,
+        snapshot: &PredicateSnapshot,
+        now: u64,
+    ) -> Result<ObjectiveIngestionDispatch, CampaignModelError> {
+        let dedupe_key = event.dedupe_key();
+        if self.seen_event_keys.contains(&dedupe_key) {
+            return Ok(ObjectiveIngestionDispatch {
+                skipped_duplicate: true,
+                selected_objectives: Vec::new(),
+                records: Vec::new(),
+                emitted_events: Vec::new(),
+            });
+        }
+
+        for objective in objectives.values() {
+            if objective.campaign_id != event.campaign_id {
+                return Err(CampaignModelError::InvalidField {
+                    field: "objective.campaign_id",
+                    reason: "all objectives must match ingestion campaign",
+                });
+            }
+        }
+
+        let selected = select_relevant_objectives(event.trigger, objectives);
+        let mut emitted_events = Vec::<CampaignEventPayload>::new();
+        let records = ObjectiveEvaluationEngine::evaluate_selected(
+            objectives,
+            &selected,
+            snapshot,
+            event.trigger,
+            now,
+            &mut emitted_events,
+        )?;
+
+        self.seen_event_keys.insert(dedupe_key);
+        Ok(ObjectiveIngestionDispatch {
+            skipped_duplicate: false,
+            selected_objectives: selected.into_iter().collect(),
+            records,
+            emitted_events,
+        })
+    }
+}
+
+pub fn select_relevant_objectives(
+    trigger: ObjectiveReevaluationTrigger,
+    objectives: &BTreeMap<ObjectiveId, Objective>,
+) -> BTreeSet<ObjectiveId> {
+    let mut selected = BTreeSet::<ObjectiveId>::new();
+    for (objective_id, objective) in objectives {
+        if objective.status.is_terminal() {
+            continue;
+        }
+        if objective_matches_trigger(objective, trigger) || !objective.prerequisites.is_empty() {
+            selected.insert(objective_id.clone());
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (objective_id, objective) in objectives {
+            if objective.status.is_terminal() || selected.contains(objective_id) {
+                continue;
+            }
+            if objective
+                .prerequisites
+                .iter()
+                .any(|prerequisite_id| selected.contains(prerequisite_id))
+            {
+                selected.insert(objective_id.clone());
+                changed = true;
+            }
+        }
+    }
+
+    selected
+}
+
+fn objective_matches_trigger(objective: &Objective, trigger: ObjectiveReevaluationTrigger) -> bool {
+    let mut predicates = objective
+        .success_criteria
+        .iter()
+        .chain(objective.failure_criteria.iter());
+    match trigger {
+        ObjectiveReevaluationTrigger::ArtifactCreated => predicates.any(|predicate| {
+            matches!(
+                predicate,
+                Predicate::ArtifactTagMatch { .. } | Predicate::CustomMetadataMatch { .. }
+            )
+        }),
+        ObjectiveReevaluationTrigger::FindingCreated => predicates.any(|predicate| {
+            matches!(
+                predicate,
+                Predicate::FindingExists { .. } | Predicate::CustomMetadataMatch { .. }
+            )
+        }),
+        ObjectiveReevaluationTrigger::SessionStateChanged => predicates.any(|predicate| {
+            matches!(
+                predicate,
+                Predicate::SessionPrivilege { .. } | Predicate::CustomMetadataMatch { .. }
+            )
+        }),
+        ObjectiveReevaluationTrigger::RunCompleted => predicates.any(|predicate| {
+            matches!(
+                predicate,
+                Predicate::RunSucceeded { .. } | Predicate::CustomMetadataMatch { .. }
+            )
+        }),
+        ObjectiveReevaluationTrigger::ReplayRecovery
+        | ObjectiveReevaluationTrigger::ManualRequest => true,
     }
 }
 
@@ -2608,5 +2823,116 @@ mod tests {
         let first = objective.evaluate_transition_snapshot(true, &snapshot);
         let second = objective.evaluate_transition_snapshot(true, &snapshot);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn relevant_selector_filters_by_trigger_and_dependencies() {
+        let campaign_id = campaign_id("de305d54-75b4-431b-adb2-eb6b9e546014");
+        let objective_a_id = objective_id("0f8fad5b-d9cb-469f-a165-70867728950e");
+        let objective_b_id = objective_id("9b2f4d6a-3aa4-41ba-91ed-6308a58186a1");
+        let objective_c_id = objective_id("f47ac10b-58cc-4372-a567-0e02b2c3d479");
+
+        let objective_a = Objective::new_at(
+            objective_a_id.clone(),
+            campaign_id.clone(),
+            "A",
+            "finding-based",
+            vec![],
+            vec![Predicate::FindingExists {
+                finding_type: "credential".to_string(),
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            1,
+        )
+        .expect("objective a");
+        let objective_b = Objective::new_at(
+            objective_b_id.clone(),
+            campaign_id.clone(),
+            "B",
+            "depends on A",
+            vec![objective_a_id.clone()],
+            vec![Predicate::RunSucceeded {
+                module_name: "exploit/linux/example".to_string(),
+            }],
+            vec![],
+            RiskLevel::Medium,
+            None,
+            1,
+        )
+        .expect("objective b");
+        let mut objective_c = Objective::new_at(
+            objective_c_id.clone(),
+            campaign_id,
+            "C",
+            "terminal and should be ignored",
+            vec![],
+            vec![Predicate::SessionPrivilege {
+                level: SessionPrivilegeLevel::Root,
+            }],
+            vec![],
+            RiskLevel::High,
+            None,
+            1,
+        )
+        .expect("objective c");
+        objective_c.status = ObjectiveStatus::Achieved;
+
+        let objectives = BTreeMap::from([
+            (objective_a_id.clone(), objective_a),
+            (objective_b_id.clone(), objective_b),
+            (objective_c_id.clone(), objective_c),
+        ]);
+        let selected =
+            select_relevant_objectives(ObjectiveReevaluationTrigger::FindingCreated, &objectives);
+
+        assert!(selected.contains(&objective_a_id));
+        assert!(selected.contains(&objective_b_id));
+        assert!(!selected.contains(&objective_c_id));
+    }
+
+    #[test]
+    fn ingestion_dispatch_is_idempotent_for_repeated_event_keys() {
+        let campaign_id = campaign_id("de305d54-75b4-431b-adb2-eb6b9e546014");
+        let objective_id = objective_id("0f8fad5b-d9cb-469f-a165-70867728950e");
+        let objective = Objective::new_at(
+            objective_id.clone(),
+            campaign_id.clone(),
+            "Credential objective",
+            "find credential",
+            vec![],
+            vec![Predicate::FindingExists {
+                finding_type: "credential".to_string(),
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            1,
+        )
+        .expect("objective");
+        let mut objectives = BTreeMap::from([(objective_id.clone(), objective)]);
+
+        let event = ObjectiveIngestionEvent::new(
+            campaign_id,
+            ObjectiveReevaluationTrigger::FindingCreated,
+            "finding_created:42",
+        )
+        .expect("event");
+        let snapshot = PredicateSnapshot::new();
+        let mut dispatcher = ObjectiveIngestionDispatcher::default();
+
+        let first = dispatcher
+            .dispatch(&event, &mut objectives, &snapshot, 2)
+            .expect("first dispatch");
+        assert!(!first.skipped_duplicate);
+        assert!(!first.emitted_events.is_empty());
+
+        let second = dispatcher
+            .dispatch(&event, &mut objectives, &snapshot, 3)
+            .expect("second dispatch");
+        assert!(second.skipped_duplicate);
+        assert!(second.emitted_events.is_empty());
+        assert!(second.records.is_empty());
     }
 }
