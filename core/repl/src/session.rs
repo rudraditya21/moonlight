@@ -206,24 +206,24 @@ const COMMAND_HELP: &[CommandHelpSpec] = &[
     CommandHelpSpec {
         name: "campaign",
         summary: "Manage campaigns",
-        usage: "campaign create <name> [description] | campaign list | campaign show <campaign-id> | campaign status [campaign-id [active|paused|completed|failed]]",
+        usage: "campaign create <name> [description] [--yes] | campaign list | campaign show <campaign-id> | campaign status [campaign-id [active|paused|completed|failed] [--yes]]",
         aliases: &[],
         examples: &[
             "campaign create operation-alpha \"Internal validation operation\"",
             "campaign list",
-            "campaign status <campaign-id> paused",
+            "campaign status <campaign-id> paused --yes",
         ],
         notes: &[],
     },
     CommandHelpSpec {
         name: "objective",
         summary: "Manage objectives",
-        usage: "objective create <campaign-id> <name> --success <predicate[,predicate...]> [--failure <predicate[,predicate...]>] [--risk <low|medium|high>] [--noise-budget <n>] [--description <text>] | objective link-prereq <objective-id> <prerequisite-id> | objective list [campaign-id] | objective status [objective-id [start|evaluate]]",
+        usage: "objective create <campaign-id> <name> --success <predicate[,predicate...]> [--failure <predicate[,predicate...]>] [--risk <low|medium|high>] [--noise-budget <n>] [--description <text>] [--yes] | objective link-prereq <objective-id> <prerequisite-id> [--yes] | objective list [campaign-id] | objective status [objective-id [start|evaluate] [--yes]]",
         aliases: &[],
         examples: &[
             "objective create <campaign-id> foothold --success finding_exists:shell_access --risk high",
             "objective link-prereq <objective-id> <prerequisite-id>",
-            "objective status <objective-id> start",
+            "objective status <objective-id> start --yes",
         ],
         notes: &[
             "Predicate formats: finding_exists:<type>, session_privilege:<user|elevated|root>, artifact_tag_match:<tag>, run_succeeded:<module>, custom_metadata_match:<key>=<value>",
@@ -1917,10 +1917,16 @@ impl Repl {
             );
             return;
         }
+        let explicit_yes = has_yes_flag(tokens);
         let campaign_id = next_campaign_id();
         let name = &tokens[2];
-        let description = if tokens.len() > 3 {
-            tokens[3..].join(" ")
+        let description_parts = tokens[3..]
+            .iter()
+            .filter(|token| !is_yes_flag(token))
+            .cloned()
+            .collect::<Vec<_>>();
+        let description = if !description_parts.is_empty() {
+            description_parts.join(" ")
         } else {
             String::new()
         };
@@ -1932,6 +1938,17 @@ impl Repl {
                 return;
             }
         };
+        let decision = self
+            .policy
+            .evaluate(&PolicyRequest::create_campaign(campaign_id.as_str()));
+        if !self.enforce_policy_decision(
+            "campaign",
+            decision,
+            explicit_yes,
+            "campaign creation canceled by confirmation",
+        ) {
+            return;
+        }
         self.campaigns.insert(campaign_id.clone(), campaign.clone());
         self.emit_response(
             CommandResponse::ok("campaign", "campaign created")
@@ -2152,7 +2169,16 @@ impl Repl {
                         .with_field("status", campaign.status.as_str()),
                 );
             }
-            4 => {
+            4 | 5 => {
+                if tokens.len() == 5 && !is_yes_flag(&tokens[4]) {
+                    self.emit_error(
+                        "campaign",
+                        CliCode::Usage,
+                        "usage: campaign status [campaign-id [active|paused|completed|failed]]",
+                    );
+                    return;
+                }
+                let explicit_yes = has_yes_flag(tokens);
                 let campaign_id = match CampaignId::parse(&tokens[2]) {
                     Ok(value) => value,
                     Err(err) => {
@@ -2168,6 +2194,29 @@ impl Repl {
                     );
                     return;
                 };
+                let Some(current_status) = self.campaigns.get(&campaign_id).map(|c| c.status)
+                else {
+                    self.emit_error(
+                        "campaign",
+                        CliCode::NotFound,
+                        &format!("campaign not found: {}", campaign_id.as_str()),
+                    );
+                    return;
+                };
+                let decision = self.policy.evaluate(&PolicyRequest::change_campaign_status(
+                    campaign_id.as_str(),
+                    current_status.as_str(),
+                    next_status.as_str(),
+                ));
+                if !self.enforce_policy_decision(
+                    "campaign",
+                    decision,
+                    explicit_yes,
+                    "campaign status update canceled by confirmation",
+                ) {
+                    return;
+                }
+
                 let (campaign_id_text, from_status, to_status) = {
                     let Some(campaign) = self.campaigns.get_mut(&campaign_id) else {
                         self.emit_error(
@@ -2234,6 +2283,7 @@ impl Repl {
             );
             return;
         }
+        let explicit_yes = has_yes_flag(tokens);
         let campaign_id = match CampaignId::parse(&tokens[2]) {
             Ok(value) => value,
             Err(err) => {
@@ -2352,6 +2402,7 @@ impl Repl {
                         }
                     }
                 }
+                "--yes" | "-y" => {}
                 unknown => {
                     self.emit_error(
                         "objective",
@@ -2392,6 +2443,19 @@ impl Repl {
                 return;
             }
         };
+        let decision = self.policy.evaluate(&PolicyRequest::create_objective(
+            campaign_id.as_str(),
+            objective_id.as_str(),
+            objective.risk_level.as_str(),
+        ));
+        if !self.enforce_policy_decision(
+            "objective",
+            decision,
+            explicit_yes,
+            "objective creation canceled by confirmation",
+        ) {
+            return;
+        }
 
         self.objectives
             .insert(objective_id.clone(), objective.clone());
@@ -2409,7 +2473,7 @@ impl Repl {
     }
 
     fn cmd_objective_link_prereq(&mut self, tokens: &[String]) {
-        if tokens.len() != 4 {
+        if tokens.len() != 4 && tokens.len() != 5 {
             self.emit_error(
                 "objective",
                 CliCode::Usage,
@@ -2417,6 +2481,15 @@ impl Repl {
             );
             return;
         }
+        if tokens.len() == 5 && !is_yes_flag(&tokens[4]) {
+            self.emit_error(
+                "objective",
+                CliCode::Usage,
+                "usage: objective link-prereq <objective-id> <prerequisite-id>",
+            );
+            return;
+        }
+        let explicit_yes = has_yes_flag(tokens);
         let objective_id = match ObjectiveId::parse(&tokens[2]) {
             Ok(value) => value,
             Err(err) => {
@@ -2466,6 +2539,21 @@ impl Repl {
         }
 
         let campaign_id = objective.campaign_id.clone();
+        let decision = self
+            .policy
+            .evaluate(&PolicyRequest::link_objective_prerequisite(
+                campaign_id.as_str(),
+                objective_id.as_str(),
+                prerequisite_id.as_str(),
+            ));
+        if !self.enforce_policy_decision(
+            "objective",
+            decision,
+            explicit_yes,
+            "objective prerequisite link canceled by confirmation",
+        ) {
+            return;
+        }
         let mut already_linked = false;
         let mut inserted = false;
         if let Some(editable) = self.objectives.get_mut(&objective_id) {
@@ -2703,7 +2791,16 @@ impl Repl {
                         .with_field("status", objective.status.as_str()),
                 );
             }
-            4 => {
+            4 | 5 => {
+                if tokens.len() == 5 && !is_yes_flag(&tokens[4]) {
+                    self.emit_error(
+                        "objective",
+                        CliCode::Usage,
+                        "usage: objective status [objective-id [start|evaluate]]",
+                    );
+                    return;
+                }
+                let explicit_yes = has_yes_flag(tokens);
                 let objective_id = match ObjectiveId::parse(&tokens[2]) {
                     Ok(value) => value,
                     Err(err) => {
@@ -2712,8 +2809,8 @@ impl Repl {
                     }
                 };
                 match tokens[3].as_str() {
-                    "start" => self.cmd_objective_start(objective_id),
-                    "evaluate" => self.cmd_objective_evaluate(objective_id),
+                    "start" => self.cmd_objective_start(objective_id, explicit_yes),
+                    "evaluate" => self.cmd_objective_evaluate(objective_id, explicit_yes),
                     _ => self.emit_error(
                         "objective",
                         CliCode::Usage,
@@ -2729,7 +2826,7 @@ impl Repl {
         }
     }
 
-    fn cmd_objective_start(&mut self, objective_id: ObjectiveId) {
+    fn cmd_objective_start(&mut self, objective_id: ObjectiveId, explicit_yes: bool) {
         let Some(objective) = self.objectives.get(&objective_id) else {
             self.emit_error(
                 "objective",
@@ -2739,6 +2836,19 @@ impl Repl {
             return;
         };
         let campaign_id = objective.campaign_id.clone();
+        let decision = self.policy.evaluate(&PolicyRequest::start_objective(
+            campaign_id.as_str(),
+            objective.id.as_str(),
+            objective.risk_level.as_str(),
+        ));
+        if !self.enforce_policy_decision(
+            "objective",
+            decision,
+            explicit_yes,
+            "objective start canceled by confirmation",
+        ) {
+            return;
+        }
         let objective_statuses = self
             .objectives
             .values()
@@ -2771,11 +2881,12 @@ impl Repl {
             CommandResponse::ok("objective", "objective started")
                 .with_field("objective_id", transition.objective_id.as_str())
                 .with_field("from", transition.from.as_str())
-                .with_field("to", transition.to.as_str()),
+                .with_field("to", transition.to.as_str())
+                .with_field("campaign_id", campaign_id.as_str()),
         );
     }
 
-    fn cmd_objective_evaluate(&mut self, objective_id: ObjectiveId) {
+    fn cmd_objective_evaluate(&mut self, objective_id: ObjectiveId, explicit_yes: bool) {
         let Some(objective) = self.objectives.get(&objective_id) else {
             self.emit_error(
                 "objective",
@@ -2785,6 +2896,19 @@ impl Repl {
             return;
         };
         let campaign_id = objective.campaign_id.clone();
+        let decision = self.policy.evaluate(&PolicyRequest::evaluate_objective(
+            campaign_id.as_str(),
+            objective.id.as_str(),
+            objective.risk_level.as_str(),
+        ));
+        if !self.enforce_policy_decision(
+            "objective",
+            decision,
+            explicit_yes,
+            "objective evaluation canceled by confirmation",
+        ) {
+            return;
+        }
         let mut scoped = self
             .objectives
             .iter()
@@ -3189,6 +3313,36 @@ impl Repl {
         Ok(matches!(answer.as_str(), "yes" | "y"))
     }
 
+    fn enforce_policy_decision(
+        &self,
+        command: &str,
+        decision: corelib::policy::PolicyDecision,
+        explicit_yes: bool,
+        confirm_cancel_message: &str,
+    ) -> bool {
+        match decision.kind {
+            DecisionKind::Deny => {
+                self.emit_error(
+                    command,
+                    CliCode::PolicyDenied,
+                    &format!("policy blocked {command}: {}", decision.reason),
+                );
+                false
+            }
+            DecisionKind::RequireConfirmation if !explicit_yes => {
+                let confirmed = self
+                    .confirm_intent(&format!("{} [yes/no]: ", decision.reason))
+                    .unwrap_or(false);
+                if !confirmed {
+                    self.emit_error(command, CliCode::PolicyDenied, confirm_cancel_message);
+                    return false;
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
     fn emit_response(&self, response: CommandResponse) {
         if self.output_mode.is_json() {
             println!("{}", response.render_json());
@@ -3506,6 +3660,25 @@ impl Repl {
                                 .map(|v| v.to_string())
                                 .collect();
                         }
+                    } else if token_index == 4
+                        && matches!(tokens.get(1), Some(&"status"))
+                        && tokens
+                            .get(2)
+                            .and_then(|value| CampaignId::parse(value).ok())
+                            .is_some()
+                        && matches!(
+                            tokens.get(3),
+                            Some(&"active")
+                                | Some(&"paused")
+                                | Some(&"completed")
+                                | Some(&"failed")
+                        )
+                    {
+                        candidates = ["--yes", "-y"]
+                            .iter()
+                            .filter(|v| v.starts_with(current))
+                            .map(|v| v.to_string())
+                            .collect();
                     }
                 }
                 "objective" => {
@@ -3580,6 +3753,35 @@ impl Repl {
                                 .map(|v| v.to_string())
                                 .collect();
                             }
+                        }
+                    } else if token_index == 4 && matches!(tokens.get(1), Some(&"status")) {
+                        if tokens
+                            .get(2)
+                            .and_then(|value| ObjectiveId::parse(value).ok())
+                            .is_some()
+                            && matches!(tokens.get(3), Some(&"start") | Some(&"evaluate"))
+                        {
+                            candidates = ["--yes", "-y"]
+                                .iter()
+                                .filter(|v| v.starts_with(current))
+                                .map(|v| v.to_string())
+                                .collect();
+                        }
+                    } else if token_index == 4 && matches!(tokens.get(1), Some(&"link-prereq")) {
+                        if tokens
+                            .get(2)
+                            .and_then(|value| ObjectiveId::parse(value).ok())
+                            .is_some()
+                            && tokens
+                                .get(3)
+                                .and_then(|value| ObjectiveId::parse(value).ok())
+                                .is_some()
+                        {
+                            candidates = ["--yes", "-y"]
+                                .iter()
+                                .filter(|v| v.starts_with(current))
+                                .map(|v| v.to_string())
+                                .collect();
                         }
                     }
                 }
@@ -3758,6 +3960,14 @@ fn search_flag_candidates(prefix: &str) -> Vec<String> {
         .filter(|flag| flag.starts_with(prefix))
         .map(|flag| flag.to_string())
         .collect()
+}
+
+fn is_yes_flag(token: &str) -> bool {
+    token.eq_ignore_ascii_case("--yes") || token.eq_ignore_ascii_case("-y")
+}
+
+fn has_yes_flag(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| is_yes_flag(token))
 }
 
 fn next_campaign_id() -> CampaignId {

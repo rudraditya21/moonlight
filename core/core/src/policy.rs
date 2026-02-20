@@ -59,6 +59,12 @@ pub enum PolicyAction {
     ExecuteModule,
     CloseSession,
     CloseAllSessions,
+    CreateCampaign,
+    ChangeCampaignStatus,
+    CreateObjective,
+    LinkObjectivePrerequisite,
+    StartObjective,
+    EvaluateObjective,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +101,12 @@ pub struct PolicyRequest {
     pub action: PolicyAction,
     pub module: Option<ModuleContext>,
     pub target: Option<String>,
+    pub campaign_id: Option<String>,
+    pub objective_id: Option<String>,
+    pub prerequisite_id: Option<String>,
+    pub risk_level: Option<String>,
+    pub from_status: Option<String>,
+    pub to_status: Option<String>,
 }
 
 impl PolicyRequest {
@@ -103,6 +115,12 @@ impl PolicyRequest {
             action: PolicyAction::ExecuteModule,
             module: Some(module),
             target,
+            campaign_id: None,
+            objective_id: None,
+            prerequisite_id: None,
+            risk_level: None,
+            from_status: None,
+            to_status: None,
         }
     }
 
@@ -111,6 +129,12 @@ impl PolicyRequest {
             action: PolicyAction::CloseSession,
             module: None,
             target: None,
+            campaign_id: None,
+            objective_id: None,
+            prerequisite_id: None,
+            risk_level: None,
+            from_status: None,
+            to_status: None,
         }
     }
 
@@ -119,6 +143,100 @@ impl PolicyRequest {
             action: PolicyAction::CloseAllSessions,
             module: None,
             target: None,
+            campaign_id: None,
+            objective_id: None,
+            prerequisite_id: None,
+            risk_level: None,
+            from_status: None,
+            to_status: None,
+        }
+    }
+
+    pub fn create_campaign(campaign_id: &str) -> Self {
+        Self {
+            action: PolicyAction::CreateCampaign,
+            module: None,
+            target: None,
+            campaign_id: Some(campaign_id.trim().to_string()),
+            objective_id: None,
+            prerequisite_id: None,
+            risk_level: None,
+            from_status: None,
+            to_status: None,
+        }
+    }
+
+    pub fn change_campaign_status(campaign_id: &str, from_status: &str, to_status: &str) -> Self {
+        Self {
+            action: PolicyAction::ChangeCampaignStatus,
+            module: None,
+            target: None,
+            campaign_id: Some(campaign_id.trim().to_string()),
+            objective_id: None,
+            prerequisite_id: None,
+            risk_level: None,
+            from_status: Some(from_status.trim().to_ascii_lowercase()),
+            to_status: Some(to_status.trim().to_ascii_lowercase()),
+        }
+    }
+
+    pub fn create_objective(campaign_id: &str, objective_id: &str, risk_level: &str) -> Self {
+        Self {
+            action: PolicyAction::CreateObjective,
+            module: None,
+            target: None,
+            campaign_id: Some(campaign_id.trim().to_string()),
+            objective_id: Some(objective_id.trim().to_string()),
+            prerequisite_id: None,
+            risk_level: Some(risk_level.trim().to_ascii_lowercase()),
+            from_status: None,
+            to_status: None,
+        }
+    }
+
+    pub fn link_objective_prerequisite(
+        campaign_id: &str,
+        objective_id: &str,
+        prerequisite_id: &str,
+    ) -> Self {
+        Self {
+            action: PolicyAction::LinkObjectivePrerequisite,
+            module: None,
+            target: None,
+            campaign_id: Some(campaign_id.trim().to_string()),
+            objective_id: Some(objective_id.trim().to_string()),
+            prerequisite_id: Some(prerequisite_id.trim().to_string()),
+            risk_level: None,
+            from_status: None,
+            to_status: None,
+        }
+    }
+
+    pub fn start_objective(campaign_id: &str, objective_id: &str, risk_level: &str) -> Self {
+        Self {
+            action: PolicyAction::StartObjective,
+            module: None,
+            target: None,
+            campaign_id: Some(campaign_id.trim().to_string()),
+            objective_id: Some(objective_id.trim().to_string()),
+            prerequisite_id: None,
+            risk_level: Some(risk_level.trim().to_ascii_lowercase()),
+            from_status: None,
+            to_status: None,
+        }
+    }
+
+    pub fn evaluate_objective(campaign_id: &str, objective_id: &str, risk_level: &str) -> Self {
+        Self {
+            action: PolicyAction::EvaluateObjective,
+            module: None,
+            target: None,
+            campaign_id: Some(campaign_id.trim().to_string()),
+            objective_id: Some(objective_id.trim().to_string()),
+            prerequisite_id: None,
+            risk_level: Some(risk_level.trim().to_ascii_lowercase()),
+            from_status: None,
+            to_status: None,
         }
     }
 }
@@ -197,7 +315,82 @@ impl DefaultSafetyPolicy {
                 )
             }
             PolicyAction::ExecuteModule => self.evaluate_module_execution(request, granted),
+            PolicyAction::CreateCampaign => {
+                PolicyDecision::allow("campaign creation allowed by default safety policy")
+            }
+            PolicyAction::ChangeCampaignStatus => self.evaluate_campaign_status_change(request),
+            PolicyAction::CreateObjective => self.evaluate_objective_create(request, granted),
+            PolicyAction::LinkObjectivePrerequisite => PolicyDecision::allow(
+                "objective prerequisite linkage allowed by default safety policy",
+            ),
+            PolicyAction::StartObjective => self.evaluate_objective_start(request, granted),
+            PolicyAction::EvaluateObjective => {
+                PolicyDecision::allow("objective evaluation allowed by default safety policy")
+            }
         }
+    }
+
+    fn evaluate_campaign_status_change(&self, request: &PolicyRequest) -> PolicyDecision {
+        let Some(to_status) = request.to_status.as_deref() else {
+            return PolicyDecision::deny("campaign status change missing target status");
+        };
+        let campaign_id = request.campaign_id.as_deref().unwrap_or("<unknown>");
+        if matches!(to_status, "completed" | "failed") {
+            return PolicyDecision::confirm(&format!(
+                "Campaign '{}' transition to '{}' requires explicit intent",
+                campaign_id, to_status
+            ));
+        }
+        PolicyDecision::allow("campaign status change allowed by default safety policy")
+    }
+
+    fn evaluate_objective_create(
+        &self,
+        request: &PolicyRequest,
+        granted: &BTreeSet<Capability>,
+    ) -> PolicyDecision {
+        let Some(risk_level) = request.risk_level.as_deref() else {
+            return PolicyDecision::deny("objective creation missing risk level");
+        };
+        let objective_id = request.objective_id.as_deref().unwrap_or("<unknown>");
+        if risk_level == "high" {
+            if !granted.contains(&Capability::ExploitExecution) {
+                return PolicyDecision::deny(
+                    "high-risk objective creation blocked: enable capability exploit_execution",
+                );
+            }
+            return PolicyDecision::confirm(&format!(
+                "Objective '{}' is high risk; confirm explicit intent",
+                objective_id
+            ));
+        }
+        if risk_level == "medium" {
+            return PolicyDecision::confirm(&format!(
+                "Objective '{}' is medium risk; confirm explicit intent",
+                objective_id
+            ));
+        }
+        PolicyDecision::allow("objective creation allowed by default safety policy")
+    }
+
+    fn evaluate_objective_start(
+        &self,
+        request: &PolicyRequest,
+        granted: &BTreeSet<Capability>,
+    ) -> PolicyDecision {
+        let Some(risk_level) = request.risk_level.as_deref() else {
+            return PolicyDecision::deny("objective start missing risk level");
+        };
+        let objective_id = request.objective_id.as_deref().unwrap_or("<unknown>");
+        if risk_level == "high" && !granted.contains(&Capability::ExploitExecution) {
+            return PolicyDecision::deny(
+                "high-risk objective start blocked: enable capability exploit_execution",
+            );
+        }
+        PolicyDecision::confirm(&format!(
+            "Starting objective '{}' (risk={}) requires explicit intent",
+            objective_id, risk_level
+        ))
     }
 
     fn evaluate_module_execution(
@@ -543,5 +736,63 @@ mod tests {
         ));
         assert_eq!(decision.kind, DecisionKind::Deny);
         assert_eq!(decision.reason, "blocked by custom policy hook");
+    }
+
+    #[test]
+    fn campaign_terminal_status_requires_confirmation() {
+        let engine = PolicyEngine::new();
+        let decision = engine.evaluate(&PolicyRequest::change_campaign_status(
+            "de305d54-75b4-431b-adb2-eb6b9e546014",
+            "active",
+            "completed",
+        ));
+        assert_eq!(decision.kind, DecisionKind::RequireConfirmation);
+    }
+
+    #[test]
+    fn high_risk_objective_create_requires_exploit_capability() {
+        let engine = PolicyEngine::new();
+        let denied = engine.evaluate(&PolicyRequest::create_objective(
+            "de305d54-75b4-431b-adb2-eb6b9e546014",
+            "0f8fad5b-d9cb-469f-a165-70867728950e",
+            "high",
+        ));
+        assert_eq!(denied.kind, DecisionKind::Deny);
+
+        let mut engine = PolicyEngine::new();
+        engine.grant(Capability::ExploitExecution);
+        let confirmed = engine.evaluate(&PolicyRequest::create_objective(
+            "de305d54-75b4-431b-adb2-eb6b9e546014",
+            "0f8fad5b-d9cb-469f-a165-70867728950e",
+            "high",
+        ));
+        assert_eq!(confirmed.kind, DecisionKind::RequireConfirmation);
+    }
+
+    #[test]
+    fn objective_start_requires_explicit_intent_and_high_risk_capability() {
+        let engine = PolicyEngine::new();
+        let denied = engine.evaluate(&PolicyRequest::start_objective(
+            "de305d54-75b4-431b-adb2-eb6b9e546014",
+            "0f8fad5b-d9cb-469f-a165-70867728950e",
+            "high",
+        ));
+        assert_eq!(denied.kind, DecisionKind::Deny);
+
+        let medium = engine.evaluate(&PolicyRequest::start_objective(
+            "de305d54-75b4-431b-adb2-eb6b9e546014",
+            "0f8fad5b-d9cb-469f-a165-70867728950e",
+            "medium",
+        ));
+        assert_eq!(medium.kind, DecisionKind::RequireConfirmation);
+
+        let mut engine = PolicyEngine::new();
+        engine.grant(Capability::ExploitExecution);
+        let confirmed = engine.evaluate(&PolicyRequest::start_objective(
+            "de305d54-75b4-431b-adb2-eb6b9e546014",
+            "0f8fad5b-d9cb-469f-a165-70867728950e",
+            "high",
+        ));
+        assert_eq!(confirmed.kind, DecisionKind::RequireConfirmation);
     }
 }
