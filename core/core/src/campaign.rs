@@ -1021,7 +1021,7 @@ impl Objective {
         }
     }
 
-    pub fn transition_to_eligible(
+    fn transition_to_eligible(
         &mut self,
         prerequisites_satisfied: bool,
         now: u64,
@@ -1035,11 +1035,11 @@ impl Objective {
         self.transition_status(ObjectiveStatus::Eligible, now)
     }
 
-    pub fn transition_to_in_progress(&mut self, now: u64) -> Result<(), CampaignModelError> {
+    fn transition_to_in_progress(&mut self, now: u64) -> Result<(), CampaignModelError> {
         self.transition_status(ObjectiveStatus::InProgress, now)
     }
 
-    pub fn transition_to_achieved(
+    fn transition_to_achieved(
         &mut self,
         success_criteria_satisfied: bool,
         now: u64,
@@ -1053,7 +1053,7 @@ impl Objective {
         self.transition_status(ObjectiveStatus::Achieved, now)
     }
 
-    pub fn transition_to_failed(
+    fn transition_to_failed(
         &mut self,
         failure_criteria_satisfied: bool,
         now: u64,
@@ -1067,7 +1067,7 @@ impl Objective {
         self.transition_status(ObjectiveStatus::Failed, now)
     }
 
-    pub fn transition_status(
+    fn transition_status(
         &mut self,
         next: ObjectiveStatus,
         now: u64,
@@ -1089,6 +1089,215 @@ impl Objective {
         self.status = next;
         self.updated_at = now;
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveTransitionAudit {
+    pub objective_id: ObjectiveId,
+    pub from: ObjectiveStatus,
+    pub to: ObjectiveStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveEvaluationRecord {
+    pub objective_id: ObjectiveId,
+    pub result: ObjectiveEvaluationResult,
+}
+
+pub trait ObjectiveEventHook {
+    fn emit(&mut self, payload: CampaignEventPayload);
+}
+
+impl ObjectiveEventHook for Vec<CampaignEventPayload> {
+    fn emit(&mut self, payload: CampaignEventPayload) {
+        self.push(payload);
+    }
+}
+
+pub struct ObjectiveEvaluationEngine;
+
+impl ObjectiveEvaluationEngine {
+    pub fn evaluate_objective<H: ObjectiveEventHook>(
+        objective: &mut Objective,
+        objective_statuses: &BTreeMap<ObjectiveId, ObjectiveStatus>,
+        snapshot: &PredicateSnapshot,
+        trigger: ObjectiveReevaluationTrigger,
+        now: u64,
+        hook: &mut H,
+    ) -> Result<ObjectiveEvaluationResult, CampaignModelError> {
+        let prerequisites_satisfied = Self::prerequisites_satisfied(objective, objective_statuses)?;
+        let success_criteria_satisfied = objective.success_criteria_satisfied_snapshot(snapshot);
+        let failure_criteria_satisfied = objective.failure_criteria_satisfied_snapshot(snapshot);
+
+        let mut result = ObjectiveEvaluationResult::no_transition(
+            prerequisites_satisfied,
+            success_criteria_satisfied,
+            failure_criteria_satisfied,
+        );
+        let from = objective.status;
+        let mut resulting_status = from;
+
+        if objective.status == ObjectiveStatus::Pending {
+            if prerequisites_satisfied {
+                objective.transition_to_eligible(true, now)?;
+                result.next_status = Some(ObjectiveStatus::Eligible);
+                resulting_status = ObjectiveStatus::Eligible;
+                hook.emit(CampaignEventPayload::ObjectiveStatusChanged {
+                    campaign_id: objective.campaign_id.clone(),
+                    objective_id: objective.id.clone(),
+                    from,
+                    to: ObjectiveStatus::Eligible,
+                    reason: Some("evaluator_prerequisites_satisfied".to_string()),
+                });
+            }
+        } else if objective.status == ObjectiveStatus::InProgress {
+            if failure_criteria_satisfied {
+                objective.transition_to_failed(true, now)?;
+                result.next_status = Some(ObjectiveStatus::Failed);
+                resulting_status = ObjectiveStatus::Failed;
+                hook.emit(CampaignEventPayload::ObjectiveStatusChanged {
+                    campaign_id: objective.campaign_id.clone(),
+                    objective_id: objective.id.clone(),
+                    from,
+                    to: ObjectiveStatus::Failed,
+                    reason: Some("evaluator_failure_criteria_satisfied".to_string()),
+                });
+            } else if success_criteria_satisfied {
+                objective.transition_to_achieved(true, now)?;
+                result.next_status = Some(ObjectiveStatus::Achieved);
+                resulting_status = ObjectiveStatus::Achieved;
+                hook.emit(CampaignEventPayload::ObjectiveStatusChanged {
+                    campaign_id: objective.campaign_id.clone(),
+                    objective_id: objective.id.clone(),
+                    from,
+                    to: ObjectiveStatus::Achieved,
+                    reason: Some("evaluator_success_criteria_satisfied".to_string()),
+                });
+            }
+        }
+
+        hook.emit(CampaignEventPayload::ObjectiveEvaluated {
+            campaign_id: objective.campaign_id.clone(),
+            objective_id: objective.id.clone(),
+            trigger,
+            prerequisites_satisfied: result.prerequisites_satisfied,
+            success_criteria_satisfied: result.success_criteria_satisfied,
+            failure_criteria_satisfied: result.failure_criteria_satisfied,
+            resulting_status,
+        });
+
+        Ok(result)
+    }
+
+    pub fn evaluate_campaign<H: ObjectiveEventHook>(
+        campaign_id: &CampaignId,
+        objectives: &mut BTreeMap<ObjectiveId, Objective>,
+        snapshot: &PredicateSnapshot,
+        trigger: ObjectiveReevaluationTrigger,
+        now: u64,
+        hook: &mut H,
+    ) -> Result<Vec<ObjectiveEvaluationRecord>, CampaignModelError> {
+        validate_prerequisite_graph(&objectives.values().cloned().collect::<Vec<_>>())?;
+        for objective in objectives.values() {
+            if &objective.campaign_id != campaign_id {
+                return Err(CampaignModelError::InvalidField {
+                    field: "objective.campaign_id",
+                    reason: "must match evaluation campaign",
+                });
+            }
+        }
+
+        let mut records = Vec::new();
+        let max_iterations = objectives.len().saturating_mul(4).max(1);
+        for _ in 0..max_iterations {
+            let status_index = objectives
+                .iter()
+                .map(|(id, objective)| (id.clone(), objective.status))
+                .collect::<BTreeMap<_, _>>();
+
+            let ordered_ids = objectives.keys().cloned().collect::<Vec<_>>();
+            let mut changed = false;
+
+            for objective_id in ordered_ids {
+                let objective = objectives.get_mut(&objective_id).ok_or_else(|| {
+                    CampaignModelError::MissingObjective {
+                        objective_id: objective_id.clone(),
+                    }
+                })?;
+
+                let result = Self::evaluate_objective(
+                    objective,
+                    &status_index,
+                    snapshot,
+                    trigger,
+                    now,
+                    hook,
+                )?;
+                changed |= result.next_status.is_some();
+                records.push(ObjectiveEvaluationRecord {
+                    objective_id,
+                    result,
+                });
+            }
+
+            if !changed {
+                return Ok(records);
+            }
+        }
+
+        Err(CampaignModelError::InvalidField {
+            field: "objective.evaluation",
+            reason: "evaluation exceeded deterministic iteration budget",
+        })
+    }
+
+    pub fn start_objective<H: ObjectiveEventHook>(
+        objective: &mut Objective,
+        objective_statuses: &BTreeMap<ObjectiveId, ObjectiveStatus>,
+        now: u64,
+        hook: &mut H,
+    ) -> Result<ObjectiveTransitionAudit, CampaignModelError> {
+        let prerequisites_satisfied = Self::prerequisites_satisfied(objective, objective_statuses)?;
+        if !prerequisites_satisfied {
+            return Err(CampaignModelError::InvalidField {
+                field: "objective.prerequisites",
+                reason: "all prerequisites must be achieved before starting objective",
+            });
+        }
+
+        let from = objective.status;
+        objective.transition_to_in_progress(now)?;
+        let transition = ObjectiveTransitionAudit {
+            objective_id: objective.id.clone(),
+            from,
+            to: objective.status,
+        };
+        hook.emit(CampaignEventPayload::ObjectiveStatusChanged {
+            campaign_id: objective.campaign_id.clone(),
+            objective_id: objective.id.clone(),
+            from,
+            to: objective.status,
+            reason: Some("manual_objective_start".to_string()),
+        });
+        Ok(transition)
+    }
+
+    pub fn prerequisites_satisfied(
+        objective: &Objective,
+        objective_statuses: &BTreeMap<ObjectiveId, ObjectiveStatus>,
+    ) -> Result<bool, CampaignModelError> {
+        for prerequisite in &objective.prerequisites {
+            let status = objective_statuses.get(prerequisite).ok_or_else(|| {
+                CampaignModelError::MissingObjective {
+                    objective_id: prerequisite.clone(),
+                }
+            })?;
+            if *status != ObjectiveStatus::Achieved {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -1733,20 +1942,245 @@ mod tests {
             10,
         )
         .expect("objective");
+        let mut status_index = BTreeMap::from([(objective.id.clone(), ObjectiveStatus::Pending)]);
+        let mut events = Vec::<CampaignEventPayload>::new();
 
-        assert!(objective.transition_to_eligible(false, 11).is_err());
-        objective
-            .transition_to_eligible(true, 11)
-            .expect("eligible");
-        objective
-            .transition_to_in_progress(12)
-            .expect("in progress");
-        assert!(objective.transition_to_achieved(false, 13).is_err());
-        objective
-            .transition_to_achieved(true, 13)
-            .expect("achieved");
+        let pending_result = ObjectiveEvaluationEngine::evaluate_objective(
+            &mut objective,
+            &status_index,
+            &PredicateSnapshot::new(),
+            ObjectiveReevaluationTrigger::ManualRequest,
+            11,
+            &mut events,
+        )
+        .expect("evaluate pending");
+        assert_eq!(objective.status, ObjectiveStatus::Eligible);
+        assert_eq!(pending_result.next_status, Some(ObjectiveStatus::Eligible));
+        assert_eq!(events.len(), 2);
+
+        status_index.insert(objective.id.clone(), objective.status);
+        ObjectiveEvaluationEngine::start_objective(&mut objective, &status_index, 12, &mut events)
+            .expect("start objective");
+        assert_eq!(objective.status, ObjectiveStatus::InProgress);
+
+        let root_snapshot = PredicateSnapshot::new().with_session(
+            SessionSnapshot::new(
+                domain::Session::new_at(
+                    domain::Run::new_at(
+                        domain::Workspace::new_at("ws", "test", 1)
+                            .expect("workspace")
+                            .id,
+                        domain::ModuleVersion::new_at(
+                            "exploit/linux/example",
+                            "1.0.0",
+                            1,
+                            "entrypoint",
+                            "sha256",
+                            1,
+                        )
+                        .expect("module")
+                        .id,
+                        None,
+                        "operator",
+                        2,
+                    )
+                    .expect("run")
+                    .id,
+                    None,
+                    "shell",
+                    "127.0.0.1:23",
+                    3,
+                )
+                .expect("session"),
+            )
+            .with_privilege(SessionPrivilegeLevel::Root),
+        );
+        status_index.insert(objective.id.clone(), objective.status);
+        let complete_result = ObjectiveEvaluationEngine::evaluate_objective(
+            &mut objective,
+            &status_index,
+            &root_snapshot,
+            ObjectiveReevaluationTrigger::SessionStateChanged,
+            13,
+            &mut events,
+        )
+        .expect("evaluate in progress");
         assert_eq!(objective.status, ObjectiveStatus::Achieved);
-        assert!(objective.transition_to_failed(true, 14).is_err());
+        assert_eq!(complete_result.next_status, Some(ObjectiveStatus::Achieved));
+    }
+
+    #[test]
+    fn evaluator_emits_auditable_transition_events() {
+        let mut objective = Objective::new_at(
+            objective_id("1f65f5d5-f9a9-42dc-a0ef-3d96f5565de8"),
+            campaign_id("de305d54-75b4-431b-adb2-eb6b9e546014"),
+            "Objective",
+            "pending to eligible",
+            vec![],
+            vec![Predicate::FindingExists {
+                finding_type: "credential".to_string(),
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            10,
+        )
+        .expect("objective");
+
+        let mut events = Vec::<CampaignEventPayload>::new();
+        let status_index = BTreeMap::from([(objective.id.clone(), ObjectiveStatus::Pending)]);
+
+        ObjectiveEvaluationEngine::evaluate_objective(
+            &mut objective,
+            &status_index,
+            &PredicateSnapshot::new(),
+            ObjectiveReevaluationTrigger::RunCompleted,
+            11,
+            &mut events,
+        )
+        .expect("evaluation");
+
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            CampaignEventPayload::ObjectiveStatusChanged { from, to, .. } => {
+                assert_eq!(*from, ObjectiveStatus::Pending);
+                assert_eq!(*to, ObjectiveStatus::Eligible);
+            }
+            payload => panic!("unexpected payload: {payload:?}"),
+        }
+        match &events[1] {
+            CampaignEventPayload::ObjectiveEvaluated {
+                trigger,
+                resulting_status,
+                ..
+            } => {
+                assert_eq!(*trigger, ObjectiveReevaluationTrigger::RunCompleted);
+                assert_eq!(*resulting_status, ObjectiveStatus::Eligible);
+            }
+            payload => panic!("unexpected payload: {payload:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluator_campaign_pass_is_deterministic_and_auditable() {
+        let cid = campaign_id("de305d54-75b4-431b-adb2-eb6b9e546014");
+        let oid_a = objective_id("0f8fad5b-d9cb-469f-a165-70867728950e");
+        let oid_b = objective_id("9b2f4d6a-3aa4-41ba-91ed-6308a58186a1");
+
+        let objective_a = Objective::new_at(
+            oid_a.clone(),
+            cid.clone(),
+            "A",
+            "first objective",
+            vec![],
+            vec![Predicate::SessionPrivilege {
+                level: SessionPrivilegeLevel::Root,
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            1,
+        )
+        .expect("objective a");
+        let objective_b = Objective::new_at(
+            oid_b.clone(),
+            cid.clone(),
+            "B",
+            "depends on A",
+            vec![oid_a.clone()],
+            vec![Predicate::FindingExists {
+                finding_type: "credential".to_string(),
+            }],
+            vec![],
+            RiskLevel::Medium,
+            None,
+            1,
+        )
+        .expect("objective b");
+
+        let mut objectives =
+            BTreeMap::from([(oid_a.clone(), objective_a), (oid_b.clone(), objective_b)]);
+        let mut events_a = Vec::<CampaignEventPayload>::new();
+        let records_a = ObjectiveEvaluationEngine::evaluate_campaign(
+            &cid,
+            &mut objectives,
+            &PredicateSnapshot::new(),
+            ObjectiveReevaluationTrigger::ManualRequest,
+            2,
+            &mut events_a,
+        )
+        .expect("campaign evaluation");
+
+        assert_eq!(objectives[&oid_a].status, ObjectiveStatus::Eligible);
+        assert_eq!(objectives[&oid_b].status, ObjectiveStatus::Pending);
+        assert!(!records_a.is_empty());
+
+        let mut status_index = objectives
+            .iter()
+            .map(|(id, objective)| (id.clone(), objective.status))
+            .collect::<BTreeMap<_, _>>();
+        ObjectiveEvaluationEngine::start_objective(
+            objectives.get_mut(&oid_a).expect("objective a"),
+            &status_index,
+            3,
+            &mut events_a,
+        )
+        .expect("start objective a");
+        status_index.insert(oid_a.clone(), ObjectiveStatus::InProgress);
+
+        let root_snapshot = PredicateSnapshot::new().with_session(
+            SessionSnapshot::new(
+                domain::Session::new_at(
+                    domain::Run::new_at(
+                        domain::Workspace::new_at("ws", "test", 1)
+                            .expect("workspace")
+                            .id,
+                        domain::ModuleVersion::new_at(
+                            "exploit/linux/example",
+                            "1.0.0",
+                            1,
+                            "entrypoint",
+                            "sha256",
+                            1,
+                        )
+                        .expect("module")
+                        .id,
+                        None,
+                        "operator",
+                        1,
+                    )
+                    .expect("run")
+                    .id,
+                    None,
+                    "shell",
+                    "127.0.0.1:23",
+                    1,
+                )
+                .expect("session"),
+            )
+            .with_privilege(SessionPrivilegeLevel::Root),
+        );
+
+        let mut events_b = Vec::<CampaignEventPayload>::new();
+        let records_b = ObjectiveEvaluationEngine::evaluate_campaign(
+            &cid,
+            &mut objectives,
+            &root_snapshot,
+            ObjectiveReevaluationTrigger::SessionStateChanged,
+            4,
+            &mut events_b,
+        )
+        .expect("campaign re-evaluation");
+
+        assert_eq!(objectives[&oid_a].status, ObjectiveStatus::Achieved);
+        assert_eq!(objectives[&oid_b].status, ObjectiveStatus::Eligible);
+        assert!(!records_b.is_empty());
+        assert!(events_b
+            .iter()
+            .any(|event| matches!(event, CampaignEventPayload::ObjectiveStatusChanged { .. })));
+        assert!(events_b
+            .iter()
+            .any(|event| matches!(event, CampaignEventPayload::ObjectiveEvaluated { .. })));
     }
 
     #[test]
