@@ -93,7 +93,7 @@ impl ReleaseCompatibilityPolicy {
         Self::new(
             VersionWindow::new(1, 1).expect("fixed window"),
             VersionWindow::new(1, 1).expect("fixed window"),
-            VersionWindow::new(1, 3).expect("fixed window"),
+            VersionWindow::new(1, 4).expect("fixed window"),
             vec!["human".to_string(), "json".to_string()],
             vec!["builtin".to_string(), "dynlib".to_string()],
         )
@@ -394,8 +394,17 @@ impl MigrationPolicy {
                 false,
             )
             .expect("valid step"),
+            MigrationStepDefinition::new(
+                3,
+                4,
+                "Persist campaign/objective snapshots with deterministic predicate state.",
+                MigrationImpact::Compatible,
+                true,
+                true,
+            )
+            .expect("valid step"),
         ];
-        Self::new(1, 3, steps).expect("default migration policy")
+        Self::new(1, 4, steps).expect("default migration policy")
     }
 
     pub fn plan(

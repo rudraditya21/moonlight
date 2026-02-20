@@ -316,6 +316,19 @@ impl MetadataValue {
         }
     }
 
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_wire(&mut out);
+        out
+    }
+
+    pub fn from_wire_bytes(input: &[u8]) -> Result<Self, CampaignModelError> {
+        let mut cursor = WireCursor::new(input);
+        let value = Self::read_wire(&mut cursor)?;
+        cursor.ensure_finished()?;
+        Ok(value)
+    }
+
     fn write_wire(&self, out: &mut Vec<u8>) {
         match self {
             MetadataValue::Null => out.push(0),

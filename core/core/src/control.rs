@@ -3,6 +3,10 @@ use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::campaign::{
+    validate_prerequisite_graph, Campaign, CampaignId, CampaignModelError, CampaignStatus,
+    MetadataValue, Objective, ObjectiveId, ObjectiveStatus, Predicate, RiskLevel,
+};
 use crate::domain::{
     Artifact, ArtifactId, ArtifactKind, ArtifactState, CorrelationId, DomainError, ModuleVersionId,
     Run, RunId, RunState, Session, SessionId, SessionState, TargetId, Task, TaskId, TaskState,
@@ -11,7 +15,9 @@ use crate::domain::{
 use crate::ids::Id;
 use crate::time::now_secs;
 
-const CONTROL_STATE_HEADER: &str = "moonlight-control-state:v1";
+const CONTROL_STATE_HEADER_V1: &str = "moonlight-control-state:v1";
+const CONTROL_STATE_HEADER_V2: &str = "moonlight-control-state:v2";
+const CONTROL_STATE_SCHEMA_VERSION: u32 = 4;
 const CONTROL_COMMIT_LOG_HEADER: &str = "moonlight-control-commit-log:v1";
 
 #[derive(Debug)]
@@ -43,13 +49,37 @@ impl From<DomainError> for ControlStateError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+impl From<CampaignModelError> for ControlStateError {
+    fn from(value: CampaignModelError) -> Self {
+        ControlStateError::Validation(value.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlState {
+    pub schema_version: u32,
     pub runs: BTreeMap<RunId, Run>,
     pub tasks: BTreeMap<TaskId, Task>,
     pub sessions: BTreeMap<SessionId, Session>,
     pub artifacts: BTreeMap<ArtifactId, Artifact>,
+    pub campaigns: BTreeMap<CampaignId, Campaign>,
+    pub objectives: BTreeMap<ObjectiveId, Objective>,
     pub applied_transactions: BTreeSet<u64>,
+}
+
+impl Default for ControlState {
+    fn default() -> Self {
+        Self {
+            schema_version: CONTROL_STATE_SCHEMA_VERSION,
+            runs: BTreeMap::new(),
+            tasks: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+            artifacts: BTreeMap::new(),
+            campaigns: BTreeMap::new(),
+            objectives: BTreeMap::new(),
+            applied_transactions: BTreeSet::new(),
+        }
+    }
 }
 
 impl ControlState {
@@ -81,6 +111,8 @@ pub enum ControlMutation {
     UpsertTask(Task),
     UpsertSession(Session),
     UpsertArtifact(Artifact),
+    UpsertCampaign(Campaign),
+    UpsertObjective(Objective),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,9 +148,11 @@ impl ControlTransaction {
         }
 
         let mut candidate = state.clone();
+        candidate.schema_version = CONTROL_STATE_SCHEMA_VERSION;
         for mutation in &self.mutations {
             apply_mutation(&mut candidate, mutation)?;
         }
+        validate_campaign_graph_integrity(&candidate)?;
         candidate.applied_transactions.insert(self.id);
         *state = candidate;
         Ok(())
@@ -216,7 +250,87 @@ fn apply_mutation(
             }
             state.artifacts.insert(artifact.id, artifact.clone());
         }
+        ControlMutation::UpsertCampaign(campaign) => {
+            let mut next = campaign.clone();
+            let existing_objective_ids = state
+                .campaigns
+                .get(&campaign.id)
+                .map(|value| value.objective_ids.clone())
+                .unwrap_or_default();
+            for objective_id in existing_objective_ids {
+                if !next.objective_ids.contains(&objective_id) {
+                    next.objective_ids.push(objective_id);
+                }
+            }
+            for objective in state.objectives.values() {
+                if objective.campaign_id == next.id && !next.objective_ids.contains(&objective.id) {
+                    next.objective_ids.push(objective.id.clone());
+                }
+            }
+            state.campaigns.insert(next.id.clone(), next);
+        }
+        ControlMutation::UpsertObjective(objective) => {
+            state
+                .objectives
+                .insert(objective.id.clone(), objective.clone());
+            if let Some(campaign) = state.campaigns.get_mut(&objective.campaign_id) {
+                if !campaign.objective_ids.contains(&objective.id) {
+                    campaign.objective_ids.push(objective.id.clone());
+                }
+            }
+        }
     }
+    Ok(())
+}
+
+fn validate_campaign_graph_integrity(state: &ControlState) -> Result<(), ControlStateError> {
+    for objective in state.objectives.values() {
+        let Some(campaign) = state.campaigns.get(&objective.campaign_id) else {
+            return Err(ControlStateError::Validation(format!(
+                "objective {} references missing campaign {}",
+                objective.id.as_str(),
+                objective.campaign_id.as_str()
+            )));
+        };
+        if !campaign.objective_ids.contains(&objective.id) {
+            return Err(ControlStateError::Validation(format!(
+                "campaign {} missing objective {} in objective_ids",
+                campaign.id.as_str(),
+                objective.id.as_str()
+            )));
+        }
+    }
+
+    for campaign in state.campaigns.values() {
+        for objective_id in &campaign.objective_ids {
+            let objective = state.objectives.get(objective_id).ok_or_else(|| {
+                ControlStateError::Validation(format!(
+                    "campaign {} references missing objective {}",
+                    campaign.id.as_str(),
+                    objective_id.as_str()
+                ))
+            })?;
+            if objective.campaign_id != campaign.id {
+                return Err(ControlStateError::Validation(format!(
+                    "campaign {} references objective {} that belongs to campaign {}",
+                    campaign.id.as_str(),
+                    objective_id.as_str(),
+                    objective.campaign_id.as_str()
+                )));
+            }
+        }
+    }
+
+    for campaign in state.campaigns.values() {
+        let objectives = state
+            .objectives
+            .values()
+            .filter(|objective| objective.campaign_id == campaign.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_prerequisite_graph(&objectives)?;
+    }
+
     Ok(())
 }
 
@@ -568,6 +682,47 @@ impl<S: TransactionalStateStore, A: ArtifactStorage> ControlPlane<S, A> {
         self.state_store.apply_transaction(&tx)
     }
 
+    pub fn record_campaign(
+        &mut self,
+        campaign: Campaign,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<(), ControlStateError> {
+        let tx = ControlTransaction::new(
+            vec![ControlMutation::UpsertCampaign(campaign)],
+            correlation_id,
+            now_secs(),
+        )?;
+        self.state_store.apply_transaction(&tx)
+    }
+
+    pub fn record_objective(
+        &mut self,
+        objective: Objective,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<(), ControlStateError> {
+        let tx = ControlTransaction::new(
+            vec![ControlMutation::UpsertObjective(objective)],
+            correlation_id,
+            now_secs(),
+        )?;
+        self.state_store.apply_transaction(&tx)
+    }
+
+    pub fn record_campaign_snapshot(
+        &mut self,
+        campaign: Campaign,
+        objectives: Vec<Objective>,
+        correlation_id: Option<CorrelationId>,
+    ) -> Result<(), ControlStateError> {
+        let mut mutations = Vec::with_capacity(objectives.len().saturating_add(1));
+        mutations.push(ControlMutation::UpsertCampaign(campaign));
+        for objective in objectives {
+            mutations.push(ControlMutation::UpsertObjective(objective));
+        }
+        let tx = ControlTransaction::new(mutations, correlation_id, now_secs())?;
+        self.state_store.apply_transaction(&tx)
+    }
+
     pub fn archive_transcript(
         &mut self,
         run_id: RunId,
@@ -726,8 +881,9 @@ impl<S: TransactionalStateStore, A: ArtifactStorage> ControlPlane<S, A> {
 
 fn encode_control_state(state: &ControlState) -> String {
     let mut out = String::new();
-    out.push_str(CONTROL_STATE_HEADER);
+    out.push_str(CONTROL_STATE_HEADER_V2);
     out.push('\n');
+    out.push_str(&format!("meta|schema_version|{}\n", state.schema_version));
 
     for run in state.runs.values() {
         out.push_str(&format!(
@@ -798,6 +954,37 @@ fn encode_control_state(state: &ControlState) -> String {
         ));
     }
 
+    for campaign in state.campaigns.values() {
+        out.push_str(&format!(
+            "campaign|{}|{}|{}|{}|{}|{}|{}\n",
+            campaign.id.as_str(),
+            encode_hex(&campaign.name),
+            encode_hex(&campaign.description),
+            campaign.created_at,
+            campaign_status_to_str(campaign.status),
+            encode_objective_ids(&campaign.objective_ids),
+            encode_metadata_map_opt(campaign.metadata.as_ref()),
+        ));
+    }
+
+    for objective in state.objectives.values() {
+        out.push_str(&format!(
+            "objective|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
+            objective.id.as_str(),
+            objective.campaign_id.as_str(),
+            encode_hex(&objective.name),
+            encode_hex(&objective.description),
+            objective_status_to_str(objective.status),
+            encode_objective_ids(&objective.prerequisites),
+            encode_predicates(&objective.success_criteria),
+            encode_predicates(&objective.failure_criteria),
+            risk_level_to_str(objective.risk_level),
+            encode_opt_u32(objective.noise_budget),
+            objective.created_at,
+            objective.updated_at,
+        ));
+    }
+
     let tx_ids = state
         .applied_transactions
         .iter()
@@ -814,14 +1001,24 @@ fn decode_control_state(input: &str) -> Result<ControlState, ControlStateError> 
     let Some(header) = lines.next() else {
         return Err(ControlStateError::Parse("empty control state".to_string()));
     };
-    if header != CONTROL_STATE_HEADER {
+    let is_v1 = header == CONTROL_STATE_HEADER_V1;
+    let is_v2 = header == CONTROL_STATE_HEADER_V2;
+    if !is_v1 && !is_v2 {
         return Err(ControlStateError::Parse(format!(
             "unsupported control state header '{}'",
             header
         )));
     }
 
-    let mut state = ControlState::default();
+    let mut state = if is_v1 {
+        ControlState {
+            schema_version: 1,
+            ..ControlState::default()
+        }
+    } else {
+        ControlState::default()
+    };
+    let mut saw_schema_meta = false;
 
     for line in lines {
         if line.trim().is_empty() {
@@ -829,6 +1026,26 @@ fn decode_control_state(input: &str) -> Result<ControlState, ControlStateError> 
         }
         let parts: Vec<&str> = line.split('|').collect();
         match parts.first().copied().unwrap_or_default() {
+            "meta" => {
+                if parts.len() != 3 {
+                    return Err(ControlStateError::Parse(format!(
+                        "invalid meta record '{}'",
+                        line
+                    )));
+                }
+                match parts[1] {
+                    "schema_version" => {
+                        state.schema_version = parse_u32(parts[2])?;
+                        saw_schema_meta = true;
+                    }
+                    other => {
+                        return Err(ControlStateError::Parse(format!(
+                            "unknown meta key '{}'",
+                            other
+                        )));
+                    }
+                }
+            }
             "run" => {
                 if parts.len() != 13 {
                     return Err(ControlStateError::Parse(format!(
@@ -918,6 +1135,47 @@ fn decode_control_state(input: &str) -> Result<ControlState, ControlStateError> 
                 };
                 state.artifacts.insert(artifact.id, artifact);
             }
+            "campaign" => {
+                if parts.len() != 8 {
+                    return Err(ControlStateError::Parse(format!(
+                        "invalid campaign record '{}'",
+                        line
+                    )));
+                }
+                let campaign = Campaign {
+                    id: CampaignId::parse(parts[1])?,
+                    name: decode_hex(parts[2])?,
+                    description: decode_hex(parts[3])?,
+                    created_at: parse_u64(parts[4])?,
+                    status: parse_campaign_status(parts[5])?,
+                    objective_ids: parse_objective_ids(parts[6])?,
+                    metadata: decode_metadata_map_opt(parts[7])?,
+                };
+                state.campaigns.insert(campaign.id.clone(), campaign);
+            }
+            "objective" => {
+                if parts.len() != 13 {
+                    return Err(ControlStateError::Parse(format!(
+                        "invalid objective record '{}'",
+                        line
+                    )));
+                }
+                let objective = Objective {
+                    id: ObjectiveId::parse(parts[1])?,
+                    campaign_id: CampaignId::parse(parts[2])?,
+                    name: decode_hex(parts[3])?,
+                    description: decode_hex(parts[4])?,
+                    status: parse_objective_status(parts[5])?,
+                    prerequisites: parse_objective_ids(parts[6])?,
+                    success_criteria: decode_predicates(parts[7])?,
+                    failure_criteria: decode_predicates(parts[8])?,
+                    risk_level: parse_risk_level(parts[9])?,
+                    noise_budget: parse_opt_u32(parts[10])?,
+                    created_at: parse_u64(parts[11])?,
+                    updated_at: parse_u64(parts[12])?,
+                };
+                state.objectives.insert(objective.id.clone(), objective);
+            }
             "txids" => {
                 if parts.len() != 2 {
                     return Err(ControlStateError::Parse(format!(
@@ -938,6 +1196,10 @@ fn decode_control_state(input: &str) -> Result<ControlState, ControlStateError> 
         }
     }
 
+    if is_v2 && !saw_schema_meta {
+        state.schema_version = CONTROL_STATE_SCHEMA_VERSION;
+    }
+    validate_campaign_graph_integrity(&state)?;
     Ok(state)
 }
 
@@ -951,6 +1213,13 @@ fn parse_u32(input: &str) -> Result<u32, ControlStateError> {
     input
         .parse::<u32>()
         .map_err(|_| ControlStateError::Parse(format!("invalid u32 '{}'", input)))
+}
+
+fn parse_opt_u32(input: &str) -> Result<Option<u32>, ControlStateError> {
+    if input == "-" {
+        return Ok(None);
+    }
+    parse_u32(input).map(Some)
 }
 
 fn parse_opt_u64(input: &str) -> Result<Option<u64>, ControlStateError> {
@@ -977,6 +1246,12 @@ fn encode_opt_u64(value: Option<u64>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn encode_opt_u32(value: Option<u32>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn encode_opt_string(value: Option<&str>) -> String {
     value.map(encode_hex).unwrap_or_else(|| "-".to_string())
 }
@@ -986,6 +1261,93 @@ fn decode_opt_string(value: &str) -> Result<Option<String>, ControlStateError> {
         return Ok(None);
     }
     decode_hex(value).map(Some)
+}
+
+fn encode_objective_ids(ids: &[ObjectiveId]) -> String {
+    ids.iter()
+        .map(|id| id.as_str().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_objective_ids(input: &str) -> Result<Vec<ObjectiveId>, ControlStateError> {
+    if input.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    input
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(ObjectiveId::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ControlStateError::from)
+}
+
+fn encode_predicates(predicates: &[Predicate]) -> String {
+    predicates
+        .iter()
+        .map(|predicate| encode_hex_bytes(&predicate.to_wire_bytes()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn decode_predicates(input: &str) -> Result<Vec<Predicate>, ControlStateError> {
+    if input.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    input
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            let bytes = decode_hex_bytes(part)?;
+            Predicate::from_wire_bytes(&bytes).map_err(ControlStateError::from)
+        })
+        .collect()
+}
+
+fn encode_metadata_map_opt(value: Option<&BTreeMap<String, MetadataValue>>) -> String {
+    let Some(map) = value else {
+        return "-".to_string();
+    };
+    let entries = map
+        .iter()
+        .map(|(key, metadata)| {
+            format!(
+                "{}:{}",
+                encode_hex(key),
+                encode_hex_bytes(&metadata.to_wire_bytes())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    encode_hex(&entries)
+}
+
+fn decode_metadata_map_opt(
+    value: &str,
+) -> Result<Option<BTreeMap<String, MetadataValue>>, ControlStateError> {
+    if value == "-" {
+        return Ok(None);
+    }
+    let decoded = decode_hex(value)?;
+    if decoded.trim().is_empty() {
+        return Ok(Some(BTreeMap::new()));
+    }
+    let mut map = BTreeMap::new();
+    for entry in decoded.split(',').filter(|part| !part.trim().is_empty()) {
+        let (raw_key, raw_value) = entry.split_once(':').ok_or_else(|| {
+            ControlStateError::Parse(format!("invalid campaign metadata entry '{}'", entry))
+        })?;
+        let key = decode_hex(raw_key)?;
+        let value_bytes = decode_hex_bytes(raw_value)?;
+        let metadata_value = MetadataValue::from_wire_bytes(&value_bytes)?;
+        if map.insert(key.clone(), metadata_value).is_some() {
+            return Err(ControlStateError::Parse(format!(
+                "duplicate campaign metadata key '{}'",
+                key
+            )));
+        }
+    }
+    Ok(Some(map))
 }
 
 fn encode_hex(input: &str) -> String {
@@ -1012,6 +1374,31 @@ fn decode_hex(input: &str) -> Result<String, ControlStateError> {
     }
     String::from_utf8(bytes)
         .map_err(|_| ControlStateError::Parse("invalid utf-8 in hex".to_string()))
+}
+
+fn encode_hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(nibble_to_hex(byte >> 4));
+        out.push(nibble_to_hex(byte & 0x0f));
+    }
+    out
+}
+
+fn decode_hex_bytes(input: &str) -> Result<Vec<u8>, ControlStateError> {
+    if input.len() % 2 != 0 {
+        return Err(ControlStateError::Parse("invalid hex length".to_string()));
+    }
+    let mut bytes = Vec::with_capacity(input.len() / 2);
+    let data = input.as_bytes();
+    let mut i = 0;
+    while i < data.len() {
+        let hi = hex_to_nibble(data[i])?;
+        let lo = hex_to_nibble(data[i + 1])?;
+        bytes.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(bytes)
 }
 
 fn nibble_to_hex(value: u8) -> char {
@@ -1123,9 +1510,61 @@ fn parse_artifact_kind(kind: &str) -> Result<ArtifactKind, ControlStateError> {
     }
 }
 
+fn campaign_status_to_str(status: CampaignStatus) -> &'static str {
+    status.as_str()
+}
+
+fn parse_campaign_status(status: &str) -> Result<CampaignStatus, ControlStateError> {
+    match status {
+        "active" => Ok(CampaignStatus::Active),
+        "paused" => Ok(CampaignStatus::Paused),
+        "completed" => Ok(CampaignStatus::Completed),
+        "failed" => Ok(CampaignStatus::Failed),
+        _ => Err(ControlStateError::Parse(format!(
+            "invalid campaign status '{}'",
+            status
+        ))),
+    }
+}
+
+fn objective_status_to_str(status: ObjectiveStatus) -> &'static str {
+    status.as_str()
+}
+
+fn parse_objective_status(status: &str) -> Result<ObjectiveStatus, ControlStateError> {
+    match status {
+        "pending" => Ok(ObjectiveStatus::Pending),
+        "eligible" => Ok(ObjectiveStatus::Eligible),
+        "in_progress" => Ok(ObjectiveStatus::InProgress),
+        "achieved" => Ok(ObjectiveStatus::Achieved),
+        "failed" => Ok(ObjectiveStatus::Failed),
+        _ => Err(ControlStateError::Parse(format!(
+            "invalid objective status '{}'",
+            status
+        ))),
+    }
+}
+
+fn risk_level_to_str(level: RiskLevel) -> &'static str {
+    level.as_str()
+}
+
+fn parse_risk_level(level: &str) -> Result<RiskLevel, ControlStateError> {
+    match level {
+        "low" => Ok(RiskLevel::Low),
+        "medium" => Ok(RiskLevel::Medium),
+        "high" => Ok(RiskLevel::High),
+        _ => Err(ControlStateError::Parse(format!(
+            "invalid risk level '{}'",
+            level
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::campaign::SessionPrivilegeLevel;
 
     fn build_run(now: u64) -> Run {
         Run::new_at(
@@ -1321,6 +1760,171 @@ mod tests {
                 .read_artifact(&artifact.locator)
                 .expect("read artifact");
             assert_eq!(bytes, b"id\nuid=0(root)");
+        }
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn campaign_snapshot_round_trip_preserves_state_and_schema_version() {
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_id =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective id");
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "owner".to_string(),
+            MetadataValue::Text("purple-team".to_string()),
+        );
+        metadata.insert("budget".to_string(), MetadataValue::Integer(10));
+
+        let mut campaign = Campaign::new_at(
+            campaign_id.clone(),
+            "operation-rain",
+            "exercise",
+            100,
+            Some(metadata),
+        )
+        .expect("campaign");
+        campaign.add_objective(objective_id.clone());
+
+        let mut objective = Objective::new_at(
+            objective_id,
+            campaign_id,
+            "get root",
+            "escalate session",
+            vec![],
+            vec![Predicate::SessionPrivilege {
+                level: SessionPrivilegeLevel::Root,
+            }],
+            vec![Predicate::FindingExists {
+                finding_type: "detection".to_string(),
+            }],
+            RiskLevel::High,
+            Some(7),
+            100,
+        )
+        .expect("objective");
+        objective.status = ObjectiveStatus::InProgress;
+        objective.updated_at = 120;
+
+        let mut state = ControlState::default();
+        state
+            .campaigns
+            .insert(campaign.id.clone(), campaign.clone());
+        state
+            .objectives
+            .insert(objective.id.clone(), objective.clone());
+        state.schema_version = CONTROL_STATE_SCHEMA_VERSION;
+
+        let encoded = encode_control_state(&state);
+        let decoded = decode_control_state(&encoded).expect("decode");
+        assert_eq!(decoded.schema_version, CONTROL_STATE_SCHEMA_VERSION);
+        assert_eq!(decoded.campaigns.get(&campaign.id), Some(&campaign));
+        assert_eq!(decoded.objectives.get(&objective.id), Some(&objective));
+    }
+
+    #[test]
+    fn campaign_snapshot_transaction_is_atomic_on_validation_failure() {
+        let mut plane = ControlPlane::new(
+            InMemoryTransactionalStateStore::default(),
+            InMemoryArtifactStorage::default(),
+        );
+        let campaign_a =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let campaign_b =
+            CampaignId::parse("9b2f4d6a-3aa4-41ba-91ed-6308a58186a1").expect("campaign id");
+        let objective_id =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective id");
+
+        let campaign = Campaign::new_at(campaign_a, "op", "desc", 1, None).expect("campaign");
+        let objective = Objective::new_at(
+            objective_id,
+            campaign_b,
+            "bad objective",
+            "wrong campaign id",
+            vec![],
+            vec![Predicate::RunSucceeded {
+                module_name: "exploit/linux/example".to_string(),
+            }],
+            vec![],
+            RiskLevel::Low,
+            None,
+            1,
+        )
+        .expect("objective");
+
+        let err = plane
+            .record_campaign_snapshot(campaign, vec![objective], None)
+            .expect_err("transaction should fail");
+        assert!(
+            err.to_string().contains("references missing campaign"),
+            "unexpected error: {err}"
+        );
+
+        let state = plane.state().expect("state");
+        assert!(state.campaigns.is_empty());
+        assert!(state.objectives.is_empty());
+    }
+
+    #[test]
+    fn file_store_recovers_campaign_and_objective_snapshot_after_restart() {
+        let base = std::env::temp_dir().join(format!("moonlight-campaign-state-{}", Id::next().0));
+        let log_path = base.join("control.log");
+
+        let campaign_id =
+            CampaignId::parse("de305d54-75b4-431b-adb2-eb6b9e546014").expect("campaign id");
+        let objective_id =
+            ObjectiveId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("objective id");
+
+        {
+            let mut plane = ControlPlane::new(
+                FileTransactionalStateStore::new(&log_path).expect("state store"),
+                InMemoryArtifactStorage::default(),
+            );
+
+            let mut campaign =
+                Campaign::new_at(campaign_id.clone(), "op", "desc", 10, None).expect("campaign");
+            campaign.add_objective(objective_id.clone());
+            let mut objective = Objective::new_at(
+                objective_id.clone(),
+                campaign_id.clone(),
+                "initial access",
+                "obtain session",
+                vec![],
+                vec![Predicate::FindingExists {
+                    finding_type: "credential".to_string(),
+                }],
+                vec![],
+                RiskLevel::Medium,
+                None,
+                10,
+            )
+            .expect("objective");
+            objective.status = ObjectiveStatus::Eligible;
+            objective.updated_at = 15;
+
+            plane
+                .record_campaign_snapshot(campaign, vec![objective], None)
+                .expect("record snapshot");
+        }
+
+        {
+            let mut recovered = ControlPlane::new(
+                FileTransactionalStateStore::new(&log_path).expect("reload store"),
+                InMemoryArtifactStorage::default(),
+            );
+            let state = recovered.state().expect("state");
+            assert_eq!(state.schema_version, CONTROL_STATE_SCHEMA_VERSION);
+            assert!(state.campaigns.contains_key(&campaign_id));
+            assert!(state.objectives.contains_key(&objective_id));
+            assert_eq!(
+                state
+                    .objectives
+                    .get(&objective_id)
+                    .map(|value| value.status),
+                Some(ObjectiveStatus::Eligible)
+            );
         }
 
         let _ = std::fs::remove_dir_all(base);
