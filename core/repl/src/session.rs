@@ -266,6 +266,7 @@ const COMMAND_HELP: &[CommandHelpSpec] = &[
 impl Repl {
     pub fn new(prompt: String, registry: ModuleRegistry, catalog: Option<ModuleCatalog>) -> Self {
         let module_compat = ModuleCompatibilityPolicy::catalog_default();
+        let release_migration_policy = MigrationPolicy::default_control_plane();
         let release_compat_policy = ReleaseCompatibilityPolicy::new(
             VersionWindow::new(
                 module_compat.min_manifest_version,
@@ -277,13 +278,16 @@ impl Repl {
                 module_compat.max_module_api_version,
             )
             .expect("fixed module API range"),
-            VersionWindow::new(1, 3).expect("fixed control-state range"),
+            VersionWindow::new(
+                release_migration_policy.supported_min_version,
+                release_migration_policy.latest_version,
+            )
+            .expect("fixed control-state range"),
             vec!["human".to_string(), "json".to_string()],
             vec!["builtin".to_string(), "dynlib".to_string()],
         )
         .expect("fixed release compatibility policy");
 
-        let release_migration_policy = MigrationPolicy::default_control_plane();
         let release_state =
             VersionedControlState::new(release_migration_policy.supported_min_version)
                 .expect("default schema version");
@@ -1468,7 +1472,18 @@ impl Repl {
                 self.release_migration_policy.latest_version,
             )
             .is_ok();
-        let rollback_snapshot_ok = self.release_rollback.has_snapshots();
+        let rollback_snapshots = self.release_rollback.list_snapshots();
+        let rollback_snapshot_ok = !rollback_snapshots.is_empty();
+        let rollback_payload_compatibility_ok = rollback_snapshots
+            .first()
+            .map(|snapshot| {
+                VersionedControlState::validate_snapshot_payload_compatibility(
+                    snapshot.schema_version,
+                    &snapshot.payload,
+                )
+                .is_ok()
+            })
+            .unwrap_or(false);
         let docs_usage_ok = docs_report
             .results
             .iter()
@@ -1483,6 +1498,10 @@ impl Repl {
         );
         checklist_status.insert("migration_path".to_string(), migration_path_ok);
         checklist_status.insert("rollback_snapshot".to_string(), rollback_snapshot_ok);
+        checklist_status.insert(
+            "rollback_payload_compatibility".to_string(),
+            rollback_payload_compatibility_ok,
+        );
         checklist_status.insert("documentation_gates".to_string(), docs_report.all_passed);
         checklist_status.insert("usage_notes".to_string(), docs_usage_ok);
 
@@ -1493,7 +1512,11 @@ impl Repl {
                 .with_field("compatibility_ok", matrix_report.tests_passed)
                 .with_field("docs_ok", docs_report.all_passed)
                 .with_field("migration_path_ok", migration_path_ok)
-                .with_field("rollback_snapshot_ok", rollback_snapshot_ok),
+                .with_field("rollback_snapshot_ok", rollback_snapshot_ok)
+                .with_field(
+                    "rollback_payload_compatibility_ok",
+                    rollback_payload_compatibility_ok,
+                ),
         );
 
         if self.output_mode.is_json() || checklist_report.ready {
@@ -1682,7 +1705,12 @@ impl Repl {
                 let snapshot = match self.release_rollback.create_snapshot(
                     &format!("pre-migrate-v{}-to-v{}", from_version, target_version),
                     self.release_state.schema_version,
-                    &self.release_state.snapshot_payload(),
+                    &self
+                        .release_state
+                        .snapshot_payload_with_campaign_objective_state(
+                            self.campaigns.len(),
+                            self.objectives.len(),
+                        ),
                     now_secs(),
                 ) {
                     Ok(snapshot) => snapshot,
@@ -1736,7 +1764,12 @@ impl Repl {
                 match self.release_rollback.create_snapshot(
                     &label,
                     self.release_state.schema_version,
-                    &self.release_state.snapshot_payload(),
+                    &self
+                        .release_state
+                        .snapshot_payload_with_campaign_objective_state(
+                            self.campaigns.len(),
+                            self.objectives.len(),
+                        ),
                     now_secs(),
                 ) {
                     Ok(snapshot) => self.emit_response(
@@ -1846,14 +1879,26 @@ impl Repl {
 
                 match self.release_rollback.restore(snapshot_id) {
                     Ok(restore) => {
-                        self.release_state
-                            .apply_rollback_restore(&restore, now_secs());
-                        self.emit_response(
-                            CommandResponse::ok("release", "rollback restore applied")
-                                .with_field("snapshot_id", restore.snapshot_id)
-                                .with_field("schema_version", restore.schema_version)
-                                .with_field("label", restore.label),
-                        );
+                        match self
+                            .release_state
+                            .apply_rollback_restore(&restore, now_secs())
+                        {
+                            Ok(()) => {
+                                self.emit_response(
+                                    CommandResponse::ok("release", "rollback restore applied")
+                                        .with_field("snapshot_id", restore.snapshot_id)
+                                        .with_field("schema_version", restore.schema_version)
+                                        .with_field("label", restore.label),
+                                );
+                            }
+                            Err(err) => {
+                                self.emit_error(
+                                    "release",
+                                    CliCode::Execution,
+                                    &format!("rollback restore compatibility check failed: {err}"),
+                                );
+                            }
+                        }
                     }
                     Err(err) => self.emit_error("release", CliCode::Execution, &err.to_string()),
                 }

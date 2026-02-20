@@ -93,7 +93,7 @@ impl ReleaseCompatibilityPolicy {
         Self::new(
             VersionWindow::new(1, 1).expect("fixed window"),
             VersionWindow::new(1, 1).expect("fixed window"),
-            VersionWindow::new(1, 4).expect("fixed window"),
+            VersionWindow::new(1, 5).expect("fixed window"),
             vec!["human".to_string(), "json".to_string()],
             vec!["builtin".to_string(), "dynlib".to_string()],
         )
@@ -403,8 +403,17 @@ impl MigrationPolicy {
                 true,
             )
             .expect("valid step"),
+            MigrationStepDefinition::new(
+                4,
+                5,
+                "Add campaign/objective rollback compatibility envelope in control-state snapshots.",
+                MigrationImpact::Compatible,
+                true,
+                true,
+            )
+            .expect("valid step"),
         ];
-        Self::new(1, 4, steps).expect("default migration policy")
+        Self::new(1, 5, steps).expect("default migration policy")
     }
 
     pub fn plan(
@@ -592,7 +601,94 @@ impl VersionedControlState {
         )
     }
 
-    pub fn apply_rollback_restore(&mut self, restore: &RollbackRestore, restored_at: u64) {
+    pub fn snapshot_payload_with_campaign_objective_state(
+        &self,
+        campaign_count: usize,
+        objective_count: usize,
+    ) -> String {
+        let integrity = if self.schema_version >= 5 {
+            "strict"
+        } else {
+            "legacy"
+        };
+        format!(
+            "schema_version={};history_count={};campaign_count={};objective_count={};campaign_objective_integrity={}",
+            self.schema_version,
+            self.migration_history.len(),
+            campaign_count,
+            objective_count,
+            integrity
+        )
+    }
+
+    pub fn validate_snapshot_payload_compatibility(
+        schema_version: u32,
+        payload: &str,
+    ) -> Result<(), ReleaseError> {
+        let fields = parse_snapshot_payload_fields(payload)?;
+        let encoded_schema = fields
+            .get("schema_version")
+            .ok_or_else(|| {
+                ReleaseError::Validation("snapshot payload missing schema_version".to_string())
+            })?
+            .parse::<u32>()
+            .map_err(|_| {
+                ReleaseError::Parse(
+                    "snapshot payload schema_version must be an integer".to_string(),
+                )
+            })?;
+        if encoded_schema != schema_version {
+            return Err(ReleaseError::Validation(format!(
+                "snapshot schema version mismatch: payload={} restore={}",
+                encoded_schema, schema_version
+            )));
+        }
+
+        if let Some(history) = fields.get("history_count") {
+            history.parse::<usize>().map_err(|_| {
+                ReleaseError::Parse("snapshot payload history_count must be an integer".to_string())
+            })?;
+        }
+
+        if schema_version >= 5 {
+            for key in ["campaign_count", "objective_count"] {
+                let value = fields.get(key).ok_or_else(|| {
+                    ReleaseError::Validation(format!(
+                        "snapshot payload missing '{}' required for schema {}",
+                        key, schema_version
+                    ))
+                })?;
+                value.parse::<usize>().map_err(|_| {
+                    ReleaseError::Parse(format!(
+                        "snapshot payload field '{}' must be an integer",
+                        key
+                    ))
+                })?;
+            }
+            let integrity = fields
+                .get("campaign_objective_integrity")
+                .ok_or_else(|| {
+                    ReleaseError::Validation(
+                        "snapshot payload missing campaign_objective_integrity".to_string(),
+                    )
+                })?
+                .to_ascii_lowercase();
+            if integrity != "strict" {
+                return Err(ReleaseError::Validation(
+                    "snapshot payload campaign_objective_integrity must be strict".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn apply_rollback_restore(
+        &mut self,
+        restore: &RollbackRestore,
+        restored_at: u64,
+    ) -> Result<(), ReleaseError> {
+        Self::validate_snapshot_payload_compatibility(restore.schema_version, &restore.payload)?;
         let previous = self.schema_version;
         self.schema_version = restore.schema_version;
         self.migration_history.push(AppliedMigrationRecord {
@@ -605,6 +701,7 @@ impl VersionedControlState {
                 restore.snapshot_id, restore.label
             ),
         });
+        Ok(())
     }
 }
 
@@ -941,6 +1038,12 @@ impl ReleaseChecklistTemplate {
             )
             .expect("item"),
             ReleaseChecklistItem::new(
+                "rollback_payload_compatibility",
+                "Rollback snapshot payload is compatible with target schema semantics.",
+                true,
+            )
+            .expect("item"),
+            ReleaseChecklistItem::new(
                 "documentation_gates",
                 "Operator usage documentation is complete and current.",
                 true,
@@ -1013,6 +1116,41 @@ fn normalize_unique(values: Vec<String>, field_name: &str) -> Result<Vec<String>
 
 fn normalize_token(value: &str) -> String {
     value.trim().to_ascii_lowercase()
+}
+
+fn parse_snapshot_payload_fields(payload: &str) -> Result<BTreeMap<String, String>, ReleaseError> {
+    let mut fields = BTreeMap::new();
+    for segment in payload.split(';') {
+        let trimmed = segment.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_value) = trimmed.split_once('=').ok_or_else(|| {
+            ReleaseError::Parse(format!(
+                "invalid snapshot payload segment '{}': expected key=value",
+                trimmed
+            ))
+        })?;
+        let key = normalize_token(raw_key);
+        if key.is_empty() {
+            return Err(ReleaseError::Parse(
+                "snapshot payload contains empty key".to_string(),
+            ));
+        }
+        if fields.contains_key(&key) {
+            return Err(ReleaseError::Parse(format!(
+                "snapshot payload contains duplicate key '{}'",
+                key
+            )));
+        }
+        fields.insert(key, raw_value.trim().to_string());
+    }
+    if fields.is_empty() {
+        return Err(ReleaseError::Parse(
+            "snapshot payload cannot be empty".to_string(),
+        ));
+    }
+    Ok(fields)
 }
 
 fn normalize_heading(value: &str) -> String {
@@ -1153,6 +1291,12 @@ mod tests {
         assert_eq!(rollback.steps.len(), 2);
         assert!(rollback.requires_backup);
         assert_eq!(rollback.steps[0].direction, MigrationDirection::Rollback);
+
+        let schema5 = policy.plan(4, 5).expect("schema 5 plan");
+        assert_eq!(schema5.steps.len(), 1);
+        assert_eq!(schema5.steps[0].from_version, 4);
+        assert_eq!(schema5.steps[0].to_version, 5);
+        assert!(schema5.requires_backup);
     }
 
     #[test]
@@ -1200,8 +1344,54 @@ mod tests {
             checksum: checksum_fnv1a("schema_version=1"),
         };
 
-        state.apply_rollback_restore(&restore, 123);
+        state
+            .apply_rollback_restore(&restore, 123)
+            .expect("restore");
         assert_eq!(state.schema_version, 1);
+        assert_eq!(state.migration_history().len(), 1);
+        assert_eq!(
+            state.migration_history()[0].direction,
+            MigrationDirection::Rollback
+        );
+    }
+
+    #[test]
+    fn rollback_restore_requires_campaign_objective_envelope_for_schema_five() {
+        let mut state = VersionedControlState::new(5).expect("state");
+        let incompatible_payload = "schema_version=5;history_count=0";
+        let restore = RollbackRestore {
+            snapshot_id: 11,
+            label: "incompatible-v5".to_string(),
+            schema_version: 5,
+            payload: incompatible_payload.to_string(),
+            checksum: checksum_fnv1a(incompatible_payload),
+        };
+
+        let err = state
+            .apply_rollback_restore(&restore, 200)
+            .expect_err("schema five payload should require campaign/objective envelope");
+        assert!(
+            err.to_string().contains("campaign_count"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rollback_restore_accepts_schema_five_campaign_objective_envelope() {
+        let mut state = VersionedControlState::new(5).expect("state");
+        let payload = state.snapshot_payload_with_campaign_objective_state(2, 3);
+        let restore = RollbackRestore {
+            snapshot_id: 12,
+            label: "compatible-v5".to_string(),
+            schema_version: 5,
+            payload: payload.clone(),
+            checksum: checksum_fnv1a(&payload),
+        };
+
+        state
+            .apply_rollback_restore(&restore, 201)
+            .expect("restore");
+        assert_eq!(state.schema_version, 5);
         assert_eq!(state.migration_history().len(), 1);
         assert_eq!(
             state.migration_history()[0].direction,
@@ -1245,6 +1435,7 @@ mod tests {
         status.insert("compatibility_matrix".to_string(), true);
         status.insert("migration_path".to_string(), true);
         status.insert("rollback_snapshot".to_string(), false);
+        status.insert("rollback_payload_compatibility".to_string(), true);
         status.insert("documentation_gates".to_string(), true);
         status.insert("usage_notes".to_string(), true);
 

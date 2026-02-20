@@ -17,7 +17,7 @@ use crate::time::now_secs;
 
 const CONTROL_STATE_HEADER_V1: &str = "moonlight-control-state:v1";
 const CONTROL_STATE_HEADER_V2: &str = "moonlight-control-state:v2";
-const CONTROL_STATE_SCHEMA_VERSION: u32 = 4;
+const CONTROL_STATE_SCHEMA_VERSION: u32 = 5;
 const CONTROL_COMMIT_LOG_HEADER: &str = "moonlight-control-commit-log:v1";
 
 #[derive(Debug)]
