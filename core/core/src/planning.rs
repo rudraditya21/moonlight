@@ -1156,6 +1156,531 @@ fn artifact_state_token(state: ArtifactState) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphBuildOutput {
+    pub graph: CapabilityGraph,
+    pub graph_signature: String,
+}
+
+pub fn build_capability_graph(
+    snapshot: &NormalizedPlannerSnapshot,
+) -> Result<GraphBuildOutput, PlanningContractError> {
+    let mut graph = CapabilityGraph::new();
+    let mut objective_nodes = BTreeMap::<ObjectiveId, PlanNodeId>::new();
+    let mut capability_nodes = BTreeMap::<String, PlanNodeId>::new();
+    let mut signal_asset_nodes = BTreeMap::<String, PlanNodeId>::new();
+    let mut discovered_asset_nodes = BTreeMap::<String, PlanNodeId>::new();
+
+    for objective in snapshot.objectives() {
+        let node_id = plan_node_id(&[
+            "objective",
+            objective.objective_id.as_str(),
+            objective.status.as_str(),
+        ])?;
+        let label = objective
+            .metadata
+            .get("name")
+            .and_then(metadata_text)
+            .unwrap_or_else(|| objective.objective_id.as_str().to_string());
+        graph.add_node(PlanNode::ObjectiveState(ObjectiveStateNode::new(
+            node_id.clone(),
+            objective.objective_id.clone(),
+            objective.status,
+            &label,
+        )?))?;
+        objective_nodes.insert(objective.objective_id.clone(), node_id);
+    }
+
+    let mut capability_set = BTreeSet::<String>::new();
+    let mut has_module_without_capability = false;
+    for module in snapshot.modules() {
+        if module.required_capabilities.is_empty() {
+            has_module_without_capability = true;
+        }
+        capability_set.extend(module.required_capabilities.iter().cloned());
+    }
+    if has_module_without_capability {
+        capability_set.insert("__no_capability__".to_string());
+    }
+
+    for capability in capability_set {
+        let node_id = plan_node_id(&["capability", &capability, "enabled"])?;
+        graph.add_node(PlanNode::CapabilityState(CapabilityStateNode::new(
+            node_id.clone(),
+            &capability,
+            true,
+        )?))?;
+        capability_nodes.insert(capability, node_id);
+    }
+
+    let mut signal_tokens = BTreeSet::<String>::new();
+    signal_tokens.extend(snapshot.known_artifact_types().iter().cloned());
+    for artifact in snapshot.artifacts() {
+        signal_tokens.insert(artifact.artifact_type.clone());
+        signal_tokens.extend(artifact.tags.iter().cloned());
+    }
+
+    for token in signal_tokens {
+        let node_id = plan_node_id(&["asset", "signal", &token, "expected"])?;
+        graph.add_node(PlanNode::AssetState(AssetStateNode::new(
+            node_id.clone(),
+            &token,
+            "expected",
+        )?))?;
+        signal_asset_nodes.insert(token, node_id);
+    }
+
+    for artifact in snapshot.artifacts() {
+        let node_id = plan_node_id(&["asset", "record", &artifact.artifact_key])?;
+        graph.add_node(PlanNode::AssetState(AssetStateNode::new(
+            node_id.clone(),
+            &artifact.artifact_type,
+            &artifact.state,
+        )?))?;
+        discovered_asset_nodes.insert(artifact.artifact_key.clone(), node_id);
+    }
+
+    for objective in snapshot.objectives() {
+        let to_objective = objective_nodes
+            .get(&objective.objective_id)
+            .expect("objective node exists");
+
+        for prerequisite in &objective.prerequisites {
+            if let Some(from_objective) = objective_nodes.get(prerequisite) {
+                let edge_id = plan_edge_id(&[
+                    "edge",
+                    "state-transition",
+                    prerequisite.as_str(),
+                    objective.objective_id.as_str(),
+                ])?;
+                graph.add_edge(PlanEdge::state_transition(
+                    edge_id,
+                    from_objective.clone(),
+                    to_objective.clone(),
+                    PlanEdgeAttributes::new(
+                        BTreeSet::new(),
+                        0,
+                        RiskLevel::Low,
+                        10_000,
+                        BTreeSet::new(),
+                    )?,
+                )?)?;
+            }
+        }
+    }
+
+    for module in snapshot.modules() {
+        let sources = if module.required_capabilities.is_empty() {
+            vec!["__no_capability__".to_string()]
+        } else {
+            module
+                .required_capabilities
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        for source_capability in &sources {
+            let from_node = match capability_nodes.get(source_capability) {
+                Some(node) => node.clone(),
+                None => continue,
+            };
+
+            for expected_artifact in &module.expected_artifacts {
+                if let Some(to_signal) = signal_asset_nodes.get(expected_artifact) {
+                    let edge_id = plan_edge_id(&[
+                        "edge",
+                        "module",
+                        &module.module_reference,
+                        source_capability,
+                        expected_artifact,
+                    ])?;
+                    graph.add_edge(PlanEdge::module_execution(
+                        edge_id,
+                        from_node.clone(),
+                        to_signal.clone(),
+                        &module.module_reference,
+                        PlanEdgeAttributes::new(
+                            module.required_capabilities.clone(),
+                            module.estimated_noise_cost,
+                            module.estimated_risk,
+                            module.probability_of_success_bps,
+                            module.expected_artifacts.clone(),
+                        )?,
+                    )?)?;
+                }
+            }
+
+            for objective in snapshot.objectives() {
+                if !objective_uses_module(objective, &module.module_reference) {
+                    continue;
+                }
+                let objective_node = objective_nodes
+                    .get(&objective.objective_id)
+                    .expect("objective node exists");
+                let edge_id = plan_edge_id(&[
+                    "edge",
+                    "module-to-objective",
+                    &module.module_reference,
+                    source_capability,
+                    objective.objective_id.as_str(),
+                ])?;
+                graph.add_edge(PlanEdge::module_execution(
+                    edge_id,
+                    from_node.clone(),
+                    objective_node.clone(),
+                    &module.module_reference,
+                    PlanEdgeAttributes::new(
+                        module.required_capabilities.clone(),
+                        module.estimated_noise_cost,
+                        module.estimated_risk,
+                        module.probability_of_success_bps,
+                        module.expected_artifacts.clone(),
+                    )?,
+                )?)?;
+            }
+        }
+    }
+
+    let mut discovered_by_type = BTreeMap::<String, Vec<PlanNodeId>>::new();
+    for artifact in snapshot.artifacts() {
+        if let Some(node_id) = discovered_asset_nodes.get(&artifact.artifact_key) {
+            discovered_by_type
+                .entry(artifact.artifact_type.clone())
+                .or_default()
+                .push(node_id.clone());
+        }
+    }
+    for nodes in discovered_by_type.values_mut() {
+        nodes.sort_by_key(|id| id.as_str().to_string());
+        for pair in nodes.windows(2) {
+            let edge_id = plan_edge_id(&["edge", "lateral", pair[0].as_str(), pair[1].as_str()])?;
+            graph.add_edge(PlanEdge::lateral_movement(
+                edge_id,
+                pair[0].clone(),
+                pair[1].clone(),
+                PlanEdgeAttributes::new(
+                    BTreeSet::new(),
+                    1,
+                    RiskLevel::Medium,
+                    7_000,
+                    BTreeSet::new(),
+                )?,
+            )?)?;
+        }
+    }
+
+    maybe_add_privilege_escalation_edges(&capability_nodes, &mut graph)?;
+
+    let graph_signature = encode_graph_signature(&graph);
+    Ok(GraphBuildOutput {
+        graph,
+        graph_signature,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum GraphRebuildTrigger {
+    FullBuild,
+    ModulesChanged,
+    ObjectivesChanged,
+    ArtifactsChanged,
+    MetadataChanged,
+}
+
+impl GraphRebuildTrigger {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            GraphRebuildTrigger::FullBuild => "full_build",
+            GraphRebuildTrigger::ModulesChanged => "modules_changed",
+            GraphRebuildTrigger::ObjectivesChanged => "objectives_changed",
+            GraphRebuildTrigger::ArtifactsChanged => "artifacts_changed",
+            GraphRebuildTrigger::MetadataChanged => "metadata_changed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphRebuildPlan {
+    pub triggers: Vec<GraphRebuildTrigger>,
+    pub added_modules: Vec<String>,
+    pub removed_modules: Vec<String>,
+    pub changed_modules: Vec<String>,
+    pub added_objectives: Vec<ObjectiveId>,
+    pub removed_objectives: Vec<ObjectiveId>,
+    pub changed_objectives: Vec<ObjectiveId>,
+    pub added_artifacts: Vec<String>,
+    pub removed_artifacts: Vec<String>,
+    pub changed_artifacts: Vec<String>,
+}
+
+impl GraphRebuildPlan {
+    pub fn requires_rebuild(&self) -> bool {
+        !self.triggers.is_empty()
+    }
+}
+
+pub fn plan_graph_rebuild(
+    previous: Option<&NormalizedPlannerSnapshot>,
+    next: &NormalizedPlannerSnapshot,
+) -> GraphRebuildPlan {
+    match previous {
+        None => GraphRebuildPlan {
+            triggers: vec![GraphRebuildTrigger::FullBuild],
+            added_modules: next
+                .modules()
+                .iter()
+                .map(|module| module.module_reference.clone())
+                .collect(),
+            removed_modules: Vec::new(),
+            changed_modules: Vec::new(),
+            added_objectives: next
+                .objectives()
+                .iter()
+                .map(|objective| objective.objective_id.clone())
+                .collect(),
+            removed_objectives: Vec::new(),
+            changed_objectives: Vec::new(),
+            added_artifacts: next
+                .artifacts()
+                .iter()
+                .map(|artifact| artifact.artifact_key.clone())
+                .collect(),
+            removed_artifacts: Vec::new(),
+            changed_artifacts: Vec::new(),
+        },
+        Some(previous) => {
+            let (added_modules, removed_modules, changed_modules) =
+                diff_modules(previous.modules(), next.modules());
+            let (added_objectives, removed_objectives, changed_objectives) =
+                diff_objectives(previous.objectives(), next.objectives());
+            let (added_artifacts, removed_artifacts, changed_artifacts) =
+                diff_artifacts(previous.artifacts(), next.artifacts());
+
+            let mut triggers = BTreeSet::new();
+            if !added_modules.is_empty()
+                || !removed_modules.is_empty()
+                || !changed_modules.is_empty()
+            {
+                triggers.insert(GraphRebuildTrigger::ModulesChanged);
+            }
+            if !added_objectives.is_empty()
+                || !removed_objectives.is_empty()
+                || !changed_objectives.is_empty()
+            {
+                triggers.insert(GraphRebuildTrigger::ObjectivesChanged);
+            }
+            if !added_artifacts.is_empty()
+                || !removed_artifacts.is_empty()
+                || !changed_artifacts.is_empty()
+            {
+                triggers.insert(GraphRebuildTrigger::ArtifactsChanged);
+            }
+            if previous.metadata() != next.metadata() {
+                triggers.insert(GraphRebuildTrigger::MetadataChanged);
+            }
+
+            GraphRebuildPlan {
+                triggers: triggers.into_iter().collect(),
+                added_modules,
+                removed_modules,
+                changed_modules,
+                added_objectives,
+                removed_objectives,
+                changed_objectives,
+                added_artifacts,
+                removed_artifacts,
+                changed_artifacts,
+            }
+        }
+    }
+}
+
+fn maybe_add_privilege_escalation_edges(
+    capability_nodes: &BTreeMap<String, PlanNodeId>,
+    graph: &mut CapabilityGraph,
+) -> Result<(), PlanningContractError> {
+    let Some(user_node) = capability_nodes.get("user") else {
+        return Ok(());
+    };
+    let Some(elevated_node) = capability_nodes.get("elevated") else {
+        return Ok(());
+    };
+    let Some(root_node) = capability_nodes.get("root") else {
+        return Ok(());
+    };
+
+    graph.add_edge(PlanEdge::privilege_escalation(
+        plan_edge_id(&["edge", "privesc", "user", "elevated"])?,
+        user_node.clone(),
+        elevated_node.clone(),
+        PlanEdgeAttributes::new(BTreeSet::new(), 5, RiskLevel::High, 6_000, BTreeSet::new())?,
+    )?)?;
+    graph.add_edge(PlanEdge::privilege_escalation(
+        plan_edge_id(&["edge", "privesc", "elevated", "root"])?,
+        elevated_node.clone(),
+        root_node.clone(),
+        PlanEdgeAttributes::new(BTreeSet::new(), 8, RiskLevel::High, 5_000, BTreeSet::new())?,
+    )?)?;
+    Ok(())
+}
+
+fn objective_uses_module(objective: &ObjectiveDefinitionInput, module_reference: &str) -> bool {
+    let module_reference = normalize_token(module_reference);
+    objective
+        .success_criteria
+        .iter()
+        .chain(objective.failure_criteria.iter())
+        .any(|predicate| {
+            matches!(
+                predicate,
+                Predicate::RunSucceeded { module_name } if normalize_token(module_name) == module_reference
+            )
+        })
+}
+
+fn diff_modules(
+    previous: &[RegisteredModuleInput],
+    next: &[RegisteredModuleInput],
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let prev = previous
+        .iter()
+        .map(|module| (module.module_reference.clone(), module))
+        .collect::<BTreeMap<_, _>>();
+    let cur = next
+        .iter()
+        .map(|module| (module.module_reference.clone(), module))
+        .collect::<BTreeMap<_, _>>();
+    diff_by_key(&prev, &cur)
+}
+
+fn diff_objectives(
+    previous: &[ObjectiveDefinitionInput],
+    next: &[ObjectiveDefinitionInput],
+) -> (Vec<ObjectiveId>, Vec<ObjectiveId>, Vec<ObjectiveId>) {
+    let prev = previous
+        .iter()
+        .map(|objective| (objective.objective_id.clone(), objective))
+        .collect::<BTreeMap<_, _>>();
+    let cur = next
+        .iter()
+        .map(|objective| (objective.objective_id.clone(), objective))
+        .collect::<BTreeMap<_, _>>();
+    diff_by_key(&prev, &cur)
+}
+
+fn diff_artifacts(
+    previous: &[DiscoveredArtifactInput],
+    next: &[DiscoveredArtifactInput],
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let prev = previous
+        .iter()
+        .map(|artifact| (artifact.artifact_key.clone(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    let cur = next
+        .iter()
+        .map(|artifact| (artifact.artifact_key.clone(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    diff_by_key(&prev, &cur)
+}
+
+fn diff_by_key<K, V>(previous: &BTreeMap<K, &V>, next: &BTreeMap<K, &V>) -> (Vec<K>, Vec<K>, Vec<K>)
+where
+    K: Ord + Clone,
+    V: PartialEq + ?Sized,
+{
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut changed = Vec::new();
+
+    for key in previous.keys() {
+        if !next.contains_key(key) {
+            removed.push(key.clone());
+        }
+    }
+    for (key, value) in next {
+        match previous.get(key) {
+            None => added.push(key.clone()),
+            Some(previous_value) if *previous_value != *value => changed.push(key.clone()),
+            Some(_) => {}
+        }
+    }
+    (added, removed, changed)
+}
+
+fn plan_node_id(parts: &[&str]) -> Result<PlanNodeId, PlanningContractError> {
+    PlanNodeId::parse(
+        &parts
+            .iter()
+            .map(|part| identifier_fragment(part))
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+fn plan_edge_id(parts: &[&str]) -> Result<PlanEdgeId, PlanningContractError> {
+    PlanEdgeId::parse(
+        &parts
+            .iter()
+            .map(|part| identifier_fragment(part))
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+fn identifier_fragment(input: &str) -> String {
+    let mut out = String::new();
+    let mut previous_dash = false;
+    for ch in normalize_token(input).chars() {
+        let valid = ch.is_ascii_lowercase()
+            || ch.is_ascii_digit()
+            || matches!(ch, '.' | '_' | ':' | '/' | '-');
+        let mapped = if valid { ch } else { '-' };
+        if mapped == '-' {
+            if previous_dash {
+                continue;
+            }
+            previous_dash = true;
+        } else {
+            previous_dash = false;
+        }
+        out.push(mapped);
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn metadata_text(value: &MetadataValue) -> Option<String> {
+    match value {
+        MetadataValue::Text(text) => Some(text.trim().to_string()),
+        _ => None,
+    }
+}
+
+fn encode_graph_signature(graph: &CapabilityGraph) -> String {
+    let node_signature = graph
+        .nodes()
+        .iter()
+        .map(|(node_id, node)| format!("{}:{}", node_id.as_str(), node.node_type().as_str()))
+        .collect::<Vec<_>>()
+        .join(";");
+    let edge_signature = graph
+        .edges()
+        .iter()
+        .map(|(edge_id, edge)| {
+            format!(
+                "{}:{}:{}:{}:{}",
+                edge_id.as_str(),
+                edge.edge_type().as_str(),
+                edge.from().as_str(),
+                edge.to().as_str(),
+                edge.module_reference().unwrap_or("-")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    format!("nodes={node_signature}|edges={edge_signature}")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlanLifecycleStatus {
     Requested,
@@ -2302,5 +2827,235 @@ mod tests {
         assert_eq!(artifact_input.artifact_type, "structured_json");
         assert_eq!(artifact_input.state, "pending");
         assert!(artifact_input.metadata.contains_key("locator"));
+    }
+
+    #[test]
+    fn graph_builder_is_idempotent_and_deterministic() {
+        let modules = vec![
+            RegisteredModuleInput::new(
+                "exploit/linux/telnet/path-a",
+                BTreeSet::from(["exploit_execution".to_string(), "user".to_string()]),
+                8,
+                RiskLevel::High,
+                6_000,
+                BTreeSet::from(["shell_access".to_string()]),
+                BTreeMap::new(),
+            )
+            .expect("module a"),
+            RegisteredModuleInput::new(
+                "auxiliary/scan/path-b",
+                BTreeSet::new(),
+                2,
+                RiskLevel::Low,
+                9_000,
+                BTreeSet::from(["service_banner".to_string()]),
+                BTreeMap::new(),
+            )
+            .expect("module b"),
+        ];
+        let objectives = vec![ObjectiveDefinitionInput::new(
+            parse_objective_id("55555555-5555-5555-5555-555555555555"),
+            parse_campaign_id("66666666-6666-6666-6666-666666666666"),
+            ObjectiveStatus::Pending,
+            vec![],
+            vec![
+                Predicate::FindingExists {
+                    finding_type: "shell_access".to_string(),
+                },
+                Predicate::RunSucceeded {
+                    module_name: "exploit/linux/telnet/path-a".to_string(),
+                },
+            ],
+            vec![],
+            RiskLevel::Medium,
+            Some(10),
+            BTreeMap::new(),
+        )
+        .expect("objective")];
+        let artifacts = vec![DiscoveredArtifactInput::new(
+            "artifact:a",
+            "shell_access",
+            "available",
+            BTreeSet::from(["interactive".to_string()]),
+            BTreeMap::new(),
+        )
+        .expect("artifact")];
+        let snapshot = normalize_planner_input(
+            PlannerNormalizationInput::new(modules, objectives, artifacts, BTreeMap::new())
+                .expect("input"),
+        )
+        .expect("normalize");
+
+        let build_a = build_capability_graph(&snapshot).expect("build a");
+        let build_b = build_capability_graph(&snapshot).expect("build b");
+        assert_eq!(build_a.graph, build_b.graph);
+        assert_eq!(build_a.graph_signature, build_b.graph_signature);
+        assert_eq!(
+            build_a
+                .graph
+                .nodes()
+                .keys()
+                .map(|id| id.as_str().to_string())
+                .collect::<Vec<_>>(),
+            build_b
+                .graph
+                .nodes()
+                .keys()
+                .map(|id| id.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            build_a
+                .graph
+                .edges()
+                .keys()
+                .map(|id| id.as_str().to_string())
+                .collect::<Vec<_>>(),
+            build_b
+                .graph
+                .edges()
+                .keys()
+                .map(|id| id.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn graph_rebuild_plan_detects_incremental_changes() {
+        let previous = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![RegisteredModuleInput::new(
+                    "auxiliary/scan/path-a",
+                    BTreeSet::new(),
+                    2,
+                    RiskLevel::Low,
+                    9_000,
+                    BTreeSet::from(["service_banner".to_string()]),
+                    BTreeMap::new(),
+                )
+                .expect("module")],
+                vec![ObjectiveDefinitionInput::new(
+                    parse_objective_id("77777777-7777-7777-7777-777777777777"),
+                    parse_campaign_id("88888888-8888-8888-8888-888888888888"),
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![Predicate::FindingExists {
+                        finding_type: "service_banner".to_string(),
+                    }],
+                    vec![],
+                    RiskLevel::Low,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                vec![DiscoveredArtifactInput::new(
+                    "artifact:one",
+                    "service_banner",
+                    "available",
+                    BTreeSet::new(),
+                    BTreeMap::new(),
+                )
+                .expect("artifact")],
+                BTreeMap::from([("operator".to_string(), MetadataValue::Text("a".to_string()))]),
+            )
+            .expect("input"),
+        )
+        .expect("normalize");
+
+        let next = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![RegisteredModuleInput::new(
+                    "auxiliary/scan/path-a",
+                    BTreeSet::new(),
+                    5,
+                    RiskLevel::Medium,
+                    8_000,
+                    BTreeSet::from(["service_banner".to_string(), "host_profile".to_string()]),
+                    BTreeMap::new(),
+                )
+                .expect("module")],
+                vec![ObjectiveDefinitionInput::new(
+                    parse_objective_id("77777777-7777-7777-7777-777777777777"),
+                    parse_campaign_id("88888888-8888-8888-8888-888888888888"),
+                    ObjectiveStatus::InProgress,
+                    vec![],
+                    vec![Predicate::FindingExists {
+                        finding_type: "service_banner".to_string(),
+                    }],
+                    vec![],
+                    RiskLevel::Medium,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                vec![DiscoveredArtifactInput::new(
+                    "artifact:one",
+                    "service_banner",
+                    "expired",
+                    BTreeSet::new(),
+                    BTreeMap::new(),
+                )
+                .expect("artifact")],
+                BTreeMap::from([("operator".to_string(), MetadataValue::Text("b".to_string()))]),
+            )
+            .expect("input"),
+        )
+        .expect("normalize");
+
+        let rebuild = plan_graph_rebuild(Some(&previous), &next);
+        assert!(rebuild.requires_rebuild());
+        assert_eq!(
+            rebuild.triggers,
+            vec![
+                GraphRebuildTrigger::ModulesChanged,
+                GraphRebuildTrigger::ObjectivesChanged,
+                GraphRebuildTrigger::ArtifactsChanged,
+                GraphRebuildTrigger::MetadataChanged
+            ]
+        );
+        assert_eq!(
+            rebuild.changed_modules,
+            vec!["auxiliary/scan/path-a".to_string()]
+        );
+        assert_eq!(
+            rebuild.changed_objectives,
+            vec![parse_objective_id("77777777-7777-7777-7777-777777777777")]
+        );
+        assert_eq!(rebuild.changed_artifacts, vec!["artifact:one".to_string()]);
+    }
+
+    #[test]
+    fn graph_rebuild_plan_reports_full_build_when_no_previous_snapshot() {
+        let snapshot = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![],
+                vec![ObjectiveDefinitionInput::new(
+                    parse_objective_id("99999999-9999-9999-9999-999999999999"),
+                    parse_campaign_id("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![Predicate::FindingExists {
+                        finding_type: "shell_access".to_string(),
+                    }],
+                    vec![],
+                    RiskLevel::Low,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                vec![],
+                BTreeMap::new(),
+            )
+            .expect("input"),
+        )
+        .expect("normalize");
+
+        let rebuild = plan_graph_rebuild(None, &snapshot);
+        assert_eq!(rebuild.triggers, vec![GraphRebuildTrigger::FullBuild]);
+        assert!(rebuild.requires_rebuild());
+        assert_eq!(
+            rebuild.added_objectives,
+            vec![parse_objective_id("99999999-9999-9999-9999-999999999999")]
+        );
     }
 }
