@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::campaign::{ObjectiveId, ObjectiveStatus, RiskLevel};
+use crate::campaign::{
+    CampaignId, MetadataValue, Objective, ObjectiveId, ObjectiveStatus, Predicate, RiskLevel,
+};
+use crate::domain::{Artifact, ArtifactKind, ArtifactState};
 use crate::time::now_secs;
 
 pub const PLANNING_CONTRACT_ID: &str = "ml.planning.contract.v1";
@@ -30,6 +33,19 @@ pub enum PlanningContractError {
     InvariantViolation {
         invariant: &'static str,
     },
+    DuplicateModuleReference {
+        module_reference: String,
+    },
+    DuplicateObjectiveDefinition {
+        objective_id: ObjectiveId,
+    },
+    DuplicateArtifactRecord {
+        artifact_key: String,
+    },
+    MetadataConflict {
+        field: &'static str,
+        key: String,
+    },
 }
 
 impl PlanningContractError {
@@ -41,6 +57,10 @@ impl PlanningContractError {
             PlanningContractError::DuplicateEdge { .. } => "ML-PLAN-0004",
             PlanningContractError::MissingNode { .. } => "ML-PLAN-0005",
             PlanningContractError::InvariantViolation { .. } => "ML-PLAN-0006",
+            PlanningContractError::DuplicateModuleReference { .. } => "ML-PLAN-0007",
+            PlanningContractError::DuplicateObjectiveDefinition { .. } => "ML-PLAN-0008",
+            PlanningContractError::DuplicateArtifactRecord { .. } => "ML-PLAN-0009",
+            PlanningContractError::MetadataConflict { .. } => "ML-PLAN-0010",
         }
     }
 }
@@ -69,6 +89,28 @@ impl fmt::Display for PlanningContractError {
             }
             PlanningContractError::InvariantViolation { invariant } => {
                 write!(f, "planning invariant violated: {invariant}")
+            }
+            PlanningContractError::DuplicateModuleReference { module_reference } => {
+                write!(
+                    f,
+                    "duplicate module reference in planner input: {module_reference}"
+                )
+            }
+            PlanningContractError::DuplicateObjectiveDefinition { objective_id } => {
+                write!(
+                    f,
+                    "duplicate objective definition in planner input: {}",
+                    objective_id.as_str()
+                )
+            }
+            PlanningContractError::DuplicateArtifactRecord { artifact_key } => {
+                write!(
+                    f,
+                    "duplicate artifact record in planner input: {artifact_key}"
+                )
+            }
+            PlanningContractError::MetadataConflict { field, key } => {
+                write!(f, "conflicting metadata key for {field}: {key}")
             }
         }
     }
@@ -612,6 +654,505 @@ impl CapabilityGraph {
 impl Default for CapabilityGraph {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredModuleInput {
+    pub module_reference: String,
+    pub required_capabilities: BTreeSet<String>,
+    pub estimated_noise_cost: u32,
+    pub estimated_risk: RiskLevel,
+    pub probability_of_success_bps: u16,
+    pub expected_artifacts: BTreeSet<String>,
+    pub metadata: BTreeMap<String, MetadataValue>,
+}
+
+impl RegisteredModuleInput {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        module_reference: &str,
+        required_capabilities: BTreeSet<String>,
+        estimated_noise_cost: u32,
+        estimated_risk: RiskLevel,
+        probability_of_success_bps: u16,
+        expected_artifacts: BTreeSet<String>,
+        metadata: BTreeMap<String, MetadataValue>,
+    ) -> Result<Self, PlanningContractError> {
+        ensure_non_empty(module_reference, "planner_input.module_reference")?;
+        if probability_of_success_bps > 10_000 {
+            return Err(PlanningContractError::InvalidField {
+                field: "planner_input.probability_of_success_bps",
+                reason: "must be in 0..=10000",
+            });
+        }
+        Ok(Self {
+            module_reference: normalize_token(module_reference),
+            required_capabilities: normalize_tokens(required_capabilities),
+            estimated_noise_cost,
+            estimated_risk,
+            probability_of_success_bps,
+            expected_artifacts: normalize_tokens(expected_artifacts),
+            metadata: normalize_metadata_map(metadata, "planner_input.module.metadata")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveDefinitionInput {
+    pub objective_id: ObjectiveId,
+    pub campaign_id: CampaignId,
+    pub status: ObjectiveStatus,
+    pub prerequisites: Vec<ObjectiveId>,
+    pub success_criteria: Vec<Predicate>,
+    pub failure_criteria: Vec<Predicate>,
+    pub risk_level: RiskLevel,
+    pub noise_budget: Option<u32>,
+    pub metadata: BTreeMap<String, MetadataValue>,
+}
+
+impl ObjectiveDefinitionInput {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        objective_id: ObjectiveId,
+        campaign_id: CampaignId,
+        status: ObjectiveStatus,
+        prerequisites: Vec<ObjectiveId>,
+        success_criteria: Vec<Predicate>,
+        failure_criteria: Vec<Predicate>,
+        risk_level: RiskLevel,
+        noise_budget: Option<u32>,
+        metadata: BTreeMap<String, MetadataValue>,
+    ) -> Result<Self, PlanningContractError> {
+        if success_criteria.is_empty() {
+            return Err(PlanningContractError::InvalidField {
+                field: "planner_input.objective.success_criteria",
+                reason: "must contain at least one predicate",
+            });
+        }
+        if noise_budget == Some(0) {
+            return Err(PlanningContractError::InvalidField {
+                field: "planner_input.objective.noise_budget",
+                reason: "must be greater than zero when provided",
+            });
+        }
+        let mut prereq_set = BTreeSet::new();
+        for prerequisite in prerequisites {
+            if prerequisite == objective_id {
+                return Err(PlanningContractError::InvalidField {
+                    field: "planner_input.objective.prerequisites",
+                    reason: "cannot include objective id itself",
+                });
+            }
+            prereq_set.insert(prerequisite);
+        }
+        let success_criteria = canonicalize_predicates(success_criteria);
+        let failure_criteria = canonicalize_predicates(failure_criteria);
+        Ok(Self {
+            objective_id,
+            campaign_id,
+            status,
+            prerequisites: prereq_set.into_iter().collect(),
+            success_criteria,
+            failure_criteria,
+            risk_level,
+            noise_budget,
+            metadata: normalize_metadata_map(metadata, "planner_input.objective.metadata")?,
+        })
+    }
+
+    pub fn from_objective(objective: &Objective) -> Result<Self, PlanningContractError> {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "name".to_string(),
+            MetadataValue::Text(objective.name.trim().to_string()),
+        );
+        metadata.insert(
+            "description".to_string(),
+            MetadataValue::Text(objective.description.trim().to_string()),
+        );
+
+        Self::new(
+            objective.id.clone(),
+            objective.campaign_id.clone(),
+            objective.status,
+            objective.prerequisites.clone(),
+            objective.success_criteria.clone(),
+            objective.failure_criteria.clone(),
+            objective.risk_level,
+            objective.noise_budget,
+            metadata,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredArtifactInput {
+    pub artifact_key: String,
+    pub artifact_type: String,
+    pub state: String,
+    pub tags: BTreeSet<String>,
+    pub metadata: BTreeMap<String, MetadataValue>,
+}
+
+impl DiscoveredArtifactInput {
+    pub fn new(
+        artifact_key: &str,
+        artifact_type: &str,
+        state: &str,
+        tags: BTreeSet<String>,
+        metadata: BTreeMap<String, MetadataValue>,
+    ) -> Result<Self, PlanningContractError> {
+        ensure_non_empty(artifact_key, "planner_input.artifact.artifact_key")?;
+        ensure_non_empty(artifact_type, "planner_input.artifact.artifact_type")?;
+        ensure_non_empty(state, "planner_input.artifact.state")?;
+        Ok(Self {
+            artifact_key: normalize_token(artifact_key),
+            artifact_type: normalize_token(artifact_type),
+            state: normalize_token(state),
+            tags: normalize_tokens(tags),
+            metadata: normalize_metadata_map(metadata, "planner_input.artifact.metadata")?,
+        })
+    }
+
+    pub fn from_artifact(artifact: &Artifact) -> Result<Self, PlanningContractError> {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "name".to_string(),
+            MetadataValue::Text(artifact.name.trim().to_string()),
+        );
+        metadata.insert(
+            "locator".to_string(),
+            MetadataValue::Text(artifact.locator.trim().to_string()),
+        );
+        metadata.insert(
+            "run_id".to_string(),
+            MetadataValue::Integer(artifact.run_id.0 .0 as i64),
+        );
+        if let Some(task_id) = artifact.task_id {
+            metadata.insert(
+                "task_id".to_string(),
+                MetadataValue::Integer(task_id.0 .0 as i64),
+            );
+        }
+        if let Some(session_id) = artifact.session_id {
+            metadata.insert(
+                "session_id".to_string(),
+                MetadataValue::Integer(session_id.0 .0 as i64),
+            );
+        }
+
+        Self::new(
+            &format!("artifact:{}", artifact.id.0 .0),
+            artifact_kind_token(artifact.kind),
+            artifact_state_token(artifact.state),
+            BTreeSet::new(),
+            metadata,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerNormalizationInput {
+    pub modules: Vec<RegisteredModuleInput>,
+    pub objectives: Vec<ObjectiveDefinitionInput>,
+    pub artifacts: Vec<DiscoveredArtifactInput>,
+    pub metadata: BTreeMap<String, MetadataValue>,
+}
+
+impl PlannerNormalizationInput {
+    pub fn new(
+        modules: Vec<RegisteredModuleInput>,
+        objectives: Vec<ObjectiveDefinitionInput>,
+        artifacts: Vec<DiscoveredArtifactInput>,
+        metadata: BTreeMap<String, MetadataValue>,
+    ) -> Result<Self, PlanningContractError> {
+        Ok(Self {
+            modules,
+            objectives,
+            artifacts,
+            metadata: normalize_metadata_map(metadata, "planner_input.metadata")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedPlannerSnapshot {
+    modules: Vec<RegisteredModuleInput>,
+    objectives: Vec<ObjectiveDefinitionInput>,
+    artifacts: Vec<DiscoveredArtifactInput>,
+    known_artifact_types: Vec<String>,
+    metadata: BTreeMap<String, MetadataValue>,
+    canonical_signature: String,
+}
+
+impl NormalizedPlannerSnapshot {
+    pub fn modules(&self) -> &[RegisteredModuleInput] {
+        &self.modules
+    }
+
+    pub fn objectives(&self) -> &[ObjectiveDefinitionInput] {
+        &self.objectives
+    }
+
+    pub fn artifacts(&self) -> &[DiscoveredArtifactInput] {
+        &self.artifacts
+    }
+
+    pub fn known_artifact_types(&self) -> &[String] {
+        &self.known_artifact_types
+    }
+
+    pub fn metadata(&self) -> &BTreeMap<String, MetadataValue> {
+        &self.metadata
+    }
+
+    pub fn canonical_signature(&self) -> &str {
+        &self.canonical_signature
+    }
+}
+
+pub fn normalize_planner_input(
+    input: PlannerNormalizationInput,
+) -> Result<NormalizedPlannerSnapshot, PlanningContractError> {
+    let modules = normalize_modules(input.modules)?;
+    let objectives = normalize_objectives(input.objectives)?;
+    let artifacts = normalize_artifacts(input.artifacts)?;
+    let metadata = normalize_metadata_map(input.metadata, "planner_input.metadata")?;
+
+    let mut known_artifact_types = BTreeSet::new();
+    for module in &modules {
+        known_artifact_types.extend(module.expected_artifacts.iter().cloned());
+    }
+    for artifact in &artifacts {
+        known_artifact_types.insert(artifact.artifact_type.clone());
+    }
+
+    let known_artifact_types = known_artifact_types.into_iter().collect::<Vec<_>>();
+    let canonical_signature = encode_normalized_snapshot(
+        &modules,
+        &objectives,
+        &artifacts,
+        &known_artifact_types,
+        &metadata,
+    );
+
+    Ok(NormalizedPlannerSnapshot {
+        modules,
+        objectives,
+        artifacts,
+        known_artifact_types,
+        metadata,
+        canonical_signature,
+    })
+}
+
+fn normalize_modules(
+    modules: Vec<RegisteredModuleInput>,
+) -> Result<Vec<RegisteredModuleInput>, PlanningContractError> {
+    let mut by_module = BTreeMap::<String, RegisteredModuleInput>::new();
+    for module in modules {
+        let key = normalize_token(&module.module_reference);
+        if by_module.contains_key(&key) {
+            return Err(PlanningContractError::DuplicateModuleReference {
+                module_reference: key,
+            });
+        }
+        by_module.insert(key, module);
+    }
+    Ok(by_module.into_values().collect())
+}
+
+fn normalize_objectives(
+    objectives: Vec<ObjectiveDefinitionInput>,
+) -> Result<Vec<ObjectiveDefinitionInput>, PlanningContractError> {
+    let mut by_objective = BTreeMap::<ObjectiveId, ObjectiveDefinitionInput>::new();
+    for objective in objectives {
+        let key = objective.objective_id.clone();
+        if by_objective.contains_key(&key) {
+            return Err(PlanningContractError::DuplicateObjectiveDefinition { objective_id: key });
+        }
+        by_objective.insert(key, objective);
+    }
+    Ok(by_objective.into_values().collect())
+}
+
+fn normalize_artifacts(
+    artifacts: Vec<DiscoveredArtifactInput>,
+) -> Result<Vec<DiscoveredArtifactInput>, PlanningContractError> {
+    let mut by_artifact = BTreeMap::<String, DiscoveredArtifactInput>::new();
+    for artifact in artifacts {
+        let key = normalize_token(&artifact.artifact_key);
+        if by_artifact.contains_key(&key) {
+            return Err(PlanningContractError::DuplicateArtifactRecord { artifact_key: key });
+        }
+        by_artifact.insert(key, artifact);
+    }
+    Ok(by_artifact.into_values().collect())
+}
+
+fn canonicalize_predicates(mut predicates: Vec<Predicate>) -> Vec<Predicate> {
+    predicates.sort_by_key(|predicate| predicate.stable_encoding());
+    predicates.dedup_by(|left, right| left.stable_encoding() == right.stable_encoding());
+    predicates
+}
+
+fn normalize_metadata_map(
+    metadata: BTreeMap<String, MetadataValue>,
+    field: &'static str,
+) -> Result<BTreeMap<String, MetadataValue>, PlanningContractError> {
+    let mut out = BTreeMap::new();
+    for (key, value) in metadata {
+        let normalized_key = normalize_token(&key);
+        if normalized_key.is_empty() {
+            return Err(PlanningContractError::InvalidField {
+                field,
+                reason: "metadata keys must not be empty",
+            });
+        }
+        if let Some(existing) = out.get(&normalized_key) {
+            if existing != &value {
+                return Err(PlanningContractError::MetadataConflict {
+                    field,
+                    key: normalized_key,
+                });
+            }
+            continue;
+        }
+        out.insert(normalized_key, value);
+    }
+    Ok(out)
+}
+
+fn encode_normalized_snapshot(
+    modules: &[RegisteredModuleInput],
+    objectives: &[ObjectiveDefinitionInput],
+    artifacts: &[DiscoveredArtifactInput],
+    known_artifact_types: &[String],
+    metadata: &BTreeMap<String, MetadataValue>,
+) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!("schema={PLANNING_SCHEMA_VERSION}"));
+    parts.push(
+        "modules=".to_string()
+            + &modules
+                .iter()
+                .map(encode_module)
+                .collect::<Vec<_>>()
+                .join(";"),
+    );
+    parts.push(
+        "objectives=".to_string()
+            + &objectives
+                .iter()
+                .map(encode_objective)
+                .collect::<Vec<_>>()
+                .join(";"),
+    );
+    parts.push(
+        "artifacts=".to_string()
+            + &artifacts
+                .iter()
+                .map(encode_artifact)
+                .collect::<Vec<_>>()
+                .join(";"),
+    );
+    parts.push(format!(
+        "known_artifact_types={}",
+        known_artifact_types.join(",")
+    ));
+    parts.push(format!("metadata={}", encode_metadata(metadata)));
+    parts.join("|")
+}
+
+fn encode_module(module: &RegisteredModuleInput) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        module.module_reference,
+        join_set(&module.required_capabilities),
+        module.estimated_noise_cost,
+        module.estimated_risk.as_str(),
+        module.probability_of_success_bps,
+        join_set(&module.expected_artifacts),
+        encode_metadata(&module.metadata),
+    )
+}
+
+fn encode_objective(objective: &ObjectiveDefinitionInput) -> String {
+    let prerequisites = objective
+        .prerequisites
+        .iter()
+        .map(|id| id.as_str().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let success = objective
+        .success_criteria
+        .iter()
+        .map(|predicate| predicate.stable_encoding())
+        .collect::<Vec<_>>()
+        .join(",");
+    let failure = objective
+        .failure_criteria
+        .iter()
+        .map(|predicate| predicate.stable_encoding())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        objective.objective_id.as_str(),
+        objective.campaign_id.as_str(),
+        objective.status.as_str(),
+        prerequisites,
+        success,
+        failure,
+        objective.risk_level.as_str(),
+        objective
+            .noise_budget
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        encode_metadata(&objective.metadata),
+    )
+}
+
+fn encode_artifact(artifact: &DiscoveredArtifactInput) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        artifact.artifact_key,
+        artifact.artifact_type,
+        artifact.state,
+        join_set(&artifact.tags),
+        encode_metadata(&artifact.metadata),
+    )
+}
+
+fn join_set(values: &BTreeSet<String>) -> String {
+    values.iter().cloned().collect::<Vec<_>>().join(",")
+}
+
+fn encode_metadata(metadata: &BTreeMap<String, MetadataValue>) -> String {
+    metadata
+        .iter()
+        .map(|(key, value)| format!("{key}={}", value.stable_encoding()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn artifact_kind_token(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::Transcript => "transcript",
+        ArtifactKind::CommandOutput => "command_output",
+        ArtifactKind::StructuredJson => "structured_json",
+        ArtifactKind::BinaryBlob => "binary_blob",
+        ArtifactKind::FileReference => "file_reference",
+    }
+}
+
+fn artifact_state_token(state: ArtifactState) -> &'static str {
+    match state {
+        ArtifactState::Pending => "pending",
+        ArtifactState::Available => "available",
+        ArtifactState::Expired => "expired",
+        ArtifactState::Deleted => "deleted",
     }
 }
 
@@ -1353,6 +1894,10 @@ mod tests {
         ObjectiveId::parse(seed).expect("objective id")
     }
 
+    fn parse_campaign_id(seed: &str) -> CampaignId {
+        CampaignId::parse(seed).expect("campaign id")
+    }
+
     fn parse_node_id(seed: &str) -> PlanNodeId {
         PlanNodeId::parse(seed).expect("node id")
     }
@@ -1600,5 +2145,162 @@ mod tests {
         )
         .expect_err("empty event key");
         assert_eq!(err.code(), "ML-PLAN-0001");
+    }
+
+    #[test]
+    fn normalization_rejects_duplicate_module_references() {
+        let module_a = RegisteredModuleInput::new(
+            "exploit/linux/example",
+            BTreeSet::new(),
+            10,
+            RiskLevel::Low,
+            5_000,
+            BTreeSet::new(),
+            BTreeMap::new(),
+        )
+        .expect("module a");
+        let module_b = RegisteredModuleInput::new(
+            " Exploit/Linux/Example ",
+            BTreeSet::new(),
+            5,
+            RiskLevel::Medium,
+            6_000,
+            BTreeSet::new(),
+            BTreeMap::new(),
+        )
+        .expect("module b");
+
+        let input = PlannerNormalizationInput::new(
+            vec![module_a, module_b],
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("input");
+        let err = normalize_planner_input(input).expect_err("duplicate module ref should fail");
+        assert_eq!(err.code(), "ML-PLAN-0007");
+    }
+
+    #[test]
+    fn normalization_is_deterministic_across_input_order() {
+        let module_a = RegisteredModuleInput::new(
+            "auxiliary/scan/one",
+            BTreeSet::from(["cap_scan".to_string()]),
+            2,
+            RiskLevel::Low,
+            8_500,
+            BTreeSet::from(["service_banner".to_string()]),
+            BTreeMap::new(),
+        )
+        .expect("module a");
+        let module_b = RegisteredModuleInput::new(
+            "exploit/linux/two",
+            BTreeSet::from(["exploit_execution".to_string()]),
+            9,
+            RiskLevel::High,
+            4_500,
+            BTreeSet::from(["shell_access".to_string()]),
+            BTreeMap::new(),
+        )
+        .expect("module b");
+
+        let objective = ObjectiveDefinitionInput::new(
+            parse_objective_id("11111111-1111-1111-1111-111111111111"),
+            parse_campaign_id("22222222-2222-2222-2222-222222222222"),
+            ObjectiveStatus::Pending,
+            vec![],
+            vec![Predicate::FindingExists {
+                finding_type: "shell_access".to_string(),
+            }],
+            vec![],
+            RiskLevel::Medium,
+            Some(5),
+            BTreeMap::new(),
+        )
+        .expect("objective");
+
+        let artifact = DiscoveredArtifactInput::new(
+            "artifact:1",
+            "shell_access",
+            "available",
+            BTreeSet::from(["interactive".to_string()]),
+            BTreeMap::new(),
+        )
+        .expect("artifact");
+
+        let snapshot_a = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![module_a.clone(), module_b.clone()],
+                vec![objective.clone()],
+                vec![artifact.clone()],
+                BTreeMap::from([(
+                    "Operator".to_string(),
+                    MetadataValue::Text("red".to_string()),
+                )]),
+            )
+            .expect("input a"),
+        )
+        .expect("normalize a");
+
+        let snapshot_b = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![module_b, module_a],
+                vec![objective],
+                vec![artifact],
+                BTreeMap::from([(
+                    "operator".to_string(),
+                    MetadataValue::Text("red".to_string()),
+                )]),
+            )
+            .expect("input b"),
+        )
+        .expect("normalize b");
+
+        assert_eq!(snapshot_a, snapshot_b);
+        assert_eq!(
+            snapshot_a.canonical_signature(),
+            snapshot_b.canonical_signature()
+        );
+    }
+
+    #[test]
+    fn normalization_adapter_from_domain_entities_is_stable() {
+        let objective = Objective::new_at(
+            parse_objective_id("33333333-3333-3333-3333-333333333333"),
+            parse_campaign_id("44444444-4444-4444-4444-444444444444"),
+            "Foothold",
+            "Gain shell",
+            vec![],
+            vec![Predicate::ArtifactTagMatch {
+                tag: "shell_access".to_string(),
+            }],
+            vec![],
+            RiskLevel::High,
+            Some(20),
+            10,
+        )
+        .expect("objective");
+        let objective_input =
+            ObjectiveDefinitionInput::from_objective(&objective).expect("objective input");
+        assert_eq!(
+            objective_input.metadata.get("name"),
+            Some(&MetadataValue::Text("Foothold".to_string()))
+        );
+
+        let artifact = Artifact::new_at(
+            crate::domain::RunId::next(),
+            None,
+            None,
+            ArtifactKind::StructuredJson,
+            "result",
+            "memory://result",
+            11,
+        )
+        .expect("artifact");
+        let artifact_input =
+            DiscoveredArtifactInput::from_artifact(&artifact).expect("artifact input");
+        assert_eq!(artifact_input.artifact_type, "structured_json");
+        assert_eq!(artifact_input.state, "pending");
+        assert!(artifact_input.metadata.contains_key("locator"));
     }
 }
