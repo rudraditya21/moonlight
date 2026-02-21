@@ -6,7 +6,7 @@ use std::fmt;
 use crate::campaign::{
     CampaignId, MetadataValue, Objective, ObjectiveId, ObjectiveStatus, Predicate, RiskLevel,
 };
-use crate::domain::{Artifact, ArtifactKind, ArtifactState};
+use crate::domain::{Artifact, ArtifactKind, ArtifactState, CorrelationId};
 use crate::time::now_secs;
 
 pub const PLANNING_CONTRACT_ID: &str = "ml.planning.contract.v1";
@@ -2734,6 +2734,7 @@ pub struct PlannerEngineOutput {
     pub result: PlanResult,
     pub explanation: Option<PlanExplanation>,
     pub simulation: Option<PlanSimulation>,
+    pub event_payloads: Vec<PlanningEventPayload>,
 }
 
 pub fn execute_planner_pipeline(
@@ -2759,23 +2760,31 @@ fn execute_planner_pipeline_with_forbidden_edges(
     let path =
         astar_plan_with_forbidden_edges(&graph_output.graph, &astar_request, forbidden_edges)?;
     let Some(path) = path else {
+        let result = PlanResult::new(
+            request.objective_id.clone(),
+            PlanLifecycleStatus::Unreachable,
+            PlanningAlgorithm::AStar,
+            context.generated_at,
+            0,
+            0,
+            BTreeSet::new(),
+            0,
+            BTreeSet::new(),
+            Some(PlanUnreachableReason::NoGraphPath),
+            Vec::new(),
+        )?;
         return Ok(PlannerEngineOutput {
             graph_signature: graph_output.graph_signature,
-            result: PlanResult::new(
-                request.objective_id.clone(),
-                PlanLifecycleStatus::Unreachable,
-                PlanningAlgorithm::AStar,
-                context.generated_at,
-                0,
-                0,
-                BTreeSet::new(),
-                0,
-                BTreeSet::new(),
-                Some(PlanUnreachableReason::NoGraphPath),
-                Vec::new(),
-            )?,
+            result: result.clone(),
             explanation: None,
             simulation: None,
+            event_payloads: build_planning_event_payloads(
+                request,
+                &graph_output.graph,
+                &result,
+                None,
+                None,
+            ),
         });
     };
 
@@ -2783,23 +2792,31 @@ fn execute_planner_pipeline_with_forbidden_edges(
         .max_steps
         .is_some_and(|max_steps| path.traversed_edges.len() as u16 > max_steps)
     {
+        let result = PlanResult::new(
+            request.objective_id.clone(),
+            PlanLifecycleStatus::Unreachable,
+            PlanningAlgorithm::AStar,
+            context.generated_at,
+            0,
+            0,
+            BTreeSet::new(),
+            0,
+            BTreeSet::new(),
+            Some(PlanUnreachableReason::StepLimitExceeded),
+            Vec::new(),
+        )?;
         return Ok(PlannerEngineOutput {
             graph_signature: graph_output.graph_signature,
-            result: PlanResult::new(
-                request.objective_id.clone(),
-                PlanLifecycleStatus::Unreachable,
-                PlanningAlgorithm::AStar,
-                context.generated_at,
-                0,
-                0,
-                BTreeSet::new(),
-                0,
-                BTreeSet::new(),
-                Some(PlanUnreachableReason::StepLimitExceeded),
-                Vec::new(),
-            )?,
+            result: result.clone(),
             explanation: None,
             simulation: None,
+            event_payloads: build_planning_event_payloads(
+                request,
+                &graph_output.graph,
+                &result,
+                None,
+                None,
+            ),
         });
     }
 
@@ -2904,11 +2921,20 @@ fn execute_planner_pipeline_with_forbidden_edges(
         None
     };
 
+    let event_payloads = build_planning_event_payloads(
+        request,
+        &graph_output.graph,
+        &result,
+        explanation.as_ref(),
+        simulation.as_ref(),
+    );
+
     Ok(PlannerEngineOutput {
         graph_signature: graph_output.graph_signature,
         result,
         explanation,
         simulation,
+        event_payloads,
     })
 }
 
@@ -2943,6 +2969,7 @@ pub struct ConditionalReplanOutput {
     pub rebuild: GraphRebuildPlan,
     pub primary: PlannerEngineOutput,
     pub alternatives: Vec<AlternativePlan>,
+    pub event_payloads: Vec<PlanningEventPayload>,
 }
 
 pub fn conditional_replan(
@@ -2962,6 +2989,7 @@ pub fn conditional_replan(
             rebuild,
             primary,
             alternatives: Vec::new(),
+            event_payloads: Vec::new(),
         });
     }
 
@@ -3013,11 +3041,17 @@ pub fn conditional_replan(
         });
     }
 
+    let event_payloads = vec![PlanningEventPayload::PlanReplanned {
+        objective_id: request.objective_id.clone(),
+        reason: rebuild_trigger_reason(&rebuild.triggers),
+    }];
+
     Ok(ConditionalReplanOutput {
         reevaluated,
         rebuild,
         primary,
         alternatives,
+        event_payloads,
     })
 }
 
@@ -3036,6 +3070,17 @@ fn step_signature(steps: &[PlanStep]) -> String {
         .map(|step| step.edge_id.as_str().to_string())
         .collect::<Vec<_>>()
         .join("|")
+}
+
+fn rebuild_trigger_reason(triggers: &[GraphRebuildTrigger]) -> String {
+    if triggers.is_empty() {
+        return "none".to_string();
+    }
+    triggers
+        .iter()
+        .map(|trigger| trigger.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn classify_alternative_reason(
@@ -3172,6 +3217,57 @@ fn build_plan_simulation(objective_id: ObjectiveId, steps: &[PlanStep]) -> PlanS
         predicted_artifact_chain,
         expected_detection_surface,
     }
+}
+
+fn build_planning_event_payloads(
+    request: &PlanRequest,
+    graph: &CapabilityGraph,
+    result: &PlanResult,
+    explanation: Option<&PlanExplanation>,
+    simulation: Option<&PlanSimulation>,
+) -> Vec<PlanningEventPayload> {
+    let mut payloads = Vec::new();
+    payloads.push(PlanningEventPayload::PlanRequested {
+        objective_id: request.objective_id.clone(),
+        mode: request.mode,
+        event_key: request.event_key.clone(),
+    });
+    payloads.push(PlanningEventPayload::PlanGraphConstructed {
+        objective_id: request.objective_id.clone(),
+        node_count: graph.nodes().len(),
+        edge_count: graph.edges().len(),
+    });
+    payloads.push(PlanningEventPayload::PlanGenerated {
+        objective_id: request.objective_id.clone(),
+        status: result.status,
+        step_count: result.step_count,
+        total_noise_cost: result.total_noise_cost,
+        success_probability_bps: result.success_probability_bps,
+    });
+    if let Some(reason) = result.unreachable_reason.as_ref() {
+        payloads.push(PlanningEventPayload::PlanUnreachable {
+            objective_id: request.objective_id.clone(),
+            reason: reason.clone(),
+        });
+    }
+    if let Some(explanation) = explanation {
+        payloads.push(PlanningEventPayload::PlanExplained {
+            objective_id: request.objective_id.clone(),
+            step_count: explanation.steps.len() as u16,
+        });
+    }
+    if let Some(simulation) = simulation {
+        payloads.push(PlanningEventPayload::PlanSimulated {
+            objective_id: request.objective_id.clone(),
+            predicted_artifacts: simulation
+                .predicted_artifact_chain
+                .iter()
+                .cloned()
+                .collect(),
+            expected_detection_surface: simulation.expected_detection_surface.clone(),
+        });
+    }
+    payloads
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3317,6 +3413,8 @@ pub const PLANNING_INVARIANTS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanningEvent {
     pub sequence: u64,
+    pub correlation_id: CorrelationId,
+    pub occurred_at: u64,
     pub objective_id: ObjectiveId,
     pub event_key: String,
     pub payload: PlanningEventPayload,
@@ -3325,16 +3423,262 @@ pub struct PlanningEvent {
 impl PlanningEvent {
     pub fn new(
         sequence: u64,
+        correlation_id: CorrelationId,
+        occurred_at: u64,
         event_key: &str,
         payload: PlanningEventPayload,
     ) -> Result<Self, PlanningContractError> {
         ensure_non_empty(event_key, "planning_event.event_key")?;
+        if occurred_at == 0 {
+            return Err(PlanningContractError::InvalidField {
+                field: "planning_event.occurred_at",
+                reason: "must be > 0",
+            });
+        }
         Ok(Self {
             sequence,
+            correlation_id,
+            occurred_at,
             objective_id: payload.objective_id().clone(),
             event_key: normalize_token(event_key),
             payload,
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlanningEventLog {
+    events: Vec<PlanningEvent>,
+    next_sequence: BTreeMap<ObjectiveId, u64>,
+    correlations: BTreeMap<ObjectiveId, CorrelationId>,
+    applied_event_keys: BTreeSet<String>,
+}
+
+impl PlanningEventLog {
+    pub fn events(&self) -> &[PlanningEvent] {
+        &self.events
+    }
+
+    pub fn append_payloads(
+        &mut self,
+        objective_id: &ObjectiveId,
+        payloads: &[PlanningEventPayload],
+        correlation_id: Option<CorrelationId>,
+        base_event_key: &str,
+        occurred_at: u64,
+    ) -> Result<CorrelationId, PlanningContractError> {
+        ensure_non_empty(base_event_key, "planning_event.event_key")?;
+        if occurred_at == 0 {
+            return Err(PlanningContractError::InvalidField {
+                field: "planning_event.occurred_at",
+                reason: "must be > 0",
+            });
+        }
+
+        let effective_correlation_id =
+            match (self.correlations.get(objective_id).copied(), correlation_id) {
+                (Some(existing), Some(provided)) if existing != provided => {
+                    return Err(PlanningContractError::InvariantViolation {
+                        invariant: "objective lineage correlation must remain immutable",
+                    });
+                }
+                (Some(existing), _) => existing,
+                (None, Some(provided)) => {
+                    self.correlations.insert(objective_id.clone(), provided);
+                    provided
+                }
+                (None, None) => {
+                    let generated = CorrelationId::next();
+                    self.correlations.insert(objective_id.clone(), generated);
+                    generated
+                }
+            };
+
+        for payload in payloads {
+            if payload.objective_id() != objective_id {
+                return Err(PlanningContractError::InvariantViolation {
+                    invariant: "all planning payloads in one append must target one objective",
+                });
+            }
+
+            let event_key = format!(
+                "{}:{}",
+                normalize_token(base_event_key),
+                payload.event_type().as_str()
+            );
+            let dedupe_key = format!("{}:{}", objective_id.as_str(), event_key);
+            if self.applied_event_keys.contains(&dedupe_key) {
+                continue;
+            }
+
+            let sequence = *self.next_sequence.entry(objective_id.clone()).or_insert(1);
+            let event = PlanningEvent::new(
+                sequence,
+                effective_correlation_id,
+                occurred_at,
+                &event_key,
+                payload.clone(),
+            )?;
+            self.events.push(event);
+            self.applied_event_keys.insert(dedupe_key);
+            self.next_sequence
+                .insert(objective_id.clone(), sequence.saturating_add(1));
+        }
+
+        Ok(effective_correlation_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningReplayDiagnostic {
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconstructedPlanningDecision {
+    pub objective_id: ObjectiveId,
+    pub correlation_id: CorrelationId,
+    pub sequence_high_watermark: u64,
+    pub latest_mode: Option<PlanRequestMode>,
+    pub latest_status: Option<PlanLifecycleStatus>,
+    pub latest_unreachable_reason: Option<PlanUnreachableReason>,
+    pub latest_step_count: u16,
+    pub latest_total_noise_cost: u64,
+    pub latest_success_probability_bps: u16,
+    pub timeline: Vec<PlanningEventPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningReplayReport {
+    pub decision: Option<ReconstructedPlanningDecision>,
+    pub diagnostics: Vec<PlanningReplayDiagnostic>,
+}
+
+pub fn reconstruct_planning_from_events(
+    events: &[PlanningEvent],
+    objective_id: &ObjectiveId,
+) -> PlanningReplayReport {
+    let mut diagnostics = Vec::<PlanningReplayDiagnostic>::new();
+    let mut reconstructed: Option<ReconstructedPlanningDecision> = None;
+    let mut seen_event_keys = BTreeSet::<String>::new();
+
+    for event in events {
+        if &event.objective_id != objective_id {
+            continue;
+        }
+
+        let Some(decision) = reconstructed.as_mut() else {
+            reconstructed = Some(ReconstructedPlanningDecision {
+                objective_id: objective_id.clone(),
+                correlation_id: event.correlation_id,
+                sequence_high_watermark: 0,
+                latest_mode: None,
+                latest_status: None,
+                latest_unreachable_reason: None,
+                latest_step_count: 0,
+                latest_total_noise_cost: 0,
+                latest_success_probability_bps: 0,
+                timeline: Vec::new(),
+            });
+            continue;
+        };
+
+        if decision.correlation_id != event.correlation_id {
+            diagnostics.push(PlanningReplayDiagnostic {
+                code: "ML-PLAN-REPLAY-0001",
+                message: format!(
+                    "objective {} has mixed planning lineage correlations {} and {}",
+                    objective_id.as_str(),
+                    decision.correlation_id.0 .0,
+                    event.correlation_id.0 .0
+                ),
+            });
+        }
+    }
+
+    for event in events {
+        if &event.objective_id != objective_id {
+            continue;
+        }
+        let Some(decision) = reconstructed.as_mut() else {
+            continue;
+        };
+
+        let expected_next = decision.sequence_high_watermark.saturating_add(1);
+        if event.sequence != expected_next {
+            diagnostics.push(PlanningReplayDiagnostic {
+                code: "ML-PLAN-REPLAY-0002",
+                message: format!(
+                    "objective {} planning sequence mismatch: expected {}, found {}",
+                    objective_id.as_str(),
+                    expected_next,
+                    event.sequence
+                ),
+            });
+        }
+        decision.sequence_high_watermark = event.sequence;
+
+        if !seen_event_keys.insert(event.event_key.clone()) {
+            diagnostics.push(PlanningReplayDiagnostic {
+                code: "ML-PLAN-REPLAY-0003",
+                message: format!(
+                    "objective {} duplicated planning event key '{}'",
+                    objective_id.as_str(),
+                    event.event_key
+                ),
+            });
+        }
+
+        match &event.payload {
+            PlanningEventPayload::PlanRequested { mode, .. } => {
+                decision.latest_mode = Some(*mode);
+            }
+            PlanningEventPayload::PlanGraphConstructed { .. } => {}
+            PlanningEventPayload::PlanGenerated {
+                status,
+                step_count,
+                total_noise_cost,
+                success_probability_bps,
+                ..
+            } => {
+                decision.latest_status = Some(*status);
+                decision.latest_step_count = *step_count;
+                decision.latest_total_noise_cost = *total_noise_cost;
+                decision.latest_success_probability_bps = *success_probability_bps;
+                if *status != PlanLifecycleStatus::Unreachable {
+                    decision.latest_unreachable_reason = None;
+                }
+            }
+            PlanningEventPayload::PlanExplained { .. } => {
+                decision.latest_status = Some(PlanLifecycleStatus::Explained);
+            }
+            PlanningEventPayload::PlanSimulated { .. } => {
+                decision.latest_status = Some(PlanLifecycleStatus::Simulated);
+            }
+            PlanningEventPayload::PlanReplanned { .. } => {}
+            PlanningEventPayload::PlanUnreachable { reason, .. } => {
+                decision.latest_status = Some(PlanLifecycleStatus::Unreachable);
+                decision.latest_unreachable_reason = Some(reason.clone());
+            }
+        }
+
+        decision.timeline.push(event.payload.clone());
+    }
+
+    if reconstructed.is_none() {
+        diagnostics.push(PlanningReplayDiagnostic {
+            code: "ML-PLAN-REPLAY-0004",
+            message: format!(
+                "objective {} has no planning events in history",
+                objective_id.as_str()
+            ),
+        });
+    }
+
+    PlanningReplayReport {
+        decision: reconstructed,
+        diagnostics,
     }
 }
 
@@ -3629,6 +3973,166 @@ mod tests {
         };
         assert_eq!(payload.objective_id(), &objective_id);
         assert_eq!(payload.event_type(), PlanningEventType::PlanGenerated);
+    }
+
+    #[test]
+    fn planner_pipeline_emits_typed_event_payloads_for_full_lineage() {
+        let objective_id = parse_objective_id("88888888-8888-8888-8888-888888888888");
+        let snapshot = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![RegisteredModuleInput::new(
+                    "auxiliary/collect/artifacts",
+                    BTreeSet::new(),
+                    2,
+                    RiskLevel::Low,
+                    9_500,
+                    BTreeSet::from(["inventory".to_string(), "service_banner".to_string()]),
+                    BTreeMap::new(),
+                )
+                .expect("module")],
+                vec![ObjectiveDefinitionInput::new(
+                    objective_id.clone(),
+                    parse_campaign_id("14141414-1414-1414-1414-141414141414"),
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![Predicate::RunSucceeded {
+                        module_name: "auxiliary/collect/artifacts".to_string(),
+                    }],
+                    vec![],
+                    RiskLevel::Low,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                vec![],
+                BTreeMap::new(),
+            )
+            .expect("input"),
+        )
+        .expect("snapshot");
+
+        let output = simulate_pipeline(
+            &snapshot,
+            objective_id.clone(),
+            "event.simulate.lineage",
+            12345,
+            BTreeSet::new(),
+            AStarCostWeights::default(),
+        )
+        .expect("simulate");
+
+        let event_types = output
+            .event_payloads
+            .iter()
+            .map(|payload| payload.event_type().as_str().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_types,
+            vec![
+                "plan_requested",
+                "plan_graph_constructed",
+                "plan_generated",
+                "plan_explained",
+                "plan_simulated"
+            ]
+        );
+        assert!(output
+            .event_payloads
+            .iter()
+            .all(|payload| payload.objective_id() == &objective_id));
+    }
+
+    #[test]
+    fn planning_event_log_is_idempotent_by_event_key_and_preserves_lineage() {
+        let objective_id = parse_objective_id("99999999-9999-9999-9999-999999999999");
+        let payloads = vec![
+            PlanningEventPayload::PlanRequested {
+                objective_id: objective_id.clone(),
+                mode: PlanRequestMode::Plan,
+                event_key: "test.key".to_string(),
+            },
+            PlanningEventPayload::PlanGenerated {
+                objective_id: objective_id.clone(),
+                status: PlanLifecycleStatus::Proposed,
+                step_count: 1,
+                total_noise_cost: 7,
+                success_probability_bps: 9_000,
+            },
+        ];
+
+        let mut log = PlanningEventLog::default();
+        let first = log
+            .append_payloads(&objective_id, &payloads, None, "test.key", 100)
+            .expect("first append");
+        let second = log
+            .append_payloads(&objective_id, &payloads, Some(first), "test.key", 100)
+            .expect("idempotent append");
+
+        assert_eq!(first, second);
+        assert_eq!(log.events().len(), 2);
+        assert_eq!(log.events()[0].sequence, 1);
+        assert_eq!(log.events()[1].sequence, 2);
+        assert!(log
+            .events()
+            .iter()
+            .all(|event| event.correlation_id == first));
+    }
+
+    #[test]
+    fn planning_replay_reconstructs_decisions_from_event_history() {
+        let objective_id = parse_objective_id("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb");
+        let correlation_id = CorrelationId::next();
+        let events = vec![
+            PlanningEvent::new(
+                1,
+                correlation_id,
+                50,
+                "trace.plan:plan_requested",
+                PlanningEventPayload::PlanRequested {
+                    objective_id: objective_id.clone(),
+                    mode: PlanRequestMode::Explain,
+                    event_key: "trace.plan".to_string(),
+                },
+            )
+            .expect("requested"),
+            PlanningEvent::new(
+                2,
+                correlation_id,
+                50,
+                "trace.plan:plan_generated",
+                PlanningEventPayload::PlanGenerated {
+                    objective_id: objective_id.clone(),
+                    status: PlanLifecycleStatus::Explained,
+                    step_count: 2,
+                    total_noise_cost: 14,
+                    success_probability_bps: 7_500,
+                },
+            )
+            .expect("generated"),
+            PlanningEvent::new(
+                3,
+                correlation_id,
+                50,
+                "trace.plan:plan_explained",
+                PlanningEventPayload::PlanExplained {
+                    objective_id: objective_id.clone(),
+                    step_count: 2,
+                },
+            )
+            .expect("explained"),
+        ];
+
+        let report = reconstruct_planning_from_events(&events, &objective_id);
+        assert!(report.diagnostics.is_empty());
+        let decision = report.decision.expect("decision");
+        assert_eq!(decision.correlation_id, correlation_id);
+        assert_eq!(decision.sequence_high_watermark, 3);
+        assert_eq!(decision.latest_mode, Some(PlanRequestMode::Explain));
+        assert_eq!(decision.latest_status, Some(PlanLifecycleStatus::Explained));
+        assert_eq!(decision.latest_step_count, 2);
+        assert_eq!(decision.latest_total_noise_cost, 14);
+        assert_eq!(decision.latest_success_probability_bps, 7_500);
+        assert_eq!(decision.timeline.len(), 3);
     }
 
     #[test]
@@ -4745,6 +5249,9 @@ mod tests {
             .rebuild
             .triggers
             .contains(&GraphRebuildTrigger::ArtifactsChanged));
+        assert!(output.event_payloads.iter().any(|payload| {
+            matches!(payload, PlanningEventPayload::PlanReplanned { objective_id: id, .. } if id == &objective_id)
+        }));
     }
 
     #[test]

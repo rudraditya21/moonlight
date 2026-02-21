@@ -12,7 +12,7 @@ use corelib::ids::Id;
 use corelib::planning::{
     execute_planner_pipeline, normalize_planner_input, AStarCostWeights, DiscoveredArtifactInput,
     ObjectiveDefinitionInput, PlanLifecycleStatus, PlanRequest, PlanRequestMode,
-    PlannerEngineContext, PlannerNormalizationInput, RegisteredModuleInput,
+    PlannerEngineContext, PlannerNormalizationInput, PlanningEventLog, RegisteredModuleInput,
 };
 use corelib::policy::{
     Capability, DecisionKind, ModuleContext as PolicyModuleContext, PolicyEngine, PolicyRequest,
@@ -72,6 +72,7 @@ pub struct Repl {
     release_checklist: ReleaseChecklistTemplate,
     campaigns: BTreeMap<CampaignId, Campaign>,
     objectives: BTreeMap<ObjectiveId, Objective>,
+    planning_events: PlanningEventLog,
     palette: Palette,
 }
 
@@ -355,6 +356,7 @@ impl Repl {
             release_checklist: ReleaseChecklistTemplate::default_control_plane(),
             campaigns: BTreeMap::new(),
             objectives: BTreeMap::new(),
+            planning_events: PlanningEventLog::default(),
             palette: Palette::new(),
         }
     }
@@ -3067,11 +3069,13 @@ impl Repl {
             .map(|capability| capability.as_str().to_string())
             .collect::<BTreeSet<_>>();
         let generated_at = now_secs();
+        let request_nonce = Id::next().0;
         let event_key = format!(
-            "plan:{}:{}:{}",
+            "plan:{}:{}:{}:{}",
             mode.as_str(),
             objective_id.as_str(),
-            generated_at
+            generated_at,
+            request_nonce
         );
         let weights = AStarCostWeights::default();
         let include_blocked_paths = mode == PlanRequestMode::Simulate;
@@ -3131,7 +3135,19 @@ impl Repl {
         let output = execute_planner_pipeline(&snapshot, &request, &context);
 
         match output {
-            Ok(output) => self.emit_plan_output(mode, &output),
+            Ok(output) => {
+                if let Err(err) = self.planning_events.append_payloads(
+                    &objective_id,
+                    &output.event_payloads,
+                    None,
+                    &request.event_key,
+                    generated_at,
+                ) {
+                    self.emit_error("plan", CliCode::Execution, &err.to_string());
+                    return;
+                }
+                self.emit_plan_output(mode, &output)
+            }
             Err(err) => self.emit_error("plan", CliCode::Execution, &err.to_string()),
         }
     }
