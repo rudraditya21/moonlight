@@ -1783,6 +1783,14 @@ pub fn astar_plan(
     graph: &CapabilityGraph,
     request: &AStarPlanRequest,
 ) -> Result<Option<AStarPlanResult>, PlanningContractError> {
+    astar_plan_with_forbidden_edges(graph, request, &BTreeSet::new())
+}
+
+pub fn astar_plan_with_forbidden_edges(
+    graph: &CapabilityGraph,
+    request: &AStarPlanRequest,
+    forbidden_edges: &BTreeSet<PlanEdgeId>,
+) -> Result<Option<AStarPlanResult>, PlanningContractError> {
     let objective_nodes = graph
         .nodes()
         .iter()
@@ -1863,6 +1871,9 @@ pub fn astar_plan(
             continue;
         };
         for (edge_id, next_node) in neighbors {
+            if forbidden_edges.contains(edge_id) {
+                continue;
+            }
             let edge = graph
                 .edges()
                 .get(edge_id)
@@ -2687,13 +2698,23 @@ pub fn execute_planner_pipeline(
     request: &PlanRequest,
     context: &PlannerEngineContext,
 ) -> Result<PlannerEngineOutput, PlanningContractError> {
+    execute_planner_pipeline_with_forbidden_edges(snapshot, request, context, &BTreeSet::new())
+}
+
+fn execute_planner_pipeline_with_forbidden_edges(
+    snapshot: &NormalizedPlannerSnapshot,
+    request: &PlanRequest,
+    context: &PlannerEngineContext,
+    forbidden_edges: &BTreeSet<PlanEdgeId>,
+) -> Result<PlannerEngineOutput, PlanningContractError> {
     let graph_output = build_capability_graph(snapshot)?;
     let astar_request = AStarPlanRequest::new(
         request.objective_id.clone(),
         context.available_capabilities.clone(),
         context.weights.clone(),
     );
-    let path = astar_plan(&graph_output.graph, &astar_request)?;
+    let path =
+        astar_plan_with_forbidden_edges(&graph_output.graph, &astar_request, forbidden_edges)?;
     let Some(path) = path else {
         return Ok(PlannerEngineOutput {
             graph_signature: graph_output.graph_signature,
@@ -2848,6 +2869,148 @@ pub fn execute_planner_pipeline(
         explanation,
         simulation,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplanAlternativeReason {
+    DifferentPath,
+    LowerNoise,
+    LowerRisk,
+    FewerCapabilities,
+}
+
+impl ReplanAlternativeReason {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            ReplanAlternativeReason::DifferentPath => "different_path",
+            ReplanAlternativeReason::LowerNoise => "lower_noise",
+            ReplanAlternativeReason::LowerRisk => "lower_risk",
+            ReplanAlternativeReason::FewerCapabilities => "fewer_capabilities",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlternativePlan {
+    pub reason: ReplanAlternativeReason,
+    pub output: PlannerEngineOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionalReplanOutput {
+    pub reevaluated: bool,
+    pub rebuild: GraphRebuildPlan,
+    pub primary: PlannerEngineOutput,
+    pub alternatives: Vec<AlternativePlan>,
+}
+
+pub fn conditional_replan(
+    previous: Option<&NormalizedPlannerSnapshot>,
+    next: &NormalizedPlannerSnapshot,
+    request: &PlanRequest,
+    context: &PlannerEngineContext,
+    max_alternatives: usize,
+) -> Result<ConditionalReplanOutput, PlanningContractError> {
+    let rebuild = plan_graph_rebuild(previous, next);
+    let reevaluated = previous.is_none() || rebuild.requires_rebuild();
+    let primary = execute_planner_pipeline(next, request, context)?;
+
+    if !reevaluated {
+        return Ok(ConditionalReplanOutput {
+            reevaluated,
+            rebuild,
+            primary,
+            alternatives: Vec::new(),
+        });
+    }
+
+    let mut alternatives = Vec::new();
+    let mut seen_paths = BTreeSet::<String>::new();
+    let primary_signature = step_signature(&primary.result.steps);
+    seen_paths.insert(primary_signature);
+
+    let mut forbidden_edges = BTreeSet::<PlanEdgeId>::new();
+    let mut candidate_edges = primary
+        .result
+        .steps
+        .iter()
+        .map(|step| step.edge_id.clone())
+        .collect::<VecDeque<_>>();
+
+    while alternatives.len() < max_alternatives {
+        let Some(edge_to_forbid) = candidate_edges.pop_front() else {
+            break;
+        };
+        if !forbidden_edges.insert(edge_to_forbid.clone()) {
+            continue;
+        }
+
+        let candidate = execute_planner_pipeline_with_forbidden_edges(
+            next,
+            request,
+            context,
+            &forbidden_edges,
+        )?;
+        if !is_reachable_status(candidate.result.status) {
+            continue;
+        }
+        let signature = step_signature(&candidate.result.steps);
+        if !seen_paths.insert(signature) {
+            continue;
+        }
+
+        for step in &candidate.result.steps {
+            if !forbidden_edges.contains(&step.edge_id) {
+                candidate_edges.push_back(step.edge_id.clone());
+            }
+        }
+
+        let reason = classify_alternative_reason(&primary.result, &candidate.result);
+        alternatives.push(AlternativePlan {
+            reason,
+            output: candidate,
+        });
+    }
+
+    Ok(ConditionalReplanOutput {
+        reevaluated,
+        rebuild,
+        primary,
+        alternatives,
+    })
+}
+
+fn is_reachable_status(status: PlanLifecycleStatus) -> bool {
+    matches!(
+        status,
+        PlanLifecycleStatus::Proposed
+            | PlanLifecycleStatus::Explained
+            | PlanLifecycleStatus::Simulated
+    )
+}
+
+fn step_signature(steps: &[PlanStep]) -> String {
+    steps
+        .iter()
+        .map(|step| step.edge_id.as_str().to_string())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn classify_alternative_reason(
+    primary: &PlanResult,
+    candidate: &PlanResult,
+) -> ReplanAlternativeReason {
+    if candidate.total_noise_cost < primary.total_noise_cost {
+        return ReplanAlternativeReason::LowerNoise;
+    }
+    if candidate.total_risk_cost < primary.total_risk_cost {
+        return ReplanAlternativeReason::LowerRisk;
+    }
+    if candidate.required_capabilities.len() < primary.required_capabilities.len() {
+        return ReplanAlternativeReason::FewerCapabilities;
+    }
+    ReplanAlternativeReason::DifferentPath
 }
 
 pub fn plan_pipeline(
@@ -4311,5 +4474,231 @@ mod tests {
             .expected_detection_surface
             .iter()
             .any(|marker| marker.starts_with("risk:")));
+    }
+
+    #[test]
+    fn conditional_replan_triggers_on_artifact_change() {
+        let objective_id = parse_objective_id("15151515-1515-1515-1515-151515151515");
+        let request = PlanRequest::new(
+            objective_id.clone(),
+            PlanRequestMode::Plan,
+            "replan.artifact.change",
+            None,
+            false,
+        )
+        .expect("request");
+        let context = PlannerEngineContext::new(77, BTreeSet::new(), AStarCostWeights::default());
+
+        let previous = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![RegisteredModuleInput::new(
+                    "auxiliary/sample/module",
+                    BTreeSet::new(),
+                    2,
+                    RiskLevel::Low,
+                    9_000,
+                    BTreeSet::from(["service_banner".to_string()]),
+                    BTreeMap::new(),
+                )
+                .expect("module")],
+                vec![ObjectiveDefinitionInput::new(
+                    objective_id.clone(),
+                    parse_campaign_id("16161616-1616-1616-1616-161616161616"),
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![Predicate::RunSucceeded {
+                        module_name: "auxiliary/sample/module".to_string(),
+                    }],
+                    vec![],
+                    RiskLevel::Low,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                vec![DiscoveredArtifactInput::new(
+                    "artifact:one",
+                    "service_banner",
+                    "available",
+                    BTreeSet::new(),
+                    BTreeMap::new(),
+                )
+                .expect("artifact")],
+                BTreeMap::new(),
+            )
+            .expect("input"),
+        )
+        .expect("normalize");
+
+        let next = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![RegisteredModuleInput::new(
+                    "auxiliary/sample/module",
+                    BTreeSet::new(),
+                    2,
+                    RiskLevel::Low,
+                    9_000,
+                    BTreeSet::from(["service_banner".to_string()]),
+                    BTreeMap::new(),
+                )
+                .expect("module")],
+                vec![ObjectiveDefinitionInput::new(
+                    objective_id.clone(),
+                    parse_campaign_id("16161616-1616-1616-1616-161616161616"),
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![Predicate::RunSucceeded {
+                        module_name: "auxiliary/sample/module".to_string(),
+                    }],
+                    vec![],
+                    RiskLevel::Low,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                vec![DiscoveredArtifactInput::new(
+                    "artifact:one",
+                    "service_banner",
+                    "expired",
+                    BTreeSet::new(),
+                    BTreeMap::new(),
+                )
+                .expect("artifact")],
+                BTreeMap::new(),
+            )
+            .expect("input"),
+        )
+        .expect("normalize");
+
+        let output =
+            conditional_replan(Some(&previous), &next, &request, &context, 2).expect("replan");
+        assert!(output.reevaluated);
+        assert!(output
+            .rebuild
+            .triggers
+            .contains(&GraphRebuildTrigger::ArtifactsChanged));
+    }
+
+    #[test]
+    fn conditional_replan_detects_unreachable_objective_with_reason() {
+        let objective_id = parse_objective_id("17171717-1717-1717-1717-171717171717");
+        let snapshot = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                Vec::new(),
+                vec![ObjectiveDefinitionInput::new(
+                    objective_id.clone(),
+                    parse_campaign_id("18181818-1818-1818-1818-181818181818"),
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![Predicate::FindingExists {
+                        finding_type: "shell_access".to_string(),
+                    }],
+                    vec![],
+                    RiskLevel::Low,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .expect("input"),
+        )
+        .expect("snapshot");
+
+        let request = PlanRequest::new(
+            objective_id,
+            PlanRequestMode::Plan,
+            "replan.unreachable",
+            None,
+            false,
+        )
+        .expect("request");
+        let context = PlannerEngineContext::new(88, BTreeSet::new(), AStarCostWeights::default());
+        let output = conditional_replan(None, &snapshot, &request, &context, 2).expect("replan");
+        assert!(output.reevaluated);
+        assert_eq!(
+            output.primary.result.status,
+            PlanLifecycleStatus::Unreachable
+        );
+        assert_eq!(
+            output.primary.result.unreachable_reason,
+            Some(PlanUnreachableReason::NoGraphPath)
+        );
+        assert!(output.alternatives.is_empty());
+    }
+
+    #[test]
+    fn conditional_replan_generates_alternative_paths_with_reasons() {
+        let objective_id = parse_objective_id("19191919-1919-1919-1919-191919191919");
+        let snapshot = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![
+                    RegisteredModuleInput::new(
+                        "exploit/path/primary",
+                        BTreeSet::new(),
+                        8,
+                        RiskLevel::High,
+                        7_000,
+                        BTreeSet::from(["shell_access".to_string()]),
+                        BTreeMap::new(),
+                    )
+                    .expect("module"),
+                    RegisteredModuleInput::new(
+                        "exploit/path/alternate",
+                        BTreeSet::new(),
+                        2,
+                        RiskLevel::Low,
+                        9_000,
+                        BTreeSet::from(["shell_access".to_string()]),
+                        BTreeMap::new(),
+                    )
+                    .expect("module"),
+                ],
+                vec![ObjectiveDefinitionInput::new(
+                    objective_id.clone(),
+                    parse_campaign_id("20202020-2020-2020-2020-202020202020"),
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![Predicate::RunSucceeded {
+                        module_name: "exploit/path/primary".to_string(),
+                    }],
+                    vec![Predicate::RunSucceeded {
+                        module_name: "exploit/path/alternate".to_string(),
+                    }],
+                    RiskLevel::Medium,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .expect("input"),
+        )
+        .expect("snapshot");
+        let request = PlanRequest::new(
+            objective_id,
+            PlanRequestMode::Plan,
+            "replan.alternative",
+            None,
+            false,
+        )
+        .expect("request");
+        let context = PlannerEngineContext::new(99, BTreeSet::new(), AStarCostWeights::default());
+
+        let output = conditional_replan(None, &snapshot, &request, &context, 3).expect("replan");
+        assert!(output.reevaluated);
+        assert!(!output.alternatives.is_empty());
+        assert!(matches!(
+            output.alternatives[0].reason,
+            ReplanAlternativeReason::LowerNoise
+                | ReplanAlternativeReason::LowerRisk
+                | ReplanAlternativeReason::FewerCapabilities
+                | ReplanAlternativeReason::DifferentPath
+        ));
+        assert_ne!(
+            step_signature(&output.primary.result.steps),
+            step_signature(&output.alternatives[0].output.result.steps)
+        );
     }
 }
