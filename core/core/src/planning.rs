@@ -4461,6 +4461,13 @@ mod tests {
         ))
     }
 
+    fn lcg_next(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state
+    }
+
     #[test]
     fn lifecycle_transition_matrix_is_complete_and_unambiguous() {
         let states = [
@@ -5829,6 +5836,110 @@ mod tests {
             "concurrent planning exceeded budget: {:?}",
             elapsed
         );
+    }
+
+    #[test]
+    fn randomized_planner_fuzz_is_deterministic_under_replay() {
+        for seed in 1_u64..=24_u64 {
+            let mut rng = seed;
+            let module_count = 96usize;
+            let objective_id = parse_objective_id("feedfeed-1111-2222-3333-1234567890ab");
+            let campaign_id = parse_campaign_id("deadbeef-1111-2222-3333-1234567890ab");
+            let mut modules = Vec::with_capacity(module_count);
+            let mut artifacts = Vec::with_capacity(48);
+            for idx in 0..module_count {
+                let roll = lcg_next(&mut rng);
+                let module_reference = format!("auxiliary/fuzz/{seed}/{idx}");
+                let mut caps = BTreeSet::new();
+                if roll & 1 == 0 {
+                    caps.insert("exploit_execution".to_string());
+                }
+                if roll & 2 == 0 {
+                    caps.insert("public_targets".to_string());
+                }
+                let risk = match roll % 3 {
+                    0 => RiskLevel::Low,
+                    1 => RiskLevel::Medium,
+                    _ => RiskLevel::High,
+                };
+                let expected = BTreeSet::from([format!("artifact_type_{}", roll % 16)]);
+                modules.push(
+                    RegisteredModuleInput::new(
+                        &module_reference,
+                        caps,
+                        ((roll % 10) + 1) as u32,
+                        risk,
+                        4_000 + ((roll % 6_000) as u16),
+                        expected,
+                        BTreeMap::new(),
+                    )
+                    .expect("module"),
+                );
+                if idx % 2 == 0 {
+                    artifacts.push(
+                        DiscoveredArtifactInput::new(
+                            &format!("fuzz-artifact-{seed}-{idx}"),
+                            &format!("artifact_type_{}", roll % 16),
+                            if roll & 4 == 0 {
+                                "available"
+                            } else {
+                                "expired"
+                            },
+                            BTreeSet::from([format!("tag_{}", roll % 8)]),
+                            BTreeMap::new(),
+                        )
+                        .expect("artifact"),
+                    );
+                }
+            }
+            let selected_module = modules[module_count - 1].module_reference.clone();
+            let objective = ObjectiveDefinitionInput::new(
+                objective_id.clone(),
+                campaign_id,
+                ObjectiveStatus::Pending,
+                vec![],
+                vec![Predicate::RunSucceeded {
+                    module_name: selected_module,
+                }],
+                vec![],
+                RiskLevel::Low,
+                None,
+                BTreeMap::new(),
+            )
+            .expect("objective");
+
+            let snapshot = normalize_planner_input(
+                PlannerNormalizationInput::new(
+                    modules,
+                    vec![objective],
+                    artifacts,
+                    BTreeMap::new(),
+                )
+                .expect("input"),
+            )
+            .expect("snapshot");
+            let request = PlanRequest::new(
+                objective_id.clone(),
+                PlanRequestMode::Plan,
+                &format!("fuzz.plan.{seed}"),
+                None,
+                false,
+            )
+            .expect("request");
+            let context = PlannerEngineContext::new(
+                5_000 + seed,
+                BTreeSet::new(),
+                AStarCostWeights::default(),
+            );
+
+            let output_a = execute_planner_pipeline(&snapshot, &request, &context).expect("first");
+            let output_b = execute_planner_pipeline(&snapshot, &request, &context).expect("second");
+            assert_eq!(output_a.result, output_b.result, "seed={seed}");
+            assert_eq!(
+                output_a.graph_signature, output_b.graph_signature,
+                "seed={seed}"
+            );
+        }
     }
 
     #[test]

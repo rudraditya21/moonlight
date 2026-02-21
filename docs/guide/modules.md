@@ -141,6 +141,15 @@ moonlight> release migrate plan <from-version> <to-version>
 moonlight> release rollback snapshot <label>
 ```
 
+Planning commands:
+
+```
+moonlight> plan <objective-id>
+moonlight> plan explain <objective-id>
+moonlight> plan simulate <objective-id>
+moonlight> output json
+```
+
 The prompt reflects the active module when one is selected:
 
 ```
@@ -153,6 +162,13 @@ Campaign and objective orchestration commands are documented in:
 - `docs/guide/campaign_objective_operations.md`
 
 Use this guide for campaign lifecycle commands, objective predicate syntax, replay/recovery semantics, and troubleshooting.
+
+## Planning REPL Usage
+Planner workflows are documented in:
+
+- `docs/guide/planning_operations.md`
+
+Use this guide for plan/explain/simulate usage, blocked reason codes, JSON output contracts, and troubleshooting.
 
 ## Performance
 Keep modules efficient and avoid expensive initialization in `run`. If a module performs heavy work, consider lazy initialization and reuse internal state.

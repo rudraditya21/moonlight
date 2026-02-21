@@ -249,6 +249,7 @@ const COMMAND_HELP: &[CommandHelpSpec] = &[
         notes: &[
             "Planner is advisory-only and never executes modules.",
             "Use output json for script-safe step/explanation/simulation payloads.",
+            "See docs/guide/planning_operations.md for step-by-step planning workflows and troubleshooting.",
         ],
     },
     CommandHelpSpec {
