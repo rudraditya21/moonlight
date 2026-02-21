@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::collections::{BinaryHeap, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::campaign::{
     CampaignId, MetadataValue, Objective, ObjectiveId, ObjectiveStatus, Predicate, RiskLevel,
@@ -916,6 +917,21 @@ impl NormalizedPlannerSnapshot {
     pub fn canonical_signature(&self) -> &str {
         &self.canonical_signature
     }
+
+    pub fn estimated_memory_bytes(&self) -> usize {
+        let encoded = encode_normalized_snapshot(
+            &self.modules,
+            &self.objectives,
+            &self.artifacts,
+            &self.known_artifact_types,
+            &self.metadata,
+        );
+        encoded.len()
+            + self.modules.len() * std::mem::size_of::<RegisteredModuleInput>()
+            + self.objectives.len() * std::mem::size_of::<ObjectiveDefinitionInput>()
+            + self.artifacts.len() * std::mem::size_of::<DiscoveredArtifactInput>()
+            + self.known_artifact_types.len() * std::mem::size_of::<String>()
+    }
 }
 
 pub fn normalize_planner_input(
@@ -1168,8 +1184,80 @@ pub struct GraphBuildOutput {
     pub graph_signature: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerBuildIndex {
+    pub module_to_objectives: BTreeMap<String, Vec<ObjectiveId>>,
+    pub discovered_by_type: BTreeMap<String, Vec<String>>,
+    pub signal_tokens: BTreeSet<String>,
+    pub capability_set: BTreeSet<String>,
+}
+
+impl PlannerBuildIndex {
+    pub fn from_snapshot(snapshot: &NormalizedPlannerSnapshot) -> Self {
+        let mut module_to_objectives = BTreeMap::<String, Vec<ObjectiveId>>::new();
+        for objective in snapshot.objectives() {
+            for module_reference in objective_module_references(objective) {
+                module_to_objectives
+                    .entry(module_reference)
+                    .or_default()
+                    .push(objective.objective_id.clone());
+            }
+        }
+        for objective_ids in module_to_objectives.values_mut() {
+            objective_ids.sort_by_key(|id| id.as_str().to_string());
+            objective_ids.dedup();
+        }
+
+        let mut capability_set = BTreeSet::<String>::new();
+        let mut has_module_without_capability = false;
+        for module in snapshot.modules() {
+            if module.required_capabilities.is_empty() {
+                has_module_without_capability = true;
+            }
+            capability_set.extend(module.required_capabilities.iter().cloned());
+        }
+        if has_module_without_capability {
+            capability_set.insert("__no_capability__".to_string());
+        }
+
+        let mut signal_tokens = BTreeSet::<String>::new();
+        signal_tokens.extend(snapshot.known_artifact_types().iter().cloned());
+        for artifact in snapshot.artifacts() {
+            signal_tokens.insert(artifact.artifact_type.clone());
+            signal_tokens.extend(artifact.tags.iter().cloned());
+        }
+
+        let mut discovered_by_type = BTreeMap::<String, Vec<String>>::new();
+        for artifact in snapshot.artifacts() {
+            discovered_by_type
+                .entry(artifact.artifact_type.clone())
+                .or_default()
+                .push(artifact.artifact_key.clone());
+        }
+        for artifact_keys in discovered_by_type.values_mut() {
+            artifact_keys.sort();
+            artifact_keys.dedup();
+        }
+
+        Self {
+            module_to_objectives,
+            discovered_by_type,
+            signal_tokens,
+            capability_set,
+        }
+    }
+}
+
 pub fn build_capability_graph(
     snapshot: &NormalizedPlannerSnapshot,
+) -> Result<GraphBuildOutput, PlanningContractError> {
+    let index = PlannerBuildIndex::from_snapshot(snapshot);
+    build_capability_graph_indexed(snapshot, &index)
+}
+
+pub fn build_capability_graph_indexed(
+    snapshot: &NormalizedPlannerSnapshot,
+    index: &PlannerBuildIndex,
 ) -> Result<GraphBuildOutput, PlanningContractError> {
     let mut graph = CapabilityGraph::new();
     let mut objective_nodes = BTreeMap::<ObjectiveId, PlanNodeId>::new();
@@ -1197,43 +1285,24 @@ pub fn build_capability_graph(
         objective_nodes.insert(objective.objective_id.clone(), node_id);
     }
 
-    let mut capability_set = BTreeSet::<String>::new();
-    let mut has_module_without_capability = false;
-    for module in snapshot.modules() {
-        if module.required_capabilities.is_empty() {
-            has_module_without_capability = true;
-        }
-        capability_set.extend(module.required_capabilities.iter().cloned());
-    }
-    if has_module_without_capability {
-        capability_set.insert("__no_capability__".to_string());
-    }
-
-    for capability in capability_set {
+    for capability in &index.capability_set {
         let node_id = plan_node_id(&["capability", &capability, "enabled"])?;
         graph.add_node(PlanNode::CapabilityState(CapabilityStateNode::new(
             node_id.clone(),
             &capability,
             true,
         )?))?;
-        capability_nodes.insert(capability, node_id);
+        capability_nodes.insert(capability.clone(), node_id);
     }
 
-    let mut signal_tokens = BTreeSet::<String>::new();
-    signal_tokens.extend(snapshot.known_artifact_types().iter().cloned());
-    for artifact in snapshot.artifacts() {
-        signal_tokens.insert(artifact.artifact_type.clone());
-        signal_tokens.extend(artifact.tags.iter().cloned());
-    }
-
-    for token in signal_tokens {
+    for token in &index.signal_tokens {
         let node_id = plan_node_id(&["asset", "signal", &token, "expected"])?;
         graph.add_node(PlanNode::AssetState(AssetStateNode::new(
             node_id.clone(),
             &token,
             "expected",
         )?))?;
-        signal_asset_nodes.insert(token, node_id);
+        signal_asset_nodes.insert(token.clone(), node_id);
     }
 
     for artifact in snapshot.artifacts() {
@@ -1317,48 +1386,42 @@ pub fn build_capability_graph(
                 }
             }
 
-            for objective in snapshot.objectives() {
-                if !objective_uses_module(objective, &module.module_reference) {
-                    continue;
+            if let Some(objective_ids) = index.module_to_objectives.get(&module.module_reference) {
+                for objective_id in objective_ids {
+                    let Some(objective_node) = objective_nodes.get(objective_id) else {
+                        continue;
+                    };
+                    let edge_id = plan_edge_id(&[
+                        "edge",
+                        "module-to-objective",
+                        &module.module_reference,
+                        source_capability,
+                        objective_id.as_str(),
+                    ])?;
+                    graph.add_edge(PlanEdge::module_execution(
+                        edge_id,
+                        from_node.clone(),
+                        objective_node.clone(),
+                        &module.module_reference,
+                        PlanEdgeAttributes::new(
+                            module.required_capabilities.clone(),
+                            module.estimated_noise_cost,
+                            module.estimated_risk,
+                            module.probability_of_success_bps,
+                            module.expected_artifacts.clone(),
+                        )?,
+                    )?)?;
                 }
-                let objective_node = objective_nodes
-                    .get(&objective.objective_id)
-                    .expect("objective node exists");
-                let edge_id = plan_edge_id(&[
-                    "edge",
-                    "module-to-objective",
-                    &module.module_reference,
-                    source_capability,
-                    objective.objective_id.as_str(),
-                ])?;
-                graph.add_edge(PlanEdge::module_execution(
-                    edge_id,
-                    from_node.clone(),
-                    objective_node.clone(),
-                    &module.module_reference,
-                    PlanEdgeAttributes::new(
-                        module.required_capabilities.clone(),
-                        module.estimated_noise_cost,
-                        module.estimated_risk,
-                        module.probability_of_success_bps,
-                        module.expected_artifacts.clone(),
-                    )?,
-                )?)?;
             }
         }
     }
 
-    let mut discovered_by_type = BTreeMap::<String, Vec<PlanNodeId>>::new();
-    for artifact in snapshot.artifacts() {
-        if let Some(node_id) = discovered_asset_nodes.get(&artifact.artifact_key) {
-            discovered_by_type
-                .entry(artifact.artifact_type.clone())
-                .or_default()
-                .push(node_id.clone());
-        }
-    }
-    for nodes in discovered_by_type.values_mut() {
-        nodes.sort_by_key(|id| id.as_str().to_string());
+    for artifact_keys in index.discovered_by_type.values() {
+        let nodes = artifact_keys
+            .iter()
+            .filter_map(|artifact_key| discovered_asset_nodes.get(artifact_key))
+            .cloned()
+            .collect::<Vec<_>>();
         for pair in nodes.windows(2) {
             let edge_id = plan_edge_id(&["edge", "lateral", pair[0].as_str(), pair[1].as_str()])?;
             graph.add_edge(PlanEdge::lateral_movement(
@@ -1383,6 +1446,102 @@ pub fn build_capability_graph(
         graph,
         graph_signature,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedPlannerSnapshot {
+    pub snapshot: NormalizedPlannerSnapshot,
+    pub index: PlannerBuildIndex,
+    pub graph_output: GraphBuildOutput,
+}
+
+impl PreparedPlannerSnapshot {
+    pub fn prepare(snapshot: &NormalizedPlannerSnapshot) -> Result<Self, PlanningContractError> {
+        let index = PlannerBuildIndex::from_snapshot(snapshot);
+        let graph_output = build_capability_graph_indexed(snapshot, &index)?;
+        Ok(Self {
+            snapshot: snapshot.clone(),
+            index,
+            graph_output,
+        })
+    }
+
+    pub fn estimated_footprint_bytes(&self) -> usize {
+        self.snapshot.estimated_memory_bytes()
+            + estimate_graph_memory_bytes(&self.graph_output.graph)
+            + estimate_index_memory_bytes(&self.index)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConcurrentPlannerEngine {
+    prepared: Arc<PreparedPlannerSnapshot>,
+}
+
+impl ConcurrentPlannerEngine {
+    pub fn new(snapshot: &NormalizedPlannerSnapshot) -> Result<Self, PlanningContractError> {
+        let prepared = PreparedPlannerSnapshot::prepare(snapshot)?;
+        Ok(Self {
+            prepared: Arc::new(prepared),
+        })
+    }
+
+    pub fn from_prepared(prepared: PreparedPlannerSnapshot) -> Self {
+        Self {
+            prepared: Arc::new(prepared),
+        }
+    }
+
+    pub fn prepared(&self) -> Arc<PreparedPlannerSnapshot> {
+        self.prepared.clone()
+    }
+
+    pub fn execute(
+        &self,
+        request: &PlanRequest,
+        context: &PlannerEngineContext,
+    ) -> Result<PlannerEngineOutput, PlanningContractError> {
+        execute_planner_pipeline_prepared(&self.prepared.graph_output, request, context)
+    }
+}
+
+fn estimate_graph_memory_bytes(graph: &CapabilityGraph) -> usize {
+    encode_graph_signature(graph).len()
+        + graph.node_count() * std::mem::size_of::<PlanNode>()
+        + graph.edge_count() * std::mem::size_of::<PlanEdge>()
+}
+
+fn estimate_index_memory_bytes(index: &PlannerBuildIndex) -> usize {
+    let module_to_objectives = index
+        .module_to_objectives
+        .iter()
+        .map(|(module, objectives)| {
+            module.len()
+                + objectives.len() * std::mem::size_of::<ObjectiveId>()
+                + std::mem::size_of::<Vec<ObjectiveId>>()
+        })
+        .sum::<usize>();
+    let discovered_by_type = index
+        .discovered_by_type
+        .iter()
+        .map(|(artifact_type, keys)| {
+            artifact_type.len()
+                + keys.iter().map(|key| key.len()).sum::<usize>()
+                + std::mem::size_of::<Vec<String>>()
+        })
+        .sum::<usize>();
+    let signal_tokens = index
+        .signal_tokens
+        .iter()
+        .map(|token| token.len())
+        .sum::<usize>();
+    let capability_set = index
+        .capability_set
+        .iter()
+        .map(|capability| capability.len())
+        .sum::<usize>();
+
+    module_to_objectives + discovered_by_type + signal_tokens + capability_set
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1531,18 +1690,17 @@ fn maybe_add_privilege_escalation_edges(
     Ok(())
 }
 
-fn objective_uses_module(objective: &ObjectiveDefinitionInput, module_reference: &str) -> bool {
-    let module_reference = normalize_token(module_reference);
+fn objective_module_references(objective: &ObjectiveDefinitionInput) -> BTreeSet<String> {
     objective
         .success_criteria
         .iter()
         .chain(objective.failure_criteria.iter())
-        .any(|predicate| {
-            matches!(
-                predicate,
-                Predicate::RunSucceeded { module_name } if normalize_token(module_name) == module_reference
-            )
+        .filter_map(|predicate| match predicate {
+            Predicate::RunSucceeded { module_name } => Some(normalize_token(module_name)),
+            _ => None,
         })
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 fn diff_modules(
@@ -2746,16 +2904,24 @@ pub fn execute_planner_pipeline(
     request: &PlanRequest,
     context: &PlannerEngineContext,
 ) -> Result<PlannerEngineOutput, PlanningContractError> {
-    execute_planner_pipeline_with_forbidden_edges(snapshot, request, context, &BTreeSet::new())
+    let graph_output = build_capability_graph(snapshot)?;
+    execute_planner_pipeline_prepared(&graph_output, request, context)
 }
 
-fn execute_planner_pipeline_with_forbidden_edges(
-    snapshot: &NormalizedPlannerSnapshot,
+pub fn execute_planner_pipeline_prepared(
+    graph_output: &GraphBuildOutput,
+    request: &PlanRequest,
+    context: &PlannerEngineContext,
+) -> Result<PlannerEngineOutput, PlanningContractError> {
+    execute_planner_pipeline_with_graph(graph_output, request, context, &BTreeSet::new())
+}
+
+fn execute_planner_pipeline_with_graph(
+    graph_output: &GraphBuildOutput,
     request: &PlanRequest,
     context: &PlannerEngineContext,
     forbidden_edges: &BTreeSet<PlanEdgeId>,
 ) -> Result<PlannerEngineOutput, PlanningContractError> {
-    let graph_output = build_capability_graph(snapshot)?;
     let astar_request = AStarPlanRequest::new(
         request.objective_id.clone(),
         context.available_capabilities.clone(),
@@ -2778,7 +2944,7 @@ fn execute_planner_pipeline_with_forbidden_edges(
             Vec::new(),
         )?;
         return Ok(PlannerEngineOutput {
-            graph_signature: graph_output.graph_signature,
+            graph_signature: graph_output.graph_signature.clone(),
             result: result.clone(),
             explanation: None,
             simulation: None,
@@ -2810,7 +2976,7 @@ fn execute_planner_pipeline_with_forbidden_edges(
             Vec::new(),
         )?;
         return Ok(PlannerEngineOutput {
-            graph_signature: graph_output.graph_signature,
+            graph_signature: graph_output.graph_signature.clone(),
             result: result.clone(),
             explanation: None,
             simulation: None,
@@ -2934,7 +3100,7 @@ fn execute_planner_pipeline_with_forbidden_edges(
     );
 
     Ok(PlannerEngineOutput {
-        graph_signature: graph_output.graph_signature,
+        graph_signature: graph_output.graph_signature.clone(),
         result,
         explanation,
         simulation,
@@ -2985,7 +3151,8 @@ pub fn conditional_replan(
 ) -> Result<ConditionalReplanOutput, PlanningContractError> {
     let rebuild = plan_graph_rebuild(previous, next);
     let reevaluated = previous.is_none() || rebuild.requires_rebuild();
-    let primary = execute_planner_pipeline(next, request, context)?;
+    let prepared = PreparedPlannerSnapshot::prepare(next)?;
+    let primary = execute_planner_pipeline_prepared(&prepared.graph_output, request, context)?;
 
     if !reevaluated {
         return Ok(ConditionalReplanOutput {
@@ -3018,8 +3185,8 @@ pub fn conditional_replan(
             continue;
         }
 
-        let candidate = execute_planner_pipeline_with_forbidden_edges(
-            next,
+        let candidate = execute_planner_pipeline_with_graph(
+            &prepared.graph_output,
             request,
             context,
             &forbidden_edges,
@@ -4226,6 +4393,72 @@ mod tests {
     fn edge_attrs() -> PlanEdgeAttributes {
         PlanEdgeAttributes::new(BTreeSet::new(), 10, RiskLevel::Low, 5_000, BTreeSet::new())
             .expect("attrs")
+    }
+
+    fn synthetic_scale_snapshot(
+        module_count: usize,
+    ) -> Result<(NormalizedPlannerSnapshot, ObjectiveId), PlanningContractError> {
+        let campaign_id = parse_campaign_id("33333333-3333-3333-3333-333333333333");
+        let mut modules = Vec::with_capacity(module_count);
+        let mut objectives = Vec::with_capacity(module_count);
+        let mut target_objective = None::<ObjectiveId>;
+
+        for idx in 0..module_count {
+            let module_reference = format!("auxiliary/scale/module/{}", idx);
+            let mut required_capabilities = BTreeSet::new();
+            if idx % 3 == 0 {
+                required_capabilities.insert("exploit_execution".to_string());
+            }
+            modules.push(RegisteredModuleInput::new(
+                &module_reference,
+                required_capabilities,
+                (idx % 10) as u32 + 1,
+                if idx % 9 == 0 {
+                    RiskLevel::High
+                } else if idx % 3 == 0 {
+                    RiskLevel::Medium
+                } else {
+                    RiskLevel::Low
+                },
+                7_000u16.saturating_add((idx % 1_000) as u16),
+                BTreeSet::from([format!("signal_type_{}", idx % 64)]),
+                BTreeMap::new(),
+            )?);
+
+            let objective_id = parse_objective_id(&format!(
+                "{:08x}-1234-5678-9abc-{:012x}",
+                idx as u64 + 1,
+                idx as u64 + 1
+            ));
+            if idx == module_count.saturating_sub(1) {
+                target_objective = Some(objective_id.clone());
+            }
+            objectives.push(ObjectiveDefinitionInput::new(
+                objective_id,
+                campaign_id.clone(),
+                ObjectiveStatus::Pending,
+                vec![],
+                vec![Predicate::RunSucceeded {
+                    module_name: module_reference,
+                }],
+                vec![],
+                RiskLevel::Low,
+                None,
+                BTreeMap::new(),
+            )?);
+        }
+
+        let snapshot = normalize_planner_input(PlannerNormalizationInput::new(
+            modules,
+            objectives,
+            vec![],
+            BTreeMap::new(),
+        )?)?;
+
+        Ok((
+            snapshot,
+            target_objective.expect("module_count > 0 should set target objective"),
+        ))
     }
 
     #[test]
@@ -5495,6 +5728,107 @@ mod tests {
         assert_eq!(simulate.result.status, PlanLifecycleStatus::Simulated);
         assert!(simulate.explanation.is_some());
         assert!(simulate.simulation.is_some());
+    }
+
+    #[test]
+    fn indexed_graph_build_scales_to_1000_plus_modules_under_budget() {
+        let (snapshot, _) = synthetic_scale_snapshot(1_200).expect("scale snapshot");
+        let started = std::time::Instant::now();
+        let prepared = PreparedPlannerSnapshot::prepare(&snapshot).expect("prepared snapshot");
+        let elapsed = started.elapsed();
+        let memory_bytes = prepared.estimated_footprint_bytes();
+
+        assert_eq!(prepared.snapshot.modules().len(), 1_200);
+        assert!(prepared.graph_output.graph.node_count() >= 1_200);
+        assert!(prepared.graph_output.graph.edge_count() >= 1_200);
+        assert!(
+            elapsed <= std::time::Duration::from_secs(8),
+            "indexed graph build exceeded budget: {:?}",
+            elapsed
+        );
+        assert!(
+            memory_bytes <= 64 * 1024 * 1024,
+            "prepared snapshot memory estimate exceeded budget: {} bytes",
+            memory_bytes
+        );
+    }
+
+    #[test]
+    fn prepared_pipeline_matches_unprepared_pipeline_for_identical_inputs() {
+        let (snapshot, objective_id) = synthetic_scale_snapshot(1_024).expect("scale snapshot");
+        let request = PlanRequest::new(
+            objective_id,
+            PlanRequestMode::Plan,
+            "prepared.equivalence",
+            None,
+            false,
+        )
+        .expect("request");
+        let context = PlannerEngineContext::new(777, BTreeSet::new(), AStarCostWeights::default());
+
+        let baseline = execute_planner_pipeline(&snapshot, &request, &context).expect("baseline");
+        let prepared = PreparedPlannerSnapshot::prepare(&snapshot).expect("prepared");
+        let accelerated =
+            execute_planner_pipeline_prepared(&prepared.graph_output, &request, &context)
+                .expect("accelerated");
+
+        assert_eq!(baseline.result, accelerated.result);
+        assert_eq!(baseline.graph_signature, accelerated.graph_signature);
+        assert_eq!(baseline.event_payloads, accelerated.event_payloads);
+    }
+
+    #[test]
+    fn concurrent_planning_requests_are_thread_safe_and_budgeted() {
+        let (snapshot, objective_id) = synthetic_scale_snapshot(1_200).expect("scale snapshot");
+        let engine = std::sync::Arc::new(ConcurrentPlannerEngine::new(&snapshot).expect("engine"));
+        let worker_count = 8usize;
+        let requests_per_worker = 80usize;
+        let started = std::time::Instant::now();
+
+        let mut handles = Vec::with_capacity(worker_count);
+        for worker_id in 0..worker_count {
+            let engine = engine.clone();
+            let objective_id = objective_id.clone();
+            handles.push(std::thread::spawn(move || -> String {
+                let context =
+                    PlannerEngineContext::new(888, BTreeSet::new(), AStarCostWeights::default());
+                let mut expected_hash = None::<String>;
+                for idx in 0..requests_per_worker {
+                    let request = PlanRequest::new(
+                        objective_id.clone(),
+                        PlanRequestMode::Plan,
+                        &format!("concurrent.plan.{worker_id}.{idx}"),
+                        None,
+                        false,
+                    )
+                    .expect("request");
+                    let output = engine.execute(&request, &context).expect("execute");
+                    let current_hash = plan_result_hash(&output.result);
+                    match expected_hash.as_ref() {
+                        Some(existing) => assert_eq!(existing, &current_hash),
+                        None => expected_hash = Some(current_hash),
+                    }
+                }
+                expected_hash.expect("at least one request")
+            }));
+        }
+
+        let mut hashes = BTreeSet::new();
+        for handle in handles {
+            hashes.insert(handle.join().expect("worker join"));
+        }
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            hashes.len(),
+            1,
+            "all workers must converge to same plan hash"
+        );
+        assert!(
+            elapsed <= std::time::Duration::from_secs(12),
+            "concurrent planning exceeded budget: {:?}",
+            elapsed
+        );
     }
 
     #[test]
