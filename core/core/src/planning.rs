@@ -11,6 +11,7 @@ use crate::time::now_secs;
 
 pub const PLANNING_CONTRACT_ID: &str = "ml.planning.contract.v1";
 pub const PLANNING_SCHEMA_VERSION: u32 = 1;
+pub const PLANNING_PERSISTENCE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanningContractError {
@@ -48,6 +49,7 @@ pub enum PlanningContractError {
         field: &'static str,
         key: String,
     },
+    Storage(String),
 }
 
 impl PlanningContractError {
@@ -63,6 +65,7 @@ impl PlanningContractError {
             PlanningContractError::DuplicateObjectiveDefinition { .. } => "ML-PLAN-0008",
             PlanningContractError::DuplicateArtifactRecord { .. } => "ML-PLAN-0009",
             PlanningContractError::MetadataConflict { .. } => "ML-PLAN-0010",
+            PlanningContractError::Storage(_) => "ML-PLAN-0011",
         }
     }
 }
@@ -114,6 +117,7 @@ impl fmt::Display for PlanningContractError {
             PlanningContractError::MetadataConflict { field, key } => {
                 write!(f, "conflicting metadata key for {field}: {key}")
             }
+            PlanningContractError::Storage(msg) => write!(f, "planning storage error: {msg}"),
         }
     }
 }
@@ -3072,6 +3076,131 @@ fn step_signature(steps: &[PlanStep]) -> String {
         .join("|")
 }
 
+fn plan_result_hash(result: &PlanResult) -> String {
+    format!("{:016x}", fnv1a64(encode_plan_result(result).as_bytes()))
+}
+
+fn encode_plan_result(result: &PlanResult) -> String {
+    let mut out = Vec::<String>::new();
+    out.push(result.objective_id.as_str().to_string());
+    out.push(result.status.as_str().to_string());
+    out.push(result.algorithm.as_str().to_string());
+    out.push(result.generated_at.to_string());
+    out.push(result.step_count.to_string());
+    out.push(result.total_noise_cost.to_string());
+    out.push(result.total_risk_cost.to_string());
+    out.push(result.success_probability_bps.to_string());
+    out.push(
+        result
+            .required_capabilities
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    out.push(
+        result
+            .blocked_capabilities
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    out.push(
+        result
+            .unreachable_reason
+            .as_ref()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_default(),
+    );
+    for step in &result.steps {
+        let required = step
+            .required_capabilities
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        let expected = step
+            .expected_artifacts
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        let blocked = step
+            .blocked_reasons
+            .iter()
+            .map(|reason| format!("{}:{}", reason.code(), reason.stable_encoding()))
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push(format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            step.order,
+            step.edge_id.as_str(),
+            step.module_reference.as_deref().unwrap_or(""),
+            step.estimated_noise_cost,
+            step.estimated_risk.as_str(),
+            step.probability_of_success_bps,
+            required,
+            expected,
+            blocked
+        ));
+    }
+    out.join("\n")
+}
+
+fn planner_context_signature(context: &PlannerEngineContext) -> String {
+    let mut parts = Vec::<String>::new();
+    parts.push(context.generated_at.to_string());
+    parts.push(
+        context
+            .available_capabilities
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    parts.push(context.weights.noise_weight.to_string());
+    parts.push(context.weights.risk_low_weight.to_string());
+    parts.push(context.weights.risk_medium_weight.to_string());
+    parts.push(context.weights.risk_high_weight.to_string());
+    parts.push(context.weights.step_weight.to_string());
+    parts.push(context.weights.capability_penalty_weight.to_string());
+    parts.push(
+        context
+            .policy_blocked_modules
+            .iter()
+            .map(|(module, policy)| format!("{}={}", module, policy))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    parts.push(
+        context
+            .module_scopes
+            .iter()
+            .map(|(module, scope)| format!("{}={}", module, scope))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    parts.push(
+        context
+            .allowed_scopes
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    format!("{:016x}", fnv1a64(parts.join("|").as_bytes()))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn rebuild_trigger_reason(triggers: &[GraphRebuildTrigger]) -> String {
     if triggers.is_empty() {
         return "none".to_string();
@@ -3682,6 +3811,331 @@ pub fn reconstruct_planning_from_events(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningEventLogSnapshot {
+    pub schema_version: u32,
+    pub events: Vec<PlanningEvent>,
+}
+
+impl PlanningEventLog {
+    pub fn snapshot(&self) -> PlanningEventLogSnapshot {
+        PlanningEventLogSnapshot {
+            schema_version: PLANNING_PERSISTENCE_SCHEMA_VERSION,
+            events: self.events.clone(),
+        }
+    }
+
+    pub fn from_snapshot(
+        snapshot: &PlanningEventLogSnapshot,
+    ) -> Result<Self, PlanningContractError> {
+        if snapshot.schema_version != PLANNING_PERSISTENCE_SCHEMA_VERSION {
+            return Err(PlanningContractError::InvariantViolation {
+                invariant: "planning event log snapshot schema version mismatch",
+            });
+        }
+
+        let mut log = PlanningEventLog::default();
+        for event in &snapshot.events {
+            let expected_sequence = *log
+                .next_sequence
+                .entry(event.objective_id.clone())
+                .or_insert(1);
+            if event.sequence != expected_sequence {
+                return Err(PlanningContractError::InvariantViolation {
+                    invariant:
+                        "planning event sequence must be monotonic and gapless per objective",
+                });
+            }
+
+            let effective = match log.correlations.get(&event.objective_id).copied() {
+                Some(existing) if existing != event.correlation_id => {
+                    return Err(PlanningContractError::InvariantViolation {
+                        invariant: "objective lineage correlation must remain immutable",
+                    });
+                }
+                Some(existing) => existing,
+                None => {
+                    log.correlations
+                        .insert(event.objective_id.clone(), event.correlation_id);
+                    event.correlation_id
+                }
+            };
+            if effective != event.correlation_id {
+                return Err(PlanningContractError::InvariantViolation {
+                    invariant: "planning correlation mismatch during restore",
+                });
+            }
+
+            let dedupe_key = format!("{}:{}", event.objective_id.as_str(), event.event_key);
+            if !log.applied_event_keys.insert(dedupe_key) {
+                return Err(PlanningContractError::InvariantViolation {
+                    invariant: "planning event key must remain unique per objective lineage",
+                });
+            }
+
+            log.events.push(event.clone());
+            log.next_sequence
+                .insert(event.objective_id.clone(), event.sequence.saturating_add(1));
+        }
+
+        Ok(log)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedPlannerDecision {
+    pub objective_id: ObjectiveId,
+    pub persisted_at: u64,
+    pub snapshot_signature: String,
+    pub context_signature: String,
+    pub graph_signature: String,
+    pub result_hash: String,
+    pub snapshot: NormalizedPlannerSnapshot,
+    pub request: PlanRequest,
+    pub context: PlannerEngineContext,
+    pub result: PlanResult,
+}
+
+impl PersistedPlannerDecision {
+    pub fn from_output(
+        snapshot: &NormalizedPlannerSnapshot,
+        request: &PlanRequest,
+        context: &PlannerEngineContext,
+        output: &PlannerEngineOutput,
+        persisted_at: u64,
+    ) -> Result<Self, PlanningContractError> {
+        if persisted_at == 0 {
+            return Err(PlanningContractError::InvalidField {
+                field: "planner_persisted_decision.persisted_at",
+                reason: "must be > 0",
+            });
+        }
+        if request.objective_id != output.result.objective_id {
+            return Err(PlanningContractError::InvariantViolation {
+                invariant: "persisted planner decision objective ids must match request and result",
+            });
+        }
+        Ok(Self {
+            objective_id: request.objective_id.clone(),
+            persisted_at,
+            snapshot_signature: snapshot.canonical_signature().to_string(),
+            context_signature: planner_context_signature(context),
+            graph_signature: output.graph_signature.clone(),
+            result_hash: plan_result_hash(&output.result),
+            snapshot: snapshot.clone(),
+            request: request.clone(),
+            context: context.clone(),
+            result: output.result.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerPersistenceSnapshot {
+    pub schema_version: u32,
+    pub event_log: PlanningEventLogSnapshot,
+    pub decisions: Vec<PersistedPlannerDecision>,
+}
+
+impl Default for PlannerPersistenceSnapshot {
+    fn default() -> Self {
+        Self {
+            schema_version: PLANNING_PERSISTENCE_SCHEMA_VERSION,
+            event_log: PlanningEventLogSnapshot {
+                schema_version: PLANNING_PERSISTENCE_SCHEMA_VERSION,
+                events: Vec::new(),
+            },
+            decisions: Vec::new(),
+        }
+    }
+}
+
+pub trait PlannerStateStore {
+    fn load(&mut self) -> Result<Option<PlannerPersistenceSnapshot>, PlanningContractError>;
+    fn save(&mut self, snapshot: &PlannerPersistenceSnapshot) -> Result<(), PlanningContractError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryPlannerStateStore {
+    snapshot: Option<PlannerPersistenceSnapshot>,
+}
+
+impl InMemoryPlannerStateStore {
+    pub fn with_snapshot(snapshot: PlannerPersistenceSnapshot) -> Self {
+        Self {
+            snapshot: Some(snapshot),
+        }
+    }
+
+    pub fn snapshot(&self) -> Option<PlannerPersistenceSnapshot> {
+        self.snapshot.clone()
+    }
+}
+
+impl PlannerStateStore for InMemoryPlannerStateStore {
+    fn load(&mut self) -> Result<Option<PlannerPersistenceSnapshot>, PlanningContractError> {
+        Ok(self.snapshot.clone())
+    }
+
+    fn save(&mut self, snapshot: &PlannerPersistenceSnapshot) -> Result<(), PlanningContractError> {
+        self.snapshot = Some(snapshot.clone());
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerReplayEquivalence {
+    pub objective_id: ObjectiveId,
+    pub persisted_hash: String,
+    pub recomputed_hash: String,
+    pub equivalent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerRecoveryReport {
+    pub schema_version: u32,
+    pub replay_reports: Vec<PlanningReplayReport>,
+    pub equivalence: Vec<PlannerReplayEquivalence>,
+    pub diagnostics: Vec<PlanningReplayDiagnostic>,
+    pub consistent: bool,
+}
+
+pub struct PlannerStateManager<S: PlannerStateStore> {
+    store: S,
+    state: PlannerPersistenceSnapshot,
+}
+
+impl<S: PlannerStateStore> PlannerStateManager<S> {
+    pub fn new(mut store: S) -> Result<Self, PlanningContractError> {
+        let state = match store.load()? {
+            Some(snapshot) => {
+                if snapshot.schema_version != PLANNING_PERSISTENCE_SCHEMA_VERSION {
+                    return Err(PlanningContractError::InvariantViolation {
+                        invariant: "planner persistence schema version mismatch",
+                    });
+                }
+                let _ = PlanningEventLog::from_snapshot(&snapshot.event_log)?;
+                snapshot
+            }
+            None => PlannerPersistenceSnapshot::default(),
+        };
+        Ok(Self { store, state })
+    }
+
+    pub fn state(&self) -> &PlannerPersistenceSnapshot {
+        &self.state
+    }
+
+    pub fn into_store(self) -> S {
+        self.store
+    }
+
+    pub fn record_execution(
+        &mut self,
+        snapshot: &NormalizedPlannerSnapshot,
+        request: &PlanRequest,
+        context: &PlannerEngineContext,
+        output: &PlannerEngineOutput,
+        persisted_at: u64,
+    ) -> Result<(), PlanningContractError> {
+        let decision = PersistedPlannerDecision::from_output(
+            snapshot,
+            request,
+            context,
+            output,
+            persisted_at,
+        )?;
+
+        let mut event_log = PlanningEventLog::from_snapshot(&self.state.event_log)?;
+        let _ = event_log.append_payloads(
+            &request.objective_id,
+            &output.event_payloads,
+            None,
+            &request.event_key,
+            persisted_at,
+        )?;
+        self.state.event_log = event_log.snapshot();
+
+        self.state
+            .decisions
+            .retain(|existing| existing.objective_id != decision.objective_id);
+        self.state.decisions.push(decision);
+        self.state
+            .decisions
+            .sort_by_key(|decision| decision.objective_id.as_str().to_string());
+
+        self.store.save(&self.state)
+    }
+
+    pub fn cold_recover(&self) -> Result<PlannerRecoveryReport, PlanningContractError> {
+        let event_log = PlanningEventLog::from_snapshot(&self.state.event_log)?;
+        let mut replay_reports = Vec::<PlanningReplayReport>::new();
+        let mut equivalence = Vec::<PlannerReplayEquivalence>::new();
+        let mut diagnostics = Vec::<PlanningReplayDiagnostic>::new();
+
+        let event_objectives = event_log
+            .events()
+            .iter()
+            .map(|event| event.objective_id.clone())
+            .collect::<BTreeSet<_>>();
+        let persisted_objectives = self
+            .state
+            .decisions
+            .iter()
+            .map(|decision| decision.objective_id.clone())
+            .collect::<BTreeSet<_>>();
+
+        for objective_id in event_objectives.difference(&persisted_objectives) {
+            diagnostics.push(PlanningReplayDiagnostic {
+                code: "ML-PLAN-RECOVERY-0001",
+                message: format!(
+                    "objective {} has planning events but no persisted planner snapshot",
+                    objective_id.as_str()
+                ),
+            });
+        }
+
+        for decision in &self.state.decisions {
+            let replay =
+                reconstruct_planning_from_events(event_log.events(), &decision.objective_id);
+            diagnostics.extend(replay.diagnostics.iter().cloned());
+            replay_reports.push(replay);
+
+            let recomputed =
+                execute_planner_pipeline(&decision.snapshot, &decision.request, &decision.context)?;
+            let recomputed_hash = plan_result_hash(&recomputed.result);
+            let equivalent =
+                recomputed_hash == decision.result_hash && recomputed.result == decision.result;
+            if !equivalent {
+                diagnostics.push(PlanningReplayDiagnostic {
+                    code: "ML-PLAN-RECOVERY-0002",
+                    message: format!(
+                        "objective {} planner replay equivalence mismatch persisted={} recomputed={}",
+                        decision.objective_id.as_str(),
+                        decision.result_hash,
+                        recomputed_hash
+                    ),
+                });
+            }
+            equivalence.push(PlannerReplayEquivalence {
+                objective_id: decision.objective_id.clone(),
+                persisted_hash: decision.result_hash.clone(),
+                recomputed_hash,
+                equivalent,
+            });
+        }
+
+        let consistent = diagnostics.is_empty() && equivalence.iter().all(|item| item.equivalent);
+        Ok(PlannerRecoveryReport {
+            schema_version: self.state.schema_version,
+            replay_reports,
+            equivalence,
+            diagnostics,
+            consistent,
+        })
+    }
+}
+
 fn validate_distinct_edge_endpoints(
     from: &PlanNodeId,
     to: &PlanNodeId,
@@ -4133,6 +4587,138 @@ mod tests {
         assert_eq!(decision.latest_total_noise_cost, 14);
         assert_eq!(decision.latest_success_probability_bps, 7_500);
         assert_eq!(decision.timeline.len(), 3);
+    }
+
+    #[test]
+    fn planner_state_manager_cold_recovery_matches_persisted_hash_after_restart() {
+        let objective_id = parse_objective_id("abababab-1111-2222-3333-cdcdcdcdcdcd");
+        let snapshot = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![RegisteredModuleInput::new(
+                    "auxiliary/recovery/sample",
+                    BTreeSet::new(),
+                    3,
+                    RiskLevel::Low,
+                    8_000,
+                    BTreeSet::from(["shell_access".to_string()]),
+                    BTreeMap::new(),
+                )
+                .expect("module")],
+                vec![ObjectiveDefinitionInput::new(
+                    objective_id.clone(),
+                    parse_campaign_id("cccccccc-1111-2222-3333-dddddddddddd"),
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![Predicate::RunSucceeded {
+                        module_name: "auxiliary/recovery/sample".to_string(),
+                    }],
+                    vec![],
+                    RiskLevel::Low,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                vec![],
+                BTreeMap::new(),
+            )
+            .expect("input"),
+        )
+        .expect("snapshot");
+
+        let request = PlanRequest::new(
+            objective_id.clone(),
+            PlanRequestMode::Plan,
+            "recover.plan.1",
+            None,
+            false,
+        )
+        .expect("request");
+        let context = PlannerEngineContext::new(999, BTreeSet::new(), AStarCostWeights::default());
+        let output = execute_planner_pipeline(&snapshot, &request, &context).expect("output");
+
+        let store = InMemoryPlannerStateStore::default();
+        let mut manager = PlannerStateManager::new(store).expect("manager");
+        manager
+            .record_execution(&snapshot, &request, &context, &output, 999)
+            .expect("record");
+        let report_a = manager.cold_recover().expect("cold recover first");
+        assert!(report_a.consistent);
+        assert_eq!(report_a.equivalence.len(), 1);
+        assert!(report_a.equivalence[0].equivalent);
+
+        let store = manager.into_store();
+        let recovered = PlannerStateManager::new(store).expect("recovered manager");
+        let report_b = recovered.cold_recover().expect("cold recover second");
+        assert!(report_b.consistent);
+        assert_eq!(report_b.equivalence.len(), 1);
+        assert!(report_b.equivalence[0].equivalent);
+    }
+
+    #[test]
+    fn planner_recovery_reports_hash_mismatch_deterministically() {
+        let objective_id = parse_objective_id("dededede-1111-2222-3333-efefefefefef");
+        let snapshot = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![RegisteredModuleInput::new(
+                    "auxiliary/recovery/mismatch",
+                    BTreeSet::new(),
+                    4,
+                    RiskLevel::Low,
+                    7_000,
+                    BTreeSet::from(["shell_access".to_string()]),
+                    BTreeMap::new(),
+                )
+                .expect("module")],
+                vec![ObjectiveDefinitionInput::new(
+                    objective_id.clone(),
+                    parse_campaign_id("f0f0f0f0-1111-2222-3333-010101010101"),
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![Predicate::RunSucceeded {
+                        module_name: "auxiliary/recovery/mismatch".to_string(),
+                    }],
+                    vec![],
+                    RiskLevel::Low,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                vec![],
+                BTreeMap::new(),
+            )
+            .expect("input"),
+        )
+        .expect("snapshot");
+
+        let request = PlanRequest::new(
+            objective_id.clone(),
+            PlanRequestMode::Plan,
+            "recover.plan.2",
+            None,
+            false,
+        )
+        .expect("request");
+        let context = PlannerEngineContext::new(1001, BTreeSet::new(), AStarCostWeights::default());
+        let output = execute_planner_pipeline(&snapshot, &request, &context).expect("output");
+
+        let store = InMemoryPlannerStateStore::default();
+        let mut manager = PlannerStateManager::new(store).expect("manager");
+        manager
+            .record_execution(&snapshot, &request, &context, &output, 1001)
+            .expect("record");
+        let mut store = manager.into_store();
+        let mut persisted = store.snapshot().expect("persisted snapshot");
+        persisted.decisions[0].result_hash = "0000000000000000".to_string();
+        store = InMemoryPlannerStateStore::with_snapshot(persisted);
+
+        let recovered = PlannerStateManager::new(store).expect("recovered manager");
+        let report = recovered.cold_recover().expect("cold recover");
+        assert!(!report.consistent);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|item| item.code == "ML-PLAN-RECOVERY-0002"));
+        assert!(report.equivalence.iter().any(|entry| !entry.equivalent));
     }
 
     #[test]
