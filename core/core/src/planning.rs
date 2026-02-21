@@ -1,4 +1,6 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BinaryHeap, VecDeque};
 use std::fmt;
 
 use crate::campaign::{
@@ -1681,6 +1683,443 @@ fn encode_graph_signature(graph: &CapabilityGraph) -> String {
     format!("nodes={node_signature}|edges={edge_signature}")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AStarCostWeights {
+    pub noise_weight: u32,
+    pub risk_low_weight: u32,
+    pub risk_medium_weight: u32,
+    pub risk_high_weight: u32,
+    pub step_weight: u32,
+    pub capability_penalty_weight: u32,
+}
+
+impl AStarCostWeights {
+    pub fn new(
+        noise_weight: u32,
+        risk_low_weight: u32,
+        risk_medium_weight: u32,
+        risk_high_weight: u32,
+        step_weight: u32,
+        capability_penalty_weight: u32,
+    ) -> Result<Self, PlanningContractError> {
+        if step_weight == 0 {
+            return Err(PlanningContractError::InvalidField {
+                field: "astar_cost_weights.step_weight",
+                reason: "must be greater than zero",
+            });
+        }
+        Ok(Self {
+            noise_weight,
+            risk_low_weight,
+            risk_medium_weight,
+            risk_high_weight,
+            step_weight,
+            capability_penalty_weight,
+        })
+    }
+
+    pub fn default_contract() -> Self {
+        Self {
+            noise_weight: 10,
+            risk_low_weight: 5,
+            risk_medium_weight: 25,
+            risk_high_weight: 100,
+            step_weight: 1,
+            capability_penalty_weight: 200,
+        }
+    }
+
+    fn risk_weight(&self, risk: RiskLevel) -> u64 {
+        match risk {
+            RiskLevel::Low => self.risk_low_weight as u64,
+            RiskLevel::Medium => self.risk_medium_weight as u64,
+            RiskLevel::High => self.risk_high_weight as u64,
+        }
+    }
+}
+
+impl Default for AStarCostWeights {
+    fn default() -> Self {
+        Self::default_contract()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AStarPlanRequest {
+    pub objective_id: ObjectiveId,
+    pub available_capabilities: BTreeSet<String>,
+    pub weights: AStarCostWeights,
+}
+
+impl AStarPlanRequest {
+    pub fn new(
+        objective_id: ObjectiveId,
+        available_capabilities: BTreeSet<String>,
+        weights: AStarCostWeights,
+    ) -> Self {
+        Self {
+            objective_id,
+            available_capabilities: normalize_tokens(available_capabilities),
+            weights,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AStarPlanResult {
+    pub objective_id: ObjectiveId,
+    pub start_node: PlanNodeId,
+    pub goal_node: PlanNodeId,
+    pub traversed_nodes: Vec<PlanNodeId>,
+    pub traversed_edges: Vec<PlanEdgeId>,
+    pub total_cost: u64,
+    pub total_noise_cost: u64,
+    pub required_capabilities: BTreeSet<String>,
+    pub blocked_capabilities: BTreeSet<String>,
+    pub weighted_success_probability_bps: u16,
+}
+
+pub fn astar_plan(
+    graph: &CapabilityGraph,
+    request: &AStarPlanRequest,
+) -> Result<Option<AStarPlanResult>, PlanningContractError> {
+    let objective_nodes = graph
+        .nodes()
+        .iter()
+        .filter_map(|(node_id, node)| match node {
+            PlanNode::ObjectiveState(objective)
+                if objective.objective_id == request.objective_id =>
+            {
+                Some(node_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if objective_nodes.is_empty() {
+        return Ok(None);
+    }
+
+    let start_nodes = graph
+        .nodes()
+        .iter()
+        .filter_map(|(node_id, node)| match node {
+            PlanNode::CapabilityState(_) => Some(node_id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if start_nodes.is_empty() {
+        return Ok(None);
+    }
+
+    let lower_bound = minimum_edge_lower_bound(graph, &request.weights);
+    let hop_bounds = compute_goal_hop_bounds(graph, &objective_nodes);
+    let adjacency = adjacency_index(graph);
+
+    let mut open = BinaryHeap::<OpenEntry>::new();
+    let mut best_g = BTreeMap::<PlanNodeId, u64>::new();
+    let mut parent = BTreeMap::<PlanNodeId, ParentStep>::new();
+    let mut expansion_seq = 0_u64;
+
+    for start in start_nodes {
+        let g = 0_u64;
+        let h = heuristic_cost(&start, &hop_bounds, lower_bound);
+        let f = g.saturating_add(h);
+        best_g.insert(start.clone(), g);
+        open.push(OpenEntry {
+            f,
+            h,
+            g,
+            node_id: start,
+            seq: expansion_seq,
+        });
+        expansion_seq = expansion_seq.saturating_add(1);
+    }
+
+    while let Some(entry) = open.pop() {
+        let Some(recorded_g) = best_g.get(&entry.node_id).copied() else {
+            continue;
+        };
+        if recorded_g != entry.g {
+            continue;
+        }
+        if objective_nodes.contains(&entry.node_id) {
+            let (nodes, edges) = reconstruct_path(&entry.node_id, &parent);
+            let metrics = calculate_path_metrics(graph, &edges, request);
+            return Ok(Some(AStarPlanResult {
+                objective_id: request.objective_id.clone(),
+                start_node: nodes.first().expect("path has at least one node").clone(),
+                goal_node: entry.node_id.clone(),
+                traversed_nodes: nodes,
+                traversed_edges: edges,
+                total_cost: entry.g,
+                total_noise_cost: metrics.total_noise_cost,
+                required_capabilities: metrics.required_capabilities,
+                blocked_capabilities: metrics.blocked_capabilities,
+                weighted_success_probability_bps: metrics.weighted_success_probability_bps,
+            }));
+        }
+
+        let Some(neighbors) = adjacency.get(&entry.node_id) else {
+            continue;
+        };
+        for (edge_id, next_node) in neighbors {
+            let edge = graph
+                .edges()
+                .get(edge_id)
+                .expect("adjacency edges always resolve in graph");
+            let step_cost = edge_weight(edge, &request.available_capabilities, &request.weights);
+            let tentative_g = entry.g.saturating_add(step_cost);
+            let existing = best_g.get(next_node).copied();
+            let should_update = match existing {
+                None => true,
+                Some(current) if tentative_g < current => true,
+                Some(current) if tentative_g == current => {
+                    should_prefer_parent(parent.get(next_node), &entry.node_id, edge_id)
+                }
+                Some(_) => false,
+            };
+            if !should_update {
+                continue;
+            }
+
+            best_g.insert(next_node.clone(), tentative_g);
+            parent.insert(
+                next_node.clone(),
+                ParentStep {
+                    parent_node: entry.node_id.clone(),
+                    edge_id: edge_id.clone(),
+                },
+            );
+
+            let h = heuristic_cost(next_node, &hop_bounds, lower_bound);
+            let f = tentative_g.saturating_add(h);
+            open.push(OpenEntry {
+                f,
+                h,
+                g: tentative_g,
+                node_id: next_node.clone(),
+                seq: expansion_seq,
+            });
+            expansion_seq = expansion_seq.saturating_add(1);
+        }
+    }
+
+    Ok(None)
+}
+
+fn should_prefer_parent(
+    current_parent: Option<&ParentStep>,
+    candidate_parent_node: &PlanNodeId,
+    candidate_edge_id: &PlanEdgeId,
+) -> bool {
+    match current_parent {
+        None => true,
+        Some(current) => {
+            let candidate = (candidate_edge_id.as_str(), candidate_parent_node.as_str());
+            let existing = (current.edge_id.as_str(), current.parent_node.as_str());
+            candidate < existing
+        }
+    }
+}
+
+fn edge_weight(
+    edge: &PlanEdge,
+    available_capabilities: &BTreeSet<String>,
+    weights: &AStarCostWeights,
+) -> u64 {
+    let attrs = edge.attrs();
+    let base_noise =
+        (attrs.estimated_noise_cost as u64).saturating_mul(weights.noise_weight as u64);
+    let base_risk = weights.risk_weight(attrs.estimated_risk);
+    let step = weights.step_weight as u64;
+    let missing = attrs
+        .required_capabilities
+        .iter()
+        .filter(|capability| !available_capabilities.contains(*capability))
+        .count() as u64;
+    let capability_penalty = missing.saturating_mul(weights.capability_penalty_weight as u64);
+    base_noise
+        .saturating_add(base_risk)
+        .saturating_add(step)
+        .saturating_add(capability_penalty)
+}
+
+fn minimum_edge_lower_bound(graph: &CapabilityGraph, weights: &AStarCostWeights) -> u64 {
+    let minimum = graph
+        .edges()
+        .values()
+        .map(|edge| {
+            let attrs = edge.attrs();
+            (attrs.estimated_noise_cost as u64)
+                .saturating_mul(weights.noise_weight as u64)
+                .saturating_add(weights.risk_weight(attrs.estimated_risk))
+                .saturating_add(weights.step_weight as u64)
+        })
+        .min()
+        .unwrap_or(0);
+    minimum
+}
+
+fn compute_goal_hop_bounds(
+    graph: &CapabilityGraph,
+    goals: &BTreeSet<PlanNodeId>,
+) -> BTreeMap<PlanNodeId, u32> {
+    let mut reverse = BTreeMap::<PlanNodeId, Vec<PlanNodeId>>::new();
+    for edge in graph.edges().values() {
+        reverse
+            .entry(edge.to().clone())
+            .or_default()
+            .push(edge.from().clone());
+    }
+    for nodes in reverse.values_mut() {
+        nodes.sort_by_key(|node| node.as_str().to_string());
+    }
+
+    let mut distances = BTreeMap::<PlanNodeId, u32>::new();
+    let mut queue = VecDeque::<PlanNodeId>::new();
+    for goal in goals {
+        distances.insert(goal.clone(), 0);
+        queue.push_back(goal.clone());
+    }
+
+    while let Some(node) = queue.pop_front() {
+        let next_distance = distances.get(&node).copied().unwrap_or(0).saturating_add(1);
+        let Some(predecessors) = reverse.get(&node) else {
+            continue;
+        };
+        for predecessor in predecessors {
+            let entry = distances.entry(predecessor.clone()).or_insert(u32::MAX);
+            if next_distance < *entry {
+                *entry = next_distance;
+                queue.push_back(predecessor.clone());
+            }
+        }
+    }
+
+    distances
+}
+
+fn heuristic_cost(
+    node_id: &PlanNodeId,
+    hop_bounds: &BTreeMap<PlanNodeId, u32>,
+    minimum_edge_cost: u64,
+) -> u64 {
+    let hops = hop_bounds.get(node_id).copied().unwrap_or(0) as u64;
+    hops.saturating_mul(minimum_edge_cost)
+}
+
+fn adjacency_index(graph: &CapabilityGraph) -> BTreeMap<PlanNodeId, Vec<(PlanEdgeId, PlanNodeId)>> {
+    let mut index = BTreeMap::<PlanNodeId, Vec<(PlanEdgeId, PlanNodeId)>>::new();
+    for (edge_id, edge) in graph.edges() {
+        index
+            .entry(edge.from().clone())
+            .or_default()
+            .push((edge_id.clone(), edge.to().clone()));
+    }
+    for neighbors in index.values_mut() {
+        neighbors.sort_by(|left, right| match left.1.as_str().cmp(right.1.as_str()) {
+            Ordering::Equal => left.0.as_str().cmp(right.0.as_str()),
+            order => order,
+        });
+    }
+    index
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParentStep {
+    parent_node: PlanNodeId,
+    edge_id: PlanEdgeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathMetrics {
+    total_noise_cost: u64,
+    required_capabilities: BTreeSet<String>,
+    blocked_capabilities: BTreeSet<String>,
+    weighted_success_probability_bps: u16,
+}
+
+fn calculate_path_metrics(
+    graph: &CapabilityGraph,
+    edges: &[PlanEdgeId],
+    request: &AStarPlanRequest,
+) -> PathMetrics {
+    let mut total_noise_cost = 0_u64;
+    let mut required_capabilities = BTreeSet::new();
+    let mut blocked_capabilities = BTreeSet::new();
+    let mut success_probability_bps = 10_000_u16;
+
+    for edge_id in edges {
+        let edge = graph
+            .edges()
+            .get(edge_id)
+            .expect("path edge must exist in graph");
+        let attrs = edge.attrs();
+        total_noise_cost = total_noise_cost.saturating_add(attrs.estimated_noise_cost as u64);
+        required_capabilities.extend(attrs.required_capabilities.iter().cloned());
+        for capability in &attrs.required_capabilities {
+            if !request.available_capabilities.contains(capability) {
+                blocked_capabilities.insert(capability.clone());
+            }
+        }
+        success_probability_bps = ((success_probability_bps as u32)
+            .saturating_mul(attrs.probability_of_success_bps as u32)
+            / 10_000) as u16;
+    }
+
+    PathMetrics {
+        total_noise_cost,
+        required_capabilities,
+        blocked_capabilities,
+        weighted_success_probability_bps: success_probability_bps,
+    }
+}
+
+fn reconstruct_path(
+    goal: &PlanNodeId,
+    parent: &BTreeMap<PlanNodeId, ParentStep>,
+) -> (Vec<PlanNodeId>, Vec<PlanEdgeId>) {
+    let mut nodes = vec![goal.clone()];
+    let mut edges = Vec::<PlanEdgeId>::new();
+    let mut cursor = goal.clone();
+    while let Some(step) = parent.get(&cursor) {
+        edges.push(step.edge_id.clone());
+        nodes.push(step.parent_node.clone());
+        cursor = step.parent_node.clone();
+    }
+    nodes.reverse();
+    edges.reverse();
+    (nodes, edges)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenEntry {
+    f: u64,
+    h: u64,
+    g: u64,
+    node_id: PlanNodeId,
+    seq: u64,
+}
+
+impl Ord for OpenEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse ordering for BinaryHeap max-heap so smallest tuple pops first.
+        (other.f, other.h, other.g, other.node_id.as_str(), other.seq).cmp(&(
+            self.f,
+            self.h,
+            self.g,
+            self.node_id.as_str(),
+            self.seq,
+        ))
+    }
+}
+
+impl PartialOrd for OpenEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlanLifecycleStatus {
     Requested,
@@ -3057,5 +3496,260 @@ mod tests {
             rebuild.added_objectives,
             vec![parse_objective_id("99999999-9999-9999-9999-999999999999")]
         );
+    }
+
+    #[test]
+    fn astar_returns_reproducible_optimal_path_under_fixed_weights() {
+        let mut graph = CapabilityGraph::new();
+        let cap = parse_node_id("node/cap/start");
+        let asset = parse_node_id("node/asset/mid");
+        let goal = parse_node_id("node/objective/goal");
+
+        graph
+            .add_node(PlanNode::CapabilityState(
+                CapabilityStateNode::new(cap.clone(), "exploit_execution", true).expect("cap"),
+            ))
+            .expect("cap node");
+        graph
+            .add_node(PlanNode::AssetState(
+                AssetStateNode::new(asset.clone(), "shell_access", "expected").expect("asset"),
+            ))
+            .expect("asset node");
+        graph
+            .add_node(PlanNode::ObjectiveState(
+                ObjectiveStateNode::new(
+                    goal.clone(),
+                    parse_objective_id("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+                    ObjectiveStatus::Pending,
+                    "goal",
+                )
+                .expect("goal"),
+            ))
+            .expect("objective node");
+
+        let direct = PlanEdge::module_execution(
+            parse_edge_id("edge/direct"),
+            cap.clone(),
+            goal.clone(),
+            "module/direct",
+            PlanEdgeAttributes::new(
+                BTreeSet::from(["exploit_execution".to_string()]),
+                20,
+                RiskLevel::High,
+                8_000,
+                BTreeSet::new(),
+            )
+            .expect("attrs"),
+        )
+        .expect("edge");
+        graph.add_edge(direct).expect("insert direct");
+
+        let step_one = PlanEdge::module_execution(
+            parse_edge_id("edge/step-one"),
+            cap.clone(),
+            asset.clone(),
+            "module/step-one",
+            PlanEdgeAttributes::new(
+                BTreeSet::from(["exploit_execution".to_string()]),
+                5,
+                RiskLevel::Low,
+                9_000,
+                BTreeSet::new(),
+            )
+            .expect("attrs"),
+        )
+        .expect("edge");
+        graph.add_edge(step_one).expect("insert step1");
+        let step_two = PlanEdge::module_execution(
+            parse_edge_id("edge/step-two"),
+            asset.clone(),
+            goal.clone(),
+            "module/step-two",
+            PlanEdgeAttributes::new(BTreeSet::new(), 5, RiskLevel::Low, 9_000, BTreeSet::new())
+                .expect("attrs"),
+        )
+        .expect("edge");
+        graph.add_edge(step_two).expect("insert step2");
+
+        let request = AStarPlanRequest::new(
+            parse_objective_id("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+            BTreeSet::from(["exploit_execution".to_string()]),
+            AStarCostWeights::default_contract(),
+        );
+        let first = astar_plan(&graph, &request).expect("plan").expect("path");
+        let second = astar_plan(&graph, &request).expect("plan").expect("path");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first.traversed_edges,
+            vec![
+                parse_edge_id("edge/step-one"),
+                parse_edge_id("edge/step-two")
+            ]
+        );
+        assert!(
+            first.total_cost
+                < edge_weight(
+                    graph
+                        .edges()
+                        .get(&parse_edge_id("edge/direct"))
+                        .expect("direct edge"),
+                    &request.available_capabilities,
+                    &request.weights
+                )
+        );
+    }
+
+    #[test]
+    fn astar_uses_deterministic_tie_breaking_for_equal_f_scores() {
+        let mut graph = CapabilityGraph::new();
+        let start = parse_node_id("node/cap/start");
+        let branch_a = parse_node_id("node/asset/a");
+        let branch_b = parse_node_id("node/asset/b");
+        let goal = parse_node_id("node/objective/goal");
+
+        graph
+            .add_node(PlanNode::CapabilityState(
+                CapabilityStateNode::new(start.clone(), "scan", true).expect("cap"),
+            ))
+            .expect("node");
+        graph
+            .add_node(PlanNode::AssetState(
+                AssetStateNode::new(branch_a.clone(), "signal", "expected").expect("a"),
+            ))
+            .expect("node");
+        graph
+            .add_node(PlanNode::AssetState(
+                AssetStateNode::new(branch_b.clone(), "signal", "expected").expect("b"),
+            ))
+            .expect("node");
+        graph
+            .add_node(PlanNode::ObjectiveState(
+                ObjectiveStateNode::new(
+                    goal.clone(),
+                    parse_objective_id("cccccccc-cccc-cccc-cccc-cccccccccccc"),
+                    ObjectiveStatus::Pending,
+                    "goal",
+                )
+                .expect("goal"),
+            ))
+            .expect("node");
+
+        for edge in [
+            PlanEdge::module_execution(
+                parse_edge_id("edge/start-a"),
+                start.clone(),
+                branch_a.clone(),
+                "module/start-a",
+                edge_attrs(),
+            ),
+            PlanEdge::module_execution(
+                parse_edge_id("edge/start-b"),
+                start.clone(),
+                branch_b.clone(),
+                "module/start-b",
+                edge_attrs(),
+            ),
+            PlanEdge::module_execution(
+                parse_edge_id("edge/a-goal"),
+                branch_a.clone(),
+                goal.clone(),
+                "module/a-goal",
+                edge_attrs(),
+            ),
+            PlanEdge::module_execution(
+                parse_edge_id("edge/b-goal"),
+                branch_b.clone(),
+                goal.clone(),
+                "module/b-goal",
+                edge_attrs(),
+            ),
+        ] {
+            graph.add_edge(edge.expect("edge")).expect("insert");
+        }
+
+        let request = AStarPlanRequest::new(
+            parse_objective_id("cccccccc-cccc-cccc-cccc-cccccccccccc"),
+            BTreeSet::new(),
+            AStarCostWeights::default_contract(),
+        );
+        let plan = astar_plan(&graph, &request).expect("plan").expect("path");
+        assert_eq!(
+            plan.traversed_edges,
+            vec![parse_edge_id("edge/start-a"), parse_edge_id("edge/a-goal")]
+        );
+    }
+
+    #[test]
+    fn astar_heuristic_is_consistent_and_admissible() {
+        let mut graph = CapabilityGraph::new();
+        let start = parse_node_id("node/cap/start");
+        let mid = parse_node_id("node/asset/mid");
+        let goal = parse_node_id("node/objective/goal");
+        graph
+            .add_node(PlanNode::CapabilityState(
+                CapabilityStateNode::new(start.clone(), "scan", true).expect("start"),
+            ))
+            .expect("insert");
+        graph
+            .add_node(PlanNode::AssetState(
+                AssetStateNode::new(mid.clone(), "signal", "expected").expect("mid"),
+            ))
+            .expect("insert");
+        graph
+            .add_node(PlanNode::ObjectiveState(
+                ObjectiveStateNode::new(
+                    goal.clone(),
+                    parse_objective_id("dddddddd-dddd-dddd-dddd-dddddddddddd"),
+                    ObjectiveStatus::Pending,
+                    "goal",
+                )
+                .expect("goal"),
+            ))
+            .expect("insert");
+        graph
+            .add_edge(
+                PlanEdge::module_execution(
+                    parse_edge_id("edge/start-mid"),
+                    start.clone(),
+                    mid.clone(),
+                    "module/start-mid",
+                    edge_attrs(),
+                )
+                .expect("edge"),
+            )
+            .expect("insert edge");
+        graph
+            .add_edge(
+                PlanEdge::module_execution(
+                    parse_edge_id("edge/mid-goal"),
+                    mid.clone(),
+                    goal.clone(),
+                    "module/mid-goal",
+                    edge_attrs(),
+                )
+                .expect("edge"),
+            )
+            .expect("insert edge");
+
+        let goals = BTreeSet::from([goal.clone()]);
+        let weights = AStarCostWeights::default_contract();
+        let lower = minimum_edge_lower_bound(&graph, &weights);
+        let hops = compute_goal_hop_bounds(&graph, &goals);
+        let caps = BTreeSet::new();
+        for edge in graph.edges().values() {
+            let h_from = heuristic_cost(edge.from(), &hops, lower);
+            let h_to = heuristic_cost(edge.to(), &hops, lower);
+            let c = edge_weight(edge, &caps, &weights);
+            assert!(h_from <= c.saturating_add(h_to));
+        }
+
+        let request = AStarPlanRequest::new(
+            parse_objective_id("dddddddd-dddd-dddd-dddd-dddddddddddd"),
+            BTreeSet::new(),
+            weights,
+        );
+        let plan = astar_plan(&graph, &request).expect("plan").expect("path");
+        assert_eq!(plan.traversed_edges.len(), 2);
     }
 }
