@@ -2506,6 +2506,7 @@ pub enum PlanUnreachableReason {
     PrerequisitesUnsatisfied,
     CapabilityUnavailable,
     ScopeRestricted,
+    StepLimitExceeded,
 }
 
 impl PlanUnreachableReason {
@@ -2515,6 +2516,7 @@ impl PlanUnreachableReason {
             PlanUnreachableReason::PrerequisitesUnsatisfied => "prerequisites_unsatisfied",
             PlanUnreachableReason::CapabilityUnavailable => "capability_unavailable",
             PlanUnreachableReason::ScopeRestricted => "scope_restricted",
+            PlanUnreachableReason::StepLimitExceeded => "step_limit_exceeded",
         }
     }
 }
@@ -2527,6 +2529,7 @@ pub struct PlanResult {
     pub generated_at: u64,
     pub step_count: u16,
     pub total_noise_cost: u64,
+    pub total_risk_cost: u64,
     pub required_capabilities: BTreeSet<String>,
     pub success_probability_bps: u16,
     pub blocked_capabilities: BTreeSet<String>,
@@ -2542,6 +2545,7 @@ impl PlanResult {
         algorithm: PlanningAlgorithm,
         generated_at: u64,
         total_noise_cost: u64,
+        total_risk_cost: u64,
         required_capabilities: BTreeSet<String>,
         success_probability_bps: u16,
         blocked_capabilities: BTreeSet<String>,
@@ -2586,6 +2590,7 @@ impl PlanResult {
             generated_at,
             step_count: steps.len() as u16,
             total_noise_cost,
+            total_risk_cost,
             required_capabilities: normalize_tokens(required_capabilities),
             success_probability_bps,
             blocked_capabilities: normalize_tokens(blocked_capabilities),
@@ -2598,6 +2603,7 @@ impl PlanResult {
         objective_id: ObjectiveId,
         status: PlanLifecycleStatus,
         total_noise_cost: u64,
+        total_risk_cost: u64,
         required_capabilities: BTreeSet<String>,
         success_probability_bps: u16,
         blocked_capabilities: BTreeSet<String>,
@@ -2610,12 +2616,357 @@ impl PlanResult {
             PlanningAlgorithm::AStar,
             now_secs(),
             total_noise_cost,
+            total_risk_cost,
             required_capabilities,
             success_probability_bps,
             blocked_capabilities,
             unreachable_reason,
             steps,
         )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerEngineContext {
+    pub generated_at: u64,
+    pub available_capabilities: BTreeSet<String>,
+    pub weights: AStarCostWeights,
+}
+
+impl PlannerEngineContext {
+    pub fn new(
+        generated_at: u64,
+        available_capabilities: BTreeSet<String>,
+        weights: AStarCostWeights,
+    ) -> Self {
+        Self {
+            generated_at,
+            available_capabilities: normalize_tokens(available_capabilities),
+            weights,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanStepExplanation {
+    pub order: u16,
+    pub edge_id: PlanEdgeId,
+    pub module_reference: Option<String>,
+    pub weighted_noise_cost: u64,
+    pub weighted_risk_cost: u64,
+    pub weighted_step_cost: u64,
+    pub weighted_capability_penalty_cost: u64,
+    pub weighted_total_cost: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanExplanation {
+    pub objective_id: ObjectiveId,
+    pub total_weighted_cost: u64,
+    pub heuristic_model: String,
+    pub steps: Vec<PlanStepExplanation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanSimulation {
+    pub objective_id: ObjectiveId,
+    pub predicted_artifact_chain: Vec<String>,
+    pub expected_detection_surface: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerEngineOutput {
+    pub graph_signature: String,
+    pub result: PlanResult,
+    pub explanation: Option<PlanExplanation>,
+    pub simulation: Option<PlanSimulation>,
+}
+
+pub fn execute_planner_pipeline(
+    snapshot: &NormalizedPlannerSnapshot,
+    request: &PlanRequest,
+    context: &PlannerEngineContext,
+) -> Result<PlannerEngineOutput, PlanningContractError> {
+    let graph_output = build_capability_graph(snapshot)?;
+    let astar_request = AStarPlanRequest::new(
+        request.objective_id.clone(),
+        context.available_capabilities.clone(),
+        context.weights.clone(),
+    );
+    let path = astar_plan(&graph_output.graph, &astar_request)?;
+    let Some(path) = path else {
+        return Ok(PlannerEngineOutput {
+            graph_signature: graph_output.graph_signature,
+            result: PlanResult::new(
+                request.objective_id.clone(),
+                PlanLifecycleStatus::Unreachable,
+                PlanningAlgorithm::AStar,
+                context.generated_at,
+                0,
+                0,
+                BTreeSet::new(),
+                0,
+                BTreeSet::new(),
+                Some(PlanUnreachableReason::NoGraphPath),
+                Vec::new(),
+            )?,
+            explanation: None,
+            simulation: None,
+        });
+    };
+
+    if request
+        .max_steps
+        .is_some_and(|max_steps| path.traversed_edges.len() as u16 > max_steps)
+    {
+        return Ok(PlannerEngineOutput {
+            graph_signature: graph_output.graph_signature,
+            result: PlanResult::new(
+                request.objective_id.clone(),
+                PlanLifecycleStatus::Unreachable,
+                PlanningAlgorithm::AStar,
+                context.generated_at,
+                0,
+                0,
+                BTreeSet::new(),
+                0,
+                BTreeSet::new(),
+                Some(PlanUnreachableReason::StepLimitExceeded),
+                Vec::new(),
+            )?,
+            explanation: None,
+            simulation: None,
+        });
+    }
+
+    let mut steps = Vec::with_capacity(path.traversed_edges.len());
+    let mut total_risk_cost = 0_u64;
+    for (idx, edge_id) in path.traversed_edges.iter().enumerate() {
+        let edge = graph_output
+            .graph
+            .edges()
+            .get(edge_id)
+            .expect("A* path edges must exist in graph");
+        let attrs = edge.attrs();
+        let blocked_capabilities = attrs
+            .required_capabilities
+            .iter()
+            .filter(|capability| !context.available_capabilities.contains(*capability))
+            .map(|capability| PlanStepBlockReason::CapabilityDisabled {
+                capability: capability.clone(),
+            })
+            .collect::<Vec<_>>();
+        total_risk_cost =
+            total_risk_cost.saturating_add(context.weights.risk_weight(attrs.estimated_risk));
+        steps.push(PlanStep::new(
+            idx as u16 + 1,
+            edge_id.clone(),
+            edge.module_reference().map(|value| value.to_string()),
+            attrs.required_capabilities.clone(),
+            attrs.estimated_noise_cost,
+            attrs.estimated_risk,
+            attrs.probability_of_success_bps,
+            attrs.expected_artifacts.clone(),
+            blocked_capabilities,
+        )?);
+    }
+
+    let blocked_capabilities = steps
+        .iter()
+        .flat_map(|step| step.blocked_reasons.iter())
+        .filter_map(|reason| match reason {
+            PlanStepBlockReason::CapabilityDisabled { capability } => Some(capability.clone()),
+            PlanStepBlockReason::PolicyDenied { .. } | PlanStepBlockReason::OutOfScope { .. } => {
+                None
+            }
+        })
+        .collect::<BTreeSet<_>>();
+
+    if !request.include_blocked_paths && !blocked_capabilities.is_empty() {
+        return Ok(PlannerEngineOutput {
+            graph_signature: graph_output.graph_signature,
+            result: PlanResult::new(
+                request.objective_id.clone(),
+                PlanLifecycleStatus::Unreachable,
+                PlanningAlgorithm::AStar,
+                context.generated_at,
+                0,
+                0,
+                BTreeSet::new(),
+                0,
+                blocked_capabilities,
+                Some(PlanUnreachableReason::CapabilityUnavailable),
+                Vec::new(),
+            )?,
+            explanation: None,
+            simulation: None,
+        });
+    }
+
+    let status = match request.mode {
+        PlanRequestMode::Plan => PlanLifecycleStatus::Proposed,
+        PlanRequestMode::Explain => PlanLifecycleStatus::Explained,
+        PlanRequestMode::Simulate => PlanLifecycleStatus::Simulated,
+    };
+
+    let result = PlanResult::new(
+        request.objective_id.clone(),
+        status,
+        PlanningAlgorithm::AStar,
+        context.generated_at,
+        path.total_noise_cost,
+        total_risk_cost,
+        path.required_capabilities.clone(),
+        path.weighted_success_probability_bps,
+        path.blocked_capabilities.clone(),
+        None,
+        steps.clone(),
+    )?;
+
+    let explanation = if matches!(
+        request.mode,
+        PlanRequestMode::Explain | PlanRequestMode::Simulate
+    ) {
+        Some(build_plan_explanation(
+            request.objective_id.clone(),
+            &steps,
+            &context.weights,
+        ))
+    } else {
+        None
+    };
+
+    let simulation = if request.mode == PlanRequestMode::Simulate {
+        Some(build_plan_simulation(request.objective_id.clone(), &steps))
+    } else {
+        None
+    };
+
+    Ok(PlannerEngineOutput {
+        graph_signature: graph_output.graph_signature,
+        result,
+        explanation,
+        simulation,
+    })
+}
+
+pub fn plan_pipeline(
+    snapshot: &NormalizedPlannerSnapshot,
+    objective_id: ObjectiveId,
+    event_key: &str,
+    generated_at: u64,
+    available_capabilities: BTreeSet<String>,
+    weights: AStarCostWeights,
+) -> Result<PlannerEngineOutput, PlanningContractError> {
+    let request = PlanRequest::new(objective_id, PlanRequestMode::Plan, event_key, None, false)?;
+    let context = PlannerEngineContext::new(generated_at, available_capabilities, weights);
+    execute_planner_pipeline(snapshot, &request, &context)
+}
+
+pub fn explain_pipeline(
+    snapshot: &NormalizedPlannerSnapshot,
+    objective_id: ObjectiveId,
+    event_key: &str,
+    generated_at: u64,
+    available_capabilities: BTreeSet<String>,
+    weights: AStarCostWeights,
+) -> Result<PlannerEngineOutput, PlanningContractError> {
+    let request = PlanRequest::new(
+        objective_id,
+        PlanRequestMode::Explain,
+        event_key,
+        None,
+        false,
+    )?;
+    let context = PlannerEngineContext::new(generated_at, available_capabilities, weights);
+    execute_planner_pipeline(snapshot, &request, &context)
+}
+
+pub fn simulate_pipeline(
+    snapshot: &NormalizedPlannerSnapshot,
+    objective_id: ObjectiveId,
+    event_key: &str,
+    generated_at: u64,
+    available_capabilities: BTreeSet<String>,
+    weights: AStarCostWeights,
+) -> Result<PlannerEngineOutput, PlanningContractError> {
+    let request = PlanRequest::new(
+        objective_id,
+        PlanRequestMode::Simulate,
+        event_key,
+        None,
+        true,
+    )?;
+    let context = PlannerEngineContext::new(generated_at, available_capabilities, weights);
+    execute_planner_pipeline(snapshot, &request, &context)
+}
+
+fn build_plan_explanation(
+    objective_id: ObjectiveId,
+    steps: &[PlanStep],
+    weights: &AStarCostWeights,
+) -> PlanExplanation {
+    let mut total_weighted_cost = 0_u64;
+    let mut rows = Vec::with_capacity(steps.len());
+    for step in steps {
+        let weighted_noise_cost =
+            (step.estimated_noise_cost as u64).saturating_mul(weights.noise_weight as u64);
+        let weighted_risk_cost = weights.risk_weight(step.estimated_risk);
+        let weighted_step_cost = weights.step_weight as u64;
+        let missing_cap_count = step
+            .blocked_reasons
+            .iter()
+            .filter(|reason| matches!(reason, PlanStepBlockReason::CapabilityDisabled { .. }))
+            .count() as u64;
+        let weighted_capability_penalty_cost =
+            missing_cap_count.saturating_mul(weights.capability_penalty_weight as u64);
+        let weighted_total_cost = weighted_noise_cost
+            .saturating_add(weighted_risk_cost)
+            .saturating_add(weighted_step_cost)
+            .saturating_add(weighted_capability_penalty_cost);
+        total_weighted_cost = total_weighted_cost.saturating_add(weighted_total_cost);
+
+        rows.push(PlanStepExplanation {
+            order: step.order,
+            edge_id: step.edge_id.clone(),
+            module_reference: step.module_reference.clone(),
+            weighted_noise_cost,
+            weighted_risk_cost,
+            weighted_step_cost,
+            weighted_capability_penalty_cost,
+            weighted_total_cost,
+        });
+    }
+
+    PlanExplanation {
+        objective_id,
+        total_weighted_cost,
+        heuristic_model: "astar.lower_bound_hop_cost".to_string(),
+        steps: rows,
+    }
+}
+
+fn build_plan_simulation(objective_id: ObjectiveId, steps: &[PlanStep]) -> PlanSimulation {
+    let predicted_artifact_chain = steps
+        .iter()
+        .flat_map(|step| step.expected_artifacts.iter().cloned())
+        .collect::<Vec<_>>();
+
+    let mut expected_detection_surface = BTreeSet::new();
+    for step in steps {
+        expected_detection_surface.insert(format!("risk:{}", step.estimated_risk.as_str()));
+        if let Some(module) = &step.module_reference {
+            expected_detection_surface.insert(format!("module:{}", normalize_token(module)));
+        }
+        for reason in &step.blocked_reasons {
+            expected_detection_surface.insert(format!("blocked:{}", reason.stable_encoding()));
+        }
+    }
+
+    PlanSimulation {
+        objective_id,
+        predicted_artifact_chain,
+        expected_detection_surface,
     }
 }
 
@@ -3049,6 +3400,7 @@ mod tests {
             PlanLifecycleStatus::Proposed,
             PlanningAlgorithm::AStar,
             1,
+            0,
             0,
             BTreeSet::new(),
             0,
@@ -3751,5 +4103,213 @@ mod tests {
         );
         let plan = astar_plan(&graph, &request).expect("plan").expect("path");
         assert_eq!(plan.traversed_edges.len(), 2);
+    }
+
+    #[test]
+    fn planner_engine_pipelines_are_deterministic_and_advisory_only() {
+        let objective_id = parse_objective_id("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
+        let campaign_id = parse_campaign_id("ffffffff-ffff-ffff-ffff-ffffffffffff");
+        let snapshot = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![RegisteredModuleInput::new(
+                    "exploit/linux/telnet/sample",
+                    BTreeSet::from(["exploit_execution".to_string()]),
+                    7,
+                    RiskLevel::High,
+                    7_500,
+                    BTreeSet::from(["shell_access".to_string()]),
+                    BTreeMap::new(),
+                )
+                .expect("module")],
+                vec![ObjectiveDefinitionInput::new(
+                    objective_id.clone(),
+                    campaign_id,
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![
+                        Predicate::FindingExists {
+                            finding_type: "shell_access".to_string(),
+                        },
+                        Predicate::RunSucceeded {
+                            module_name: "exploit/linux/telnet/sample".to_string(),
+                        },
+                    ],
+                    vec![],
+                    RiskLevel::High,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                vec![],
+                BTreeMap::new(),
+            )
+            .expect("input"),
+        )
+        .expect("snapshot");
+
+        let snapshot_before = snapshot.clone();
+        let weights = AStarCostWeights::default_contract();
+        let capabilities = BTreeSet::from(["exploit_execution".to_string()]);
+
+        let plan_a = plan_pipeline(
+            &snapshot,
+            objective_id.clone(),
+            "event.plan.1",
+            123456,
+            capabilities.clone(),
+            weights.clone(),
+        )
+        .expect("plan a");
+        let plan_b = plan_pipeline(
+            &snapshot,
+            objective_id.clone(),
+            "event.plan.1",
+            123456,
+            capabilities.clone(),
+            weights.clone(),
+        )
+        .expect("plan b");
+
+        assert_eq!(snapshot, snapshot_before);
+        assert_eq!(plan_a, plan_b);
+        assert_eq!(plan_a.result.status, PlanLifecycleStatus::Proposed);
+        assert!(plan_a.explanation.is_none());
+        assert!(plan_a.simulation.is_none());
+
+        let explain = explain_pipeline(
+            &snapshot,
+            objective_id.clone(),
+            "event.explain.1",
+            123456,
+            capabilities.clone(),
+            weights.clone(),
+        )
+        .expect("explain");
+        assert_eq!(explain.result.status, PlanLifecycleStatus::Explained);
+        assert!(explain.explanation.is_some());
+        assert!(explain.simulation.is_none());
+
+        let simulate = simulate_pipeline(
+            &snapshot,
+            objective_id,
+            "event.simulate.1",
+            123456,
+            capabilities,
+            weights,
+        )
+        .expect("simulate");
+        assert_eq!(simulate.result.status, PlanLifecycleStatus::Simulated);
+        assert!(simulate.explanation.is_some());
+        assert!(simulate.simulation.is_some());
+    }
+
+    #[test]
+    fn planner_engine_blocks_paths_when_capabilities_are_missing() {
+        let objective_id = parse_objective_id("12121212-3434-5656-7878-909090909090");
+        let snapshot = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![RegisteredModuleInput::new(
+                    "exploit/linux/needs-capability",
+                    BTreeSet::from(["exploit_execution".to_string()]),
+                    5,
+                    RiskLevel::Medium,
+                    8_000,
+                    BTreeSet::from(["shell_access".to_string()]),
+                    BTreeMap::new(),
+                )
+                .expect("module")],
+                vec![ObjectiveDefinitionInput::new(
+                    objective_id.clone(),
+                    parse_campaign_id("abababab-abab-abab-abab-abababababab"),
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![Predicate::RunSucceeded {
+                        module_name: "exploit/linux/needs-capability".to_string(),
+                    }],
+                    vec![],
+                    RiskLevel::Medium,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                vec![],
+                BTreeMap::new(),
+            )
+            .expect("input"),
+        )
+        .expect("snapshot");
+
+        let request = PlanRequest::new(
+            objective_id,
+            PlanRequestMode::Plan,
+            "blocked.path",
+            None,
+            false,
+        )
+        .expect("request");
+        let context = PlannerEngineContext::new(55, BTreeSet::new(), AStarCostWeights::default());
+        let output = execute_planner_pipeline(&snapshot, &request, &context).expect("output");
+        assert_eq!(output.result.status, PlanLifecycleStatus::Unreachable);
+        assert_eq!(
+            output.result.unreachable_reason,
+            Some(PlanUnreachableReason::CapabilityUnavailable)
+        );
+        assert!(output
+            .result
+            .blocked_capabilities
+            .contains("exploit_execution"));
+    }
+
+    #[test]
+    fn planner_engine_simulation_outputs_predicted_artifacts_and_detection_surface() {
+        let objective_id = parse_objective_id("13131313-1313-1313-1313-131313131313");
+        let snapshot = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![RegisteredModuleInput::new(
+                    "auxiliary/collect/artifacts",
+                    BTreeSet::new(),
+                    2,
+                    RiskLevel::Low,
+                    9_500,
+                    BTreeSet::from(["inventory".to_string(), "service_banner".to_string()]),
+                    BTreeMap::new(),
+                )
+                .expect("module")],
+                vec![ObjectiveDefinitionInput::new(
+                    objective_id.clone(),
+                    parse_campaign_id("14141414-1414-1414-1414-141414141414"),
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![Predicate::RunSucceeded {
+                        module_name: "auxiliary/collect/artifacts".to_string(),
+                    }],
+                    vec![],
+                    RiskLevel::Low,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                vec![],
+                BTreeMap::new(),
+            )
+            .expect("input"),
+        )
+        .expect("snapshot");
+
+        let output = simulate_pipeline(
+            &snapshot,
+            objective_id,
+            "sim.predict",
+            99,
+            BTreeSet::new(),
+            AStarCostWeights::default(),
+        )
+        .expect("simulate");
+        let simulation = output.simulation.expect("simulation payload");
+        assert!(!simulation.predicted_artifact_chain.is_empty());
+        assert!(simulation
+            .expected_detection_surface
+            .iter()
+            .any(|marker| marker.starts_with("risk:")));
     }
 }
