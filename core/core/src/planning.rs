@@ -2448,6 +2448,14 @@ pub enum PlanStepBlockReason {
 }
 
 impl PlanStepBlockReason {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            PlanStepBlockReason::CapabilityDisabled { .. } => "ML-PLAN-BLOCK-0001",
+            PlanStepBlockReason::PolicyDenied { .. } => "ML-PLAN-BLOCK-0002",
+            PlanStepBlockReason::OutOfScope { .. } => "ML-PLAN-BLOCK-0003",
+        }
+    }
+
     pub fn stable_encoding(&self) -> String {
         match self {
             PlanStepBlockReason::CapabilityDisabled { capability } => {
@@ -2516,6 +2524,7 @@ pub enum PlanUnreachableReason {
     NoGraphPath,
     PrerequisitesUnsatisfied,
     CapabilityUnavailable,
+    PolicyRestricted,
     ScopeRestricted,
     StepLimitExceeded,
 }
@@ -2526,6 +2535,7 @@ impl PlanUnreachableReason {
             PlanUnreachableReason::NoGraphPath => "no_graph_path",
             PlanUnreachableReason::PrerequisitesUnsatisfied => "prerequisites_unsatisfied",
             PlanUnreachableReason::CapabilityUnavailable => "capability_unavailable",
+            PlanUnreachableReason::PolicyRestricted => "policy_restricted",
             PlanUnreachableReason::ScopeRestricted => "scope_restricted",
             PlanUnreachableReason::StepLimitExceeded => "step_limit_exceeded",
         }
@@ -2642,6 +2652,9 @@ pub struct PlannerEngineContext {
     pub generated_at: u64,
     pub available_capabilities: BTreeSet<String>,
     pub weights: AStarCostWeights,
+    pub policy_blocked_modules: BTreeMap<String, String>,
+    pub module_scopes: BTreeMap<String, String>,
+    pub allowed_scopes: BTreeSet<String>,
 }
 
 impl PlannerEngineContext {
@@ -2654,7 +2667,37 @@ impl PlannerEngineContext {
             generated_at,
             available_capabilities: normalize_tokens(available_capabilities),
             weights,
+            policy_blocked_modules: BTreeMap::new(),
+            module_scopes: BTreeMap::new(),
+            allowed_scopes: BTreeSet::new(),
         }
+    }
+
+    pub fn with_policy_blocked_module(mut self, module_reference: &str, policy_key: &str) -> Self {
+        let module_reference = normalize_token(module_reference);
+        let policy_key = normalize_token(policy_key);
+        if !module_reference.is_empty() && !policy_key.is_empty() {
+            self.policy_blocked_modules
+                .insert(module_reference, policy_key);
+        }
+        self
+    }
+
+    pub fn with_module_scope(mut self, module_reference: &str, scope: &str) -> Self {
+        let module_reference = normalize_token(module_reference);
+        let scope = normalize_token(scope);
+        if !module_reference.is_empty() && !scope.is_empty() {
+            self.module_scopes.insert(module_reference, scope);
+        }
+        self
+    }
+
+    pub fn with_allowed_scope(mut self, scope: &str) -> Self {
+        let scope = normalize_token(scope);
+        if !scope.is_empty() {
+            self.allowed_scopes.insert(scope);
+        }
+        self
     }
 }
 
@@ -2777,6 +2820,25 @@ fn execute_planner_pipeline_with_forbidden_edges(
                 capability: capability.clone(),
             })
             .collect::<Vec<_>>();
+        let mut blocked_reasons = blocked_capabilities;
+        if let Some(module_reference) = edge.module_reference() {
+            let module_key = normalize_token(module_reference);
+            if let Some(policy_key) = context.policy_blocked_modules.get(&module_key) {
+                blocked_reasons.push(PlanStepBlockReason::PolicyDenied {
+                    policy_key: policy_key.clone(),
+                });
+            }
+            if !context.allowed_scopes.is_empty() {
+                let scope = context
+                    .module_scopes
+                    .get(&module_key)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+                if !context.allowed_scopes.contains(&scope) {
+                    blocked_reasons.push(PlanStepBlockReason::OutOfScope { scope_key: scope });
+                }
+            }
+        }
         total_risk_cost =
             total_risk_cost.saturating_add(context.weights.risk_weight(attrs.estimated_risk));
         steps.push(PlanStep::new(
@@ -2788,7 +2850,7 @@ fn execute_planner_pipeline_with_forbidden_edges(
             attrs.estimated_risk,
             attrs.probability_of_success_bps,
             attrs.expected_artifacts.clone(),
-            blocked_capabilities,
+            blocked_reasons,
         )?);
     }
 
@@ -2802,27 +2864,6 @@ fn execute_planner_pipeline_with_forbidden_edges(
             }
         })
         .collect::<BTreeSet<_>>();
-
-    if !request.include_blocked_paths && !blocked_capabilities.is_empty() {
-        return Ok(PlannerEngineOutput {
-            graph_signature: graph_output.graph_signature,
-            result: PlanResult::new(
-                request.objective_id.clone(),
-                PlanLifecycleStatus::Unreachable,
-                PlanningAlgorithm::AStar,
-                context.generated_at,
-                0,
-                0,
-                BTreeSet::new(),
-                0,
-                blocked_capabilities,
-                Some(PlanUnreachableReason::CapabilityUnavailable),
-                Vec::new(),
-            )?,
-            explanation: None,
-            simulation: None,
-        });
-    }
 
     let status = match request.mode {
         PlanRequestMode::Plan => PlanLifecycleStatus::Proposed,
@@ -2839,7 +2880,7 @@ fn execute_planner_pipeline_with_forbidden_edges(
         total_risk_cost,
         path.required_capabilities.clone(),
         path.weighted_success_probability_bps,
-        path.blocked_capabilities.clone(),
+        blocked_capabilities,
         None,
         steps.clone(),
     )?;
@@ -4367,7 +4408,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_engine_blocks_paths_when_capabilities_are_missing() {
+    fn planner_engine_marks_capability_constraints_without_blocking_path() {
         let objective_id = parse_objective_id("12121212-3434-5656-7878-909090909090");
         let snapshot = normalize_planner_input(
             PlannerNormalizationInput::new(
@@ -4412,15 +4453,143 @@ mod tests {
         .expect("request");
         let context = PlannerEngineContext::new(55, BTreeSet::new(), AStarCostWeights::default());
         let output = execute_planner_pipeline(&snapshot, &request, &context).expect("output");
-        assert_eq!(output.result.status, PlanLifecycleStatus::Unreachable);
-        assert_eq!(
-            output.result.unreachable_reason,
-            Some(PlanUnreachableReason::CapabilityUnavailable)
-        );
+        assert_eq!(output.result.status, PlanLifecycleStatus::Proposed);
+        assert!(output.result.unreachable_reason.is_none());
+        assert_eq!(output.result.steps.len(), 1);
+        assert!(output.result.steps[0].blocked_reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                PlanStepBlockReason::CapabilityDisabled { capability }
+                if capability == "exploit_execution"
+            ) && reason.code() == "ML-PLAN-BLOCK-0001"
+        }));
         assert!(output
             .result
             .blocked_capabilities
             .contains("exploit_execution"));
+    }
+
+    #[test]
+    fn planner_engine_marks_policy_denied_steps_with_deterministic_code() {
+        let objective_id = parse_objective_id("22121212-3434-5656-7878-909090909090");
+        let module_ref = "auxiliary/policy/denied";
+        let snapshot = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![RegisteredModuleInput::new(
+                    module_ref,
+                    BTreeSet::new(),
+                    3,
+                    RiskLevel::Low,
+                    8_000,
+                    BTreeSet::from(["shell_access".to_string()]),
+                    BTreeMap::new(),
+                )
+                .expect("module")],
+                vec![ObjectiveDefinitionInput::new(
+                    objective_id.clone(),
+                    parse_campaign_id("abababab-abab-abab-abab-abababababab"),
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![Predicate::RunSucceeded {
+                        module_name: module_ref.to_string(),
+                    }],
+                    vec![],
+                    RiskLevel::Low,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                vec![],
+                BTreeMap::new(),
+            )
+            .expect("input"),
+        )
+        .expect("snapshot");
+
+        let request = PlanRequest::new(
+            objective_id,
+            PlanRequestMode::Plan,
+            "blocked.policy.path",
+            None,
+            false,
+        )
+        .expect("request");
+        let context = PlannerEngineContext::new(65, BTreeSet::new(), AStarCostWeights::default())
+            .with_policy_blocked_module(module_ref, "deny:requires_confirmation");
+        let output = execute_planner_pipeline(&snapshot, &request, &context).expect("output");
+
+        assert_eq!(output.result.status, PlanLifecycleStatus::Proposed);
+        assert!(output.result.unreachable_reason.is_none());
+        assert_eq!(output.result.steps.len(), 1);
+        assert!(output.result.steps[0].blocked_reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                PlanStepBlockReason::PolicyDenied { policy_key }
+                if policy_key == "deny:requires_confirmation"
+            ) && reason.code() == "ML-PLAN-BLOCK-0002"
+        }));
+    }
+
+    #[test]
+    fn planner_engine_marks_scope_blocked_steps_with_deterministic_code() {
+        let objective_id = parse_objective_id("23121212-3434-5656-7878-909090909090");
+        let module_ref = "auxiliary/scope/public";
+        let snapshot = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![RegisteredModuleInput::new(
+                    module_ref,
+                    BTreeSet::new(),
+                    3,
+                    RiskLevel::Low,
+                    8_000,
+                    BTreeSet::from(["shell_access".to_string()]),
+                    BTreeMap::new(),
+                )
+                .expect("module")],
+                vec![ObjectiveDefinitionInput::new(
+                    objective_id.clone(),
+                    parse_campaign_id("bcbcbcbc-bcbc-bcbc-bcbc-bcbcbcbcbcbc"),
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![Predicate::RunSucceeded {
+                        module_name: module_ref.to_string(),
+                    }],
+                    vec![],
+                    RiskLevel::Low,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                vec![],
+                BTreeMap::new(),
+            )
+            .expect("input"),
+        )
+        .expect("snapshot");
+
+        let request = PlanRequest::new(
+            objective_id,
+            PlanRequestMode::Plan,
+            "blocked.scope.path",
+            None,
+            false,
+        )
+        .expect("request");
+        let context = PlannerEngineContext::new(75, BTreeSet::new(), AStarCostWeights::default())
+            .with_module_scope(module_ref, "public")
+            .with_allowed_scope("private");
+        let output = execute_planner_pipeline(&snapshot, &request, &context).expect("output");
+
+        assert_eq!(output.result.status, PlanLifecycleStatus::Proposed);
+        assert!(output.result.unreachable_reason.is_none());
+        assert_eq!(output.result.steps.len(), 1);
+        assert!(output.result.steps[0].blocked_reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                PlanStepBlockReason::OutOfScope { scope_key }
+                if scope_key == "public"
+            ) && reason.code() == "ML-PLAN-BLOCK-0003"
+        }));
     }
 
     #[test]

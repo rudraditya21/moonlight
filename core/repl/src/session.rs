@@ -10,9 +10,9 @@ use corelib::campaign::{
 };
 use corelib::ids::Id;
 use corelib::planning::{
-    explain_pipeline, normalize_planner_input, plan_pipeline, simulate_pipeline, AStarCostWeights,
-    DiscoveredArtifactInput, ObjectiveDefinitionInput, PlanLifecycleStatus, PlanRequestMode,
-    PlannerNormalizationInput, RegisteredModuleInput,
+    execute_planner_pipeline, normalize_planner_input, AStarCostWeights, DiscoveredArtifactInput,
+    ObjectiveDefinitionInput, PlanLifecycleStatus, PlanRequest, PlanRequestMode,
+    PlannerEngineContext, PlannerNormalizationInput, RegisteredModuleInput,
 };
 use corelib::policy::{
     Capability, DecisionKind, ModuleContext as PolicyModuleContext, PolicyEngine, PolicyRequest,
@@ -3074,33 +3074,61 @@ impl Repl {
             generated_at
         );
         let weights = AStarCostWeights::default();
-
-        let output = match mode {
-            PlanRequestMode::Plan => plan_pipeline(
-                &snapshot,
-                objective_id.clone(),
-                &event_key,
-                generated_at,
-                capabilities,
-                weights,
-            ),
-            PlanRequestMode::Explain => explain_pipeline(
-                &snapshot,
-                objective_id.clone(),
-                &event_key,
-                generated_at,
-                capabilities,
-                weights,
-            ),
-            PlanRequestMode::Simulate => simulate_pipeline(
-                &snapshot,
-                objective_id.clone(),
-                &event_key,
-                generated_at,
-                capabilities,
-                weights,
-            ),
+        let include_blocked_paths = mode == PlanRequestMode::Simulate;
+        let request = match PlanRequest::new(
+            objective_id.clone(),
+            mode,
+            &event_key,
+            None,
+            include_blocked_paths,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                self.emit_error("plan", CliCode::Validation, &err.to_string());
+                return;
+            }
         };
+
+        let mut context = PlannerEngineContext::new(generated_at, capabilities.clone(), weights);
+        context = context.with_allowed_scope("unknown");
+        context = context.with_allowed_scope("private");
+        if capabilities.contains(Capability::PublicTargets.as_str()) {
+            context = context.with_allowed_scope("public");
+        }
+        if capabilities.contains(Capability::WideTargetScope.as_str()) {
+            context = context.with_allowed_scope("wide");
+        }
+
+        for module in snapshot.modules() {
+            let category =
+                metadata_text_or_default(&module.metadata, "category", "unknown").to_string();
+            let rank = metadata_text_or_default(&module.metadata, "rank", "unknown").to_string();
+            let tags = module
+                .expected_artifacts
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Ok(module_ctx) =
+                PolicyModuleContext::new(&module.module_reference, &category, &rank, tags)
+            {
+                let decision = self
+                    .policy
+                    .evaluate(&PolicyRequest::execute_module(module_ctx, None));
+                if !matches!(decision.kind, DecisionKind::Allow) {
+                    let policy_key = format!(
+                        "{}:{}",
+                        decision_kind_token(decision.kind),
+                        normalize_reason_token(&decision.reason)
+                    );
+                    context =
+                        context.with_policy_blocked_module(&module.module_reference, &policy_key);
+                }
+            }
+            let scope = module_scope_from_expected_artifacts(&module.expected_artifacts);
+            context = context.with_module_scope(&module.module_reference, scope);
+        }
+
+        let output = execute_planner_pipeline(&snapshot, &request, &context);
 
         match output {
             Ok(output) => self.emit_plan_output(mode, &output),
@@ -3175,7 +3203,11 @@ impl Repl {
                     let blocked = step
                         .blocked_reasons
                         .iter()
-                        .map(|reason| format!("\"{}\"", escape_json(&reason.stable_encoding())))
+                        .map(|reason| {
+                            let encoded =
+                                format!("{}:{}", reason.code(), reason.stable_encoding());
+                            format!("\"{}\"", escape_json(&encoded))
+                        })
                         .collect::<Vec<_>>()
                         .join(",");
                     let expected_artifacts = step
@@ -3333,7 +3365,7 @@ impl Repl {
             let blocked = step
                 .blocked_reasons
                 .iter()
-                .map(|reason| reason.stable_encoding())
+                .map(|reason| format!("{}:{}", reason.code(), reason.stable_encoding()))
                 .collect::<Vec<_>>()
                 .join(",");
             println!(
@@ -4740,6 +4772,58 @@ fn parse_metadata_value(raw: &str) -> MetadataValue {
             MetadataValue::Text(raw.to_string())
         }
     }
+}
+
+fn metadata_text_or_default<'a>(
+    map: &'a BTreeMap<String, MetadataValue>,
+    key: &str,
+    default: &'a str,
+) -> &'a str {
+    match map.get(key) {
+        Some(MetadataValue::Text(value)) if !value.trim().is_empty() => value.as_str(),
+        _ => default,
+    }
+}
+
+fn decision_kind_token(kind: DecisionKind) -> &'static str {
+    match kind {
+        DecisionKind::Allow => "allow",
+        DecisionKind::RequireConfirmation => "confirm",
+        DecisionKind::Deny => "deny",
+    }
+}
+
+fn normalize_reason_token(raw: &str) -> String {
+    let mut out = String::new();
+    let mut previous_sep = false;
+    for ch in raw.trim().to_ascii_lowercase().chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            out.push(ch);
+            previous_sep = false;
+            continue;
+        }
+        if !previous_sep {
+            out.push('_');
+            previous_sep = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+fn module_scope_from_expected_artifacts(expected_artifacts: &BTreeSet<String>) -> &'static str {
+    if expected_artifacts.iter().any(|artifact| {
+        let token = artifact.trim().to_ascii_lowercase();
+        token.contains("wide") || token.contains("internet") || token.contains("global")
+    }) {
+        return "wide";
+    }
+    if expected_artifacts.iter().any(|artifact| {
+        let token = artifact.trim().to_ascii_lowercase();
+        token.contains("public") || token.contains("external")
+    }) {
+        return "public";
+    }
+    "private"
 }
 
 fn bool_word(value: bool) -> String {
