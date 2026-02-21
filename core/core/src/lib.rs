@@ -7,6 +7,7 @@ pub mod log;
 pub mod observability;
 pub mod orchestrator;
 pub mod performance;
+pub mod planning;
 pub mod policy;
 pub mod release;
 pub mod reliability;

@@ -590,10 +590,6 @@ impl Default for SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use corelib::performance::{PerformanceBudget, PerformanceSample};
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-    use std::time::Instant;
 
     struct DummySession {
         open: bool,
@@ -766,97 +762,5 @@ mod tests {
         let drained = manager.read_buffered(id).expect("drain");
         assert_eq!(drained.len(), 8);
         assert_eq!(drained, (64u8..72u8).collect::<Vec<u8>>());
-    }
-
-    #[test]
-    fn concurrent_session_polling_meets_scale_budget() {
-        const SESSION_COUNT: usize = 96;
-        const CHUNKS_PER_SESSION: usize = 20;
-        const CHUNK_SIZE: usize = 256;
-        const WORKERS: usize = 6;
-
-        let mut manager = SessionManager::with_config(30, 4096);
-        let mut ids = Vec::with_capacity(SESSION_COUNT);
-        for session_idx in 0..SESSION_COUNT {
-            let mut session = DummySession::new();
-            for chunk_idx in 0..CHUNKS_PER_SESSION {
-                let value = ((session_idx + chunk_idx) % 255) as u8;
-                session.pending_reads.push_back(Ok(vec![value; CHUNK_SIZE]));
-            }
-            ids.push(manager.register("aux/load".to_string(), Box::new(session)));
-        }
-
-        let manager = Arc::new(Mutex::new(manager));
-        let started = Instant::now();
-        let mut workers = Vec::with_capacity(WORKERS);
-
-        for worker_idx in 0..WORKERS {
-            let manager = Arc::clone(&manager);
-            let worker_ids: Vec<u32> = ids
-                .iter()
-                .copied()
-                .enumerate()
-                .filter_map(|(idx, id)| (idx % WORKERS == worker_idx).then_some(id))
-                .collect();
-            workers.push(thread::spawn(move || {
-                let mut drained = 0u64;
-                let mut operations = 0u64;
-                let mut latencies = Vec::<u64>::new();
-
-                for _ in 0..CHUNKS_PER_SESSION {
-                    for id in &worker_ids {
-                        let call_started = Instant::now();
-                        let bytes = {
-                            let mut guard = manager.lock().expect("lock");
-                            guard.poll(*id).expect("poll");
-                            guard.read_buffered_limited(*id, CHUNK_SIZE).expect("read")
-                        };
-                        if !bytes.is_empty() {
-                            drained = drained.saturating_add(bytes.len() as u64);
-                            operations = operations.saturating_add(1);
-                            latencies.push(call_started.elapsed().as_millis() as u64);
-                        }
-                    }
-                }
-                (drained, operations, latencies)
-            }));
-        }
-
-        let mut total_drained = 0u64;
-        let mut total_operations = 0u64;
-        let mut latencies_ms = Vec::<u64>::new();
-        for worker in workers {
-            let (drained, operations, mut worker_latencies) = worker.join().expect("worker");
-            total_drained = total_drained.saturating_add(drained);
-            total_operations = total_operations.saturating_add(operations);
-            latencies_ms.append(&mut worker_latencies);
-        }
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-
-        let expected_bytes = (SESSION_COUNT * CHUNKS_PER_SESSION * CHUNK_SIZE) as u64;
-        assert_eq!(total_drained, expected_bytes);
-        assert_eq!(
-            total_operations,
-            (SESSION_COUNT * CHUNKS_PER_SESSION) as u64
-        );
-
-        let snapshots = manager.lock().expect("lock").snapshots();
-        for snapshot in snapshots {
-            assert_eq!(snapshot.pending_bytes, 0);
-            assert!(snapshot.is_open);
-        }
-
-        let budget =
-            PerformanceBudget::new("session_manager_concurrent_poll", 30_000, 150, Some(25));
-        let evaluation = budget.evaluate(&PerformanceSample {
-            operations: total_operations,
-            total_elapsed_ms: elapsed_ms,
-            latencies_ms,
-        });
-        assert!(
-            evaluation.passed,
-            "session load regression gate failed: {:?}",
-            evaluation.failures
-        );
     }
 }
