@@ -9,6 +9,11 @@ use corelib::campaign::{
     PredicateSnapshot, RiskLevel, SessionPrivilegeLevel,
 };
 use corelib::ids::Id;
+use corelib::planning::{
+    explain_pipeline, normalize_planner_input, plan_pipeline, simulate_pipeline, AStarCostWeights,
+    DiscoveredArtifactInput, ObjectiveDefinitionInput, PlanLifecycleStatus, PlanRequestMode,
+    PlannerNormalizationInput, RegisteredModuleInput,
+};
 use corelib::policy::{
     Capability, DecisionKind, ModuleContext as PolicyModuleContext, PolicyEngine, PolicyRequest,
 };
@@ -231,6 +236,21 @@ const COMMAND_HELP: &[CommandHelpSpec] = &[
         ],
     },
     CommandHelpSpec {
+        name: "plan",
+        summary: "Generate advisory planner output for an objective",
+        usage: "plan <objective-id> | plan explain <objective-id> | plan simulate <objective-id>",
+        aliases: &[],
+        examples: &[
+            "plan <objective-id>",
+            "plan explain <objective-id>",
+            "plan simulate <objective-id>",
+        ],
+        notes: &[
+            "Planner is advisory-only and never executes modules.",
+            "Use output json for script-safe step/explanation/simulation payloads.",
+        ],
+    },
+    CommandHelpSpec {
         name: "sessions",
         summary: "List/read/close sessions",
         usage: "sessions | sessions -r <id> | sessions -R | sessions -k <id> [--yes] | sessions -K [--yes]",
@@ -434,6 +454,7 @@ impl Repl {
             "release" => self.cmd_release(tokens),
             "campaign" => self.cmd_campaign(tokens),
             "objective" => self.cmd_objective(tokens),
+            "plan" => self.cmd_plan(tokens),
             "info" => self.cmd_info(tokens),
             "sessions" => self.cmd_sessions(tokens),
             "interact" => self.cmd_interact(tokens),
@@ -2996,6 +3017,364 @@ impl Repl {
         );
     }
 
+    fn cmd_plan(&mut self, tokens: &[String]) {
+        let (mode, objective_token) = match tokens.len() {
+            2 => (PlanRequestMode::Plan, tokens[1].as_str()),
+            3 => {
+                let mode = match tokens[1].as_str() {
+                    "explain" => PlanRequestMode::Explain,
+                    "simulate" => PlanRequestMode::Simulate,
+                    _ => {
+                        self.emit_error("plan", CliCode::Usage, &plan_usage_string());
+                        return;
+                    }
+                };
+                (mode, tokens[2].as_str())
+            }
+            _ => {
+                self.emit_error("plan", CliCode::Usage, &plan_usage_string());
+                return;
+            }
+        };
+
+        let objective_id = match ObjectiveId::parse(objective_token) {
+            Ok(value) => value,
+            Err(err) => {
+                self.emit_error("plan", CliCode::Validation, &err.to_string());
+                return;
+            }
+        };
+        if !self.objectives.contains_key(&objective_id) {
+            self.emit_error(
+                "plan",
+                CliCode::NotFound,
+                &format!("objective not found: {}", objective_id.as_str()),
+            );
+            return;
+        }
+
+        let snapshot = match self.build_planner_snapshot() {
+            Ok(value) => value,
+            Err(err) => {
+                self.emit_error("plan", CliCode::Execution, &err);
+                return;
+            }
+        };
+        let capabilities = self
+            .policy
+            .granted_capabilities()
+            .into_iter()
+            .map(|capability| capability.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        let generated_at = now_secs();
+        let event_key = format!(
+            "plan:{}:{}:{}",
+            mode.as_str(),
+            objective_id.as_str(),
+            generated_at
+        );
+        let weights = AStarCostWeights::default();
+
+        let output = match mode {
+            PlanRequestMode::Plan => plan_pipeline(
+                &snapshot,
+                objective_id.clone(),
+                &event_key,
+                generated_at,
+                capabilities,
+                weights,
+            ),
+            PlanRequestMode::Explain => explain_pipeline(
+                &snapshot,
+                objective_id.clone(),
+                &event_key,
+                generated_at,
+                capabilities,
+                weights,
+            ),
+            PlanRequestMode::Simulate => simulate_pipeline(
+                &snapshot,
+                objective_id.clone(),
+                &event_key,
+                generated_at,
+                capabilities,
+                weights,
+            ),
+        };
+
+        match output {
+            Ok(output) => self.emit_plan_output(mode, &output),
+            Err(err) => self.emit_error("plan", CliCode::Execution, &err.to_string()),
+        }
+    }
+
+    fn build_planner_snapshot(
+        &self,
+    ) -> Result<corelib::planning::NormalizedPlannerSnapshot, String> {
+        let mut module_meta = BTreeMap::new();
+        for metadata in self.registry.iter_metadata() {
+            module_meta.insert(metadata.name.clone(), metadata.clone());
+        }
+        if let Some(catalog) = &self.catalog {
+            for record in catalog.iter() {
+                module_meta
+                    .entry(record.metadata.name.clone())
+                    .or_insert_with(|| record.metadata.clone());
+            }
+        }
+
+        let modules = module_meta
+            .values()
+            .map(|metadata| module_metadata_to_planner_input(metadata))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())?;
+        let objectives = self
+            .objectives
+            .values()
+            .map(ObjectiveDefinitionInput::from_objective)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())?;
+        let artifacts = self
+            .sessions
+            .snapshots()
+            .into_iter()
+            .map(session_snapshot_to_artifact_input)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())?;
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "output_mode".to_string(),
+            MetadataValue::Text(self.output_mode.as_str().to_string()),
+        );
+        metadata.insert(
+            "campaign_count".to_string(),
+            MetadataValue::Integer(self.campaigns.len() as i64),
+        );
+        metadata.insert(
+            "objective_count".to_string(),
+            MetadataValue::Integer(self.objectives.len() as i64),
+        );
+
+        let input = PlannerNormalizationInput::new(modules, objectives, artifacts, metadata)
+            .map_err(|err| err.to_string())?;
+        normalize_planner_input(input).map_err(|err| err.to_string())
+    }
+
+    fn emit_plan_output(
+        &self,
+        mode: PlanRequestMode,
+        output: &corelib::planning::PlannerEngineOutput,
+    ) {
+        if self.output_mode.is_json() {
+            let steps_json = output
+                .result
+                .steps
+                .iter()
+                .map(|step| {
+                    let blocked = step
+                        .blocked_reasons
+                        .iter()
+                        .map(|reason| format!("\"{}\"", escape_json(&reason.stable_encoding())))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let expected_artifacts = step
+                        .expected_artifacts
+                        .iter()
+                        .map(|value| format!("\"{}\"", escape_json(value)))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let required_capabilities = step
+                        .required_capabilities
+                        .iter()
+                        .map(|value| format!("\"{}\"", escape_json(value)))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!(
+                        "{{\"order\":{},\"edge_id\":\"{}\",\"module\":\"{}\",\"noise\":{},\"risk\":\"{}\",\"success_bps\":{},\"required_capabilities\":[{}],\"expected_artifacts\":[{}],\"blocked_reasons\":[{}]}}",
+                        step.order,
+                        escape_json(step.edge_id.as_str()),
+                        escape_json(step.module_reference.as_deref().unwrap_or("")),
+                        step.estimated_noise_cost,
+                        step.estimated_risk.as_str(),
+                        step.probability_of_success_bps,
+                        required_capabilities,
+                        expected_artifacts,
+                        blocked
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let required_caps = output
+                .result
+                .required_capabilities
+                .iter()
+                .map(|value| format!("\"{}\"", escape_json(value)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let blocked_caps = output
+                .result
+                .blocked_capabilities
+                .iter()
+                .map(|value| format!("\"{}\"", escape_json(value)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let unreachable = output
+                .result
+                .unreachable_reason
+                .as_ref()
+                .map(|reason| reason.as_str().to_string())
+                .unwrap_or_default();
+            let explanation_json = output.explanation.as_ref().map(|explanation| {
+                let rows = explanation
+                    .steps
+                    .iter()
+                    .map(|row| {
+                        format!(
+                            "{{\"order\":{},\"edge_id\":\"{}\",\"module\":\"{}\",\"weighted_noise\":{},\"weighted_risk\":{},\"weighted_step\":{},\"weighted_capability_penalty\":{},\"weighted_total\":{}}}",
+                            row.order,
+                            escape_json(row.edge_id.as_str()),
+                            escape_json(row.module_reference.as_deref().unwrap_or("")),
+                            row.weighted_noise_cost,
+                            row.weighted_risk_cost,
+                            row.weighted_step_cost,
+                            row.weighted_capability_penalty_cost,
+                            row.weighted_total_cost
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "{{\"objective_id\":\"{}\",\"total_weighted_cost\":{},\"heuristic_model\":\"{}\",\"steps\":[{}]}}",
+                    escape_json(explanation.objective_id.as_str()),
+                    explanation.total_weighted_cost,
+                    escape_json(&explanation.heuristic_model),
+                    rows
+                )
+            });
+            let simulation_json = output.simulation.as_ref().map(|simulation| {
+                let artifacts = simulation
+                    .predicted_artifact_chain
+                    .iter()
+                    .map(|value| format!("\"{}\"", escape_json(value)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let detection = simulation
+                    .expected_detection_surface
+                    .iter()
+                    .map(|value| format!("\"{}\"", escape_json(value)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "{{\"objective_id\":\"{}\",\"predicted_artifacts\":[{}],\"detection_surface\":[{}]}}",
+                    escape_json(simulation.objective_id.as_str()),
+                    artifacts,
+                    detection
+                )
+            });
+            println!(
+                "{{\"command\":\"plan\",\"ok\":true,\"code\":\"{}\",\"message\":\"planner output generated\",\"mode\":\"{}\",\"objective_id\":\"{}\",\"status\":\"{}\",\"step_count\":{},\"total_noise\":{},\"total_risk\":{},\"success_probability_bps\":{},\"required_capabilities\":[{}],\"blocked_capabilities\":[{}],\"unreachable_reason\":\"{}\",\"graph_signature\":\"{}\",\"steps\":[{}],\"explanation\":{},\"simulation\":{}}}",
+                CliCode::Ok.as_str(),
+                mode.as_str(),
+                escape_json(output.result.objective_id.as_str()),
+                output.result.status.as_str(),
+                output.result.step_count,
+                output.result.total_noise_cost,
+                output.result.total_risk_cost,
+                output.result.success_probability_bps,
+                required_caps,
+                blocked_caps,
+                escape_json(&unreachable),
+                escape_json(&output.graph_signature),
+                steps_json,
+                explanation_json.unwrap_or_else(|| "null".to_string()),
+                simulation_json.unwrap_or_else(|| "null".to_string())
+            );
+            return;
+        }
+
+        self.emit_response(
+            CommandResponse::ok("plan", "planner output generated")
+                .with_field("mode", mode.as_str())
+                .with_field("objective_id", output.result.objective_id.as_str())
+                .with_field("status", output.result.status.as_str())
+                .with_field("steps", output.result.step_count)
+                .with_field("total_noise", output.result.total_noise_cost)
+                .with_field("total_risk", output.result.total_risk_cost)
+                .with_field(
+                    "success_probability_bps",
+                    output.result.success_probability_bps,
+                ),
+        );
+
+        if output.result.status == PlanLifecycleStatus::Unreachable {
+            println!(
+                "Plan unreachable: {}",
+                output
+                    .result
+                    .unreachable_reason
+                    .as_ref()
+                    .map(|reason| reason.as_str())
+                    .unwrap_or("unknown")
+            );
+            return;
+        }
+
+        if output.result.steps.is_empty() {
+            println!("No planner steps generated.");
+            return;
+        }
+        println!(
+            "Planner steps (mode={}, graph={}):",
+            mode.as_str(),
+            output.graph_signature
+        );
+        for step in &output.result.steps {
+            let blocked = step
+                .blocked_reasons
+                .iter()
+                .map(|reason| reason.stable_encoding())
+                .collect::<Vec<_>>()
+                .join(",");
+            println!(
+                "  {:>2}. edge={} module={} noise={} risk={} success_bps={} blocked={}",
+                step.order,
+                step.edge_id.as_str(),
+                step.module_reference.as_deref().unwrap_or("-"),
+                step.estimated_noise_cost,
+                step.estimated_risk.as_str(),
+                step.probability_of_success_bps,
+                if blocked.is_empty() { "-" } else { &blocked }
+            );
+        }
+
+        if let Some(explanation) = &output.explanation {
+            println!(
+                "Explanation: heuristic={} total_weighted_cost={}",
+                explanation.heuristic_model, explanation.total_weighted_cost
+            );
+        }
+        if let Some(simulation) = &output.simulation {
+            let artifacts = if simulation.predicted_artifact_chain.is_empty() {
+                "-".to_string()
+            } else {
+                simulation.predicted_artifact_chain.join(",")
+            };
+            let detection = if simulation.expected_detection_surface.is_empty() {
+                "-".to_string()
+            } else {
+                simulation
+                    .expected_detection_surface
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            println!("Simulation artifacts: {artifacts}");
+            println!("Simulation detection surface: {detection}");
+        }
+    }
+
     fn validate_campaign_objective_graph(
         &self,
         campaign_id: &CampaignId,
@@ -3831,6 +4210,22 @@ impl Repl {
                         }
                     }
                 }
+                "plan" => {
+                    if token_index == 1 {
+                        let mut roots = ["explain", "simulate"]
+                            .iter()
+                            .filter(|v| v.starts_with(current))
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>();
+                        let mut objective_ids = objective_id_candidates(self, current);
+                        roots.append(&mut objective_ids);
+                        candidates = roots;
+                    } else if token_index == 2
+                        && matches!(tokens.get(1), Some(&"explain") | Some(&"simulate"))
+                    {
+                        candidates = objective_id_candidates(self, current);
+                    }
+                }
                 "interact" => {
                     if token_index == 1 {
                         candidates = session_id_candidates(self, current);
@@ -4065,6 +4460,195 @@ fn parse_risk_level_token(raw: &str) -> Option<RiskLevel> {
     }
 }
 
+fn module_metadata_to_planner_input(
+    metadata: &modules::ModuleMetadata,
+) -> Result<RegisteredModuleInput, corelib::planning::PlanningContractError> {
+    let required_capabilities = module_required_capabilities(metadata);
+    let estimated_noise_cost = module_noise_cost(metadata.category, metadata.rank);
+    let estimated_risk = module_risk_level(metadata.category);
+    let probability_of_success_bps = module_success_probability_bps(metadata.rank);
+    let expected_artifacts = module_expected_artifacts(metadata);
+
+    let mut planner_metadata = BTreeMap::new();
+    planner_metadata.insert(
+        "name".to_string(),
+        MetadataValue::Text(metadata.name.clone()),
+    );
+    planner_metadata.insert(
+        "category".to_string(),
+        MetadataValue::Text(metadata.category.as_str().to_string()),
+    );
+    planner_metadata.insert(
+        "rank".to_string(),
+        MetadataValue::Text(metadata.rank.as_str().to_string()),
+    );
+    planner_metadata.insert(
+        "author".to_string(),
+        MetadataValue::Text(metadata.author.clone()),
+    );
+    planner_metadata.insert(
+        "platform_count".to_string(),
+        MetadataValue::Integer(metadata.platforms.len() as i64),
+    );
+    planner_metadata.insert(
+        "tag_count".to_string(),
+        MetadataValue::Integer(metadata.tags.len() as i64),
+    );
+
+    RegisteredModuleInput::new(
+        &metadata.name,
+        required_capabilities,
+        estimated_noise_cost,
+        estimated_risk,
+        probability_of_success_bps,
+        expected_artifacts,
+        planner_metadata,
+    )
+}
+
+fn module_required_capabilities(metadata: &modules::ModuleMetadata) -> BTreeSet<String> {
+    let mut capabilities = BTreeSet::new();
+    match metadata.category {
+        ModuleCategory::Exploit => {
+            capabilities.insert(Capability::ExploitExecution.as_str().to_string());
+        }
+        ModuleCategory::Payload => {
+            capabilities.insert(Capability::PayloadExecution.as_str().to_string());
+        }
+        ModuleCategory::Evasion => {
+            capabilities.insert(Capability::EvasionExecution.as_str().to_string());
+        }
+        _ => {}
+    }
+    capabilities
+}
+
+fn module_noise_cost(category: ModuleCategory, rank: ModuleRank) -> u32 {
+    let base = match category {
+        ModuleCategory::Nop => 1,
+        ModuleCategory::Auxiliary => 2,
+        ModuleCategory::Core => 3,
+        ModuleCategory::Post => 4,
+        ModuleCategory::Payload => 7,
+        ModuleCategory::Exploit => 8,
+        ModuleCategory::Evasion => 9,
+        ModuleCategory::Unknown => 5,
+    };
+    let rank_delta = match rank {
+        ModuleRank::Manual => 4,
+        ModuleRank::Low => 3,
+        ModuleRank::Average => 2,
+        ModuleRank::Normal => 1,
+        ModuleRank::Good => 0,
+        ModuleRank::Great => 0,
+        ModuleRank::Excellent => 1,
+        ModuleRank::Unknown => 2,
+    };
+    base + rank_delta
+}
+
+fn module_risk_level(category: ModuleCategory) -> RiskLevel {
+    match category {
+        ModuleCategory::Exploit | ModuleCategory::Payload | ModuleCategory::Evasion => {
+            RiskLevel::High
+        }
+        ModuleCategory::Post => RiskLevel::Medium,
+        ModuleCategory::Core
+        | ModuleCategory::Auxiliary
+        | ModuleCategory::Nop
+        | ModuleCategory::Unknown => RiskLevel::Low,
+    }
+}
+
+fn module_success_probability_bps(rank: ModuleRank) -> u16 {
+    match rank {
+        ModuleRank::Manual => 3_500,
+        ModuleRank::Low => 4_500,
+        ModuleRank::Average => 5_500,
+        ModuleRank::Normal => 6_500,
+        ModuleRank::Good => 7_500,
+        ModuleRank::Great => 8_500,
+        ModuleRank::Excellent => 9_000,
+        ModuleRank::Unknown => 5_000,
+    }
+}
+
+fn module_expected_artifacts(metadata: &modules::ModuleMetadata) -> BTreeSet<String> {
+    let mut artifacts = metadata
+        .tags
+        .iter()
+        .map(|tag| tag.trim().to_ascii_lowercase())
+        .filter(|tag| !tag.is_empty())
+        .collect::<BTreeSet<_>>();
+    if artifacts.is_empty() {
+        let default_signal = match metadata.category {
+            ModuleCategory::Exploit => "shell_access",
+            ModuleCategory::Payload => "payload_delivery",
+            ModuleCategory::Auxiliary => "service_banner",
+            ModuleCategory::Post => "post_exploit",
+            ModuleCategory::Evasion => "evasion_signal",
+            ModuleCategory::Core | ModuleCategory::Nop | ModuleCategory::Unknown => "module_output",
+        };
+        artifacts.insert(default_signal.to_string());
+    }
+    artifacts
+}
+
+fn session_snapshot_to_artifact_input(
+    snapshot: crate::sessions::SessionSnapshot,
+) -> Result<DiscoveredArtifactInput, corelib::planning::PlanningContractError> {
+    let state = if snapshot.is_partitioned {
+        "partitioned"
+    } else if snapshot.is_open {
+        "open"
+    } else {
+        "closed"
+    };
+    let mut tags = BTreeSet::new();
+    tags.insert(snapshot.kind.trim().to_ascii_lowercase());
+    if snapshot.is_attached {
+        tags.insert("attached".to_string());
+    } else {
+        tags.insert("backgrounded".to_string());
+    }
+    if snapshot.is_partitioned {
+        tags.insert("partitioned".to_string());
+    }
+
+    let mut metadata = BTreeMap::new();
+    metadata.insert("target".to_string(), MetadataValue::Text(snapshot.target));
+    metadata.insert(
+        "module_name".to_string(),
+        MetadataValue::Text(snapshot.module_name),
+    );
+    metadata.insert(
+        "idle_secs".to_string(),
+        MetadataValue::Integer(snapshot.idle_secs as i64),
+    );
+    metadata.insert(
+        "pending_bytes".to_string(),
+        MetadataValue::Integer(snapshot.pending_bytes as i64),
+    );
+    metadata.insert(
+        "consecutive_errors".to_string(),
+        MetadataValue::Integer(snapshot.consecutive_errors as i64),
+    );
+    if let Some(age) = snapshot.partition_age_secs {
+        metadata.insert(
+            "partition_age_secs".to_string(),
+            MetadataValue::Integer(age as i64),
+        );
+    }
+
+    DiscoveredArtifactInput::new(
+        &format!("session:{}", snapshot.id),
+        &format!("session_{}", state),
+        state,
+        tags,
+        metadata,
+    )
+}
+
 fn parse_predicates(raw: &str) -> Result<Vec<Predicate>, String> {
     let mut predicates = Vec::new();
     for item in raw.split(',') {
@@ -4168,6 +4752,11 @@ fn bool_word(value: bool) -> String {
 
 fn release_usage_string() -> String {
     "usage: release check | release matrix | release migrate plan <from> <to> | release migrate apply <to> | release rollback snapshot <label> | release rollback list | release rollback apply <snapshot_id> | release rollback prune <keep_latest>".to_string()
+}
+
+fn plan_usage_string() -> String {
+    "usage: plan <objective-id> | plan explain <objective-id> | plan simulate <objective-id>"
+        .to_string()
 }
 
 fn command_tokens() -> Vec<&'static str> {
@@ -4329,6 +4918,7 @@ mod tests {
         assert!(commands.contains(&"release"));
         assert!(commands.contains(&"campaign"));
         assert!(commands.contains(&"objective"));
+        assert!(commands.contains(&"plan"));
     }
 
     #[test]
@@ -4386,6 +4976,7 @@ mod tests {
         let root = repl.complete("");
         assert!(root.candidates.contains(&"campaign".to_string()));
         assert!(root.candidates.contains(&"objective".to_string()));
+        assert!(root.candidates.contains(&"plan".to_string()));
 
         let campaign_sub = repl.complete("campaign ");
         assert!(campaign_sub.candidates.contains(&"create".to_string()));
@@ -4398,6 +4989,18 @@ mod tests {
 
         let objective_status = repl.complete("objective status ");
         assert!(objective_status
+            .candidates
+            .contains(&objective_id.as_str().to_string()));
+
+        let plan_sub = repl.complete("plan ");
+        assert!(plan_sub.candidates.contains(&"explain".to_string()));
+        assert!(plan_sub.candidates.contains(&"simulate".to_string()));
+        assert!(plan_sub
+            .candidates
+            .contains(&objective_id.as_str().to_string()));
+
+        let plan_explain = repl.complete("plan explain ");
+        assert!(plan_explain
             .candidates
             .contains(&objective_id.as_str().to_string()));
     }
