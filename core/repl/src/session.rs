@@ -1,14 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fs;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use corelib::campaign::{
-    validate_prerequisite_graph, Campaign, CampaignId, MetadataValue, Objective,
+    validate_prerequisite_graph, ArtifactSnapshot as CampaignArtifactSnapshot, Campaign,
+    CampaignId, FindingSnapshot as CampaignFindingSnapshot, MetadataValue, Objective,
     ObjectiveEvaluationEngine, ObjectiveId, ObjectiveReevaluationTrigger, ObjectiveStatus,
     Predicate, PredicateSnapshot, RiskLevel, RunSnapshot, SessionPrivilegeLevel,
+    SessionSnapshot as CampaignSessionSnapshot,
 };
-use corelib::domain::{ModuleVersionId, Run, RunState, WorkspaceId};
+use corelib::domain::{
+    Artifact, ArtifactKind, ArtifactState, Finding, FindingSeverity, ModuleVersionId, Run, RunId,
+    RunState, Session, SessionState, WorkspaceId,
+};
 use corelib::ids::Id;
 use corelib::planning::{
     execute_planner_pipeline, normalize_planner_input, AStarCostWeights, DiscoveredArtifactInput,
@@ -74,6 +81,9 @@ pub struct Repl {
     campaigns: BTreeMap<CampaignId, Campaign>,
     objectives: BTreeMap<ObjectiveId, Objective>,
     successful_run_modules: BTreeSet<String>,
+    observed_artifact_signals: BTreeSet<String>,
+    observed_finding_types: BTreeSet<String>,
+    evidence_state_path: PathBuf,
     planning_events: PlanningEventLog,
     palette: Palette,
 }
@@ -341,7 +351,7 @@ impl Repl {
         ])
         .expect("release docs suite");
 
-        Repl {
+        let mut repl = Repl {
             prompt_base: normalize_prompt(&prompt),
             registry,
             catalog,
@@ -360,9 +370,14 @@ impl Repl {
             campaigns: BTreeMap::new(),
             objectives: BTreeMap::new(),
             successful_run_modules: BTreeSet::new(),
+            observed_artifact_signals: BTreeSet::new(),
+            observed_finding_types: BTreeSet::new(),
+            evidence_state_path: default_repl_evidence_path(),
             planning_events: PlanningEventLog::default(),
             palette: Palette::new(),
-        }
+        };
+        repl.load_persisted_repl_evidence();
+        repl
     }
 
     pub fn run(&mut self) -> Result<(), ReplError> {
@@ -939,6 +954,7 @@ impl Repl {
             return;
         }
         let metadata = module.metadata().clone();
+        let expected_artifacts = module_expected_artifacts(&metadata);
         let target = extract_target_from_options(module.options());
         let policy_module = match PolicyModuleContext::new(
             &metadata.name,
@@ -998,7 +1014,7 @@ impl Repl {
                 if let Some(session) = result.take_session() {
                     let kind = session.kind().to_string();
                     let target = session.target();
-                    self.record_successful_module_run(&module_name);
+                    self.record_successful_module_run(&module_name, &expected_artifacts);
                     let id = self.sessions.register(module_name, session);
                     self.emit_response(
                         CommandResponse::ok("run", "module executed; session opened")
@@ -1009,7 +1025,7 @@ impl Repl {
                     return;
                 }
                 if result.success {
-                    self.record_successful_module_run(&module_name);
+                    self.record_successful_module_run(&module_name, &expected_artifacts);
                     self.emit_response(
                         CommandResponse::ok("run", "module executed")
                             .with_field("message", result.message),
@@ -3231,6 +3247,8 @@ impl Repl {
                 .steps
                 .iter()
                 .map(|step| {
+                    let execution_status =
+                        self.planner_step_execution_status(step.module_reference.as_deref());
                     let blocked = step
                         .blocked_reasons
                         .iter()
@@ -3254,10 +3272,11 @@ impl Repl {
                         .collect::<Vec<_>>()
                         .join(",");
                     format!(
-                        "{{\"order\":{},\"edge_id\":\"{}\",\"module\":\"{}\",\"noise\":{},\"risk\":\"{}\",\"success_bps\":{},\"required_capabilities\":[{}],\"expected_artifacts\":[{}],\"blocked_reasons\":[{}]}}",
+                        "{{\"order\":{},\"edge_id\":\"{}\",\"module\":\"{}\",\"status\":\"{}\",\"noise\":{},\"risk\":\"{}\",\"success_bps\":{},\"required_capabilities\":[{}],\"expected_artifacts\":[{}],\"blocked_reasons\":[{}]}}",
                         step.order,
                         escape_json(step.edge_id.as_str()),
                         escape_json(step.module_reference.as_deref().unwrap_or("")),
+                        escape_json(execution_status),
                         step.estimated_noise_cost,
                         step.estimated_risk.as_str(),
                         step.probability_of_success_bps,
@@ -3393,6 +3412,8 @@ impl Repl {
             output.graph_signature
         );
         for step in &output.result.steps {
+            let execution_status =
+                self.planner_step_execution_status(step.module_reference.as_deref());
             let blocked = step
                 .blocked_reasons
                 .iter()
@@ -3400,10 +3421,11 @@ impl Repl {
                 .collect::<Vec<_>>()
                 .join(",");
             println!(
-                "  {:>2}. edge={} module={} noise={} risk={} success_bps={} blocked={}",
+                "  {:>2}. edge={} module={} status={} noise={} risk={} success_bps={} blocked={}",
                 step.order,
                 step.edge_id.as_str(),
                 step.module_reference.as_deref().unwrap_or("-"),
+                execution_status,
                 step.estimated_noise_cost,
                 step.estimated_risk.as_str(),
                 step.probability_of_success_bps,
@@ -3438,17 +3460,30 @@ impl Repl {
         }
     }
 
-    fn record_successful_module_run(&mut self, module_name: &str) {
-        let token = module_name.trim().to_ascii_lowercase();
-        if token.is_empty() {
+    fn record_successful_module_run(
+        &mut self,
+        module_name: &str,
+        expected_artifacts: &BTreeSet<String>,
+    ) {
+        let module_token = normalize_evidence_token(module_name);
+        if module_token.is_empty() {
             return;
         }
-        self.successful_run_modules.insert(token);
+        self.successful_run_modules.insert(module_token);
+        for artifact in expected_artifacts {
+            let token = normalize_evidence_token(artifact);
+            if token.is_empty() {
+                continue;
+            }
+            self.observed_artifact_signals.insert(token.clone());
+            self.observed_finding_types.insert(token);
+        }
+        let _ = self.persist_repl_evidence();
     }
 
     fn build_objective_evaluation_snapshot(&self) -> Result<PredicateSnapshot, String> {
         let now = now_secs();
-        let mut snapshot = PredicateSnapshot::new();
+        let mut predicate_snapshot = PredicateSnapshot::new();
         for module_name in &self.successful_run_modules {
             let mut run = Run::new_at(
                 WorkspaceId::next(),
@@ -3463,9 +3498,178 @@ impl Repl {
             run.transition_state(RunState::Succeeded, now)
                 .map_err(|err| err.to_string())?;
             let run_snapshot = RunSnapshot::new(run, module_name).map_err(|err| err.to_string())?;
-            snapshot = snapshot.with_run(run_snapshot);
+            predicate_snapshot = predicate_snapshot.with_run(run_snapshot);
         }
-        Ok(snapshot)
+
+        for signal in &self.observed_artifact_signals {
+            let mut artifact = Artifact::new_at(
+                RunId::next(),
+                None,
+                None,
+                ArtifactKind::StructuredJson,
+                signal,
+                &format!("signal:{signal}"),
+                now,
+            )
+            .map_err(|err| err.to_string())?;
+            artifact
+                .transition_state(ArtifactState::Available, now)
+                .map_err(|err| err.to_string())?;
+            let artifact_snapshot = CampaignArtifactSnapshot::new(artifact)
+                .with_tag(signal)
+                .with_metadata(
+                    "source",
+                    MetadataValue::Text("repl_run_history".to_string()),
+                );
+            predicate_snapshot = predicate_snapshot.with_artifact(artifact_snapshot);
+        }
+
+        for finding_type in &self.observed_finding_types {
+            let finding = Finding::new_at(
+                RunId::next(),
+                None,
+                None,
+                &format!("observed {finding_type}"),
+                &format!("signal:{finding_type}"),
+                FindingSeverity::Info,
+                now,
+            )
+            .map_err(|err| err.to_string())?;
+            let finding_snapshot = CampaignFindingSnapshot::new(finding, finding_type)
+                .map_err(|err| err.to_string())?
+                .with_metadata(
+                    "source",
+                    MetadataValue::Text("repl_run_history".to_string()),
+                );
+            predicate_snapshot = predicate_snapshot.with_finding(finding_snapshot);
+        }
+
+        for runtime_snapshot in self.sessions.snapshots() {
+            let mut session = Session::new_at(
+                RunId::next(),
+                None,
+                &runtime_snapshot.kind,
+                &runtime_snapshot.target,
+                now,
+            )
+            .map_err(|err| err.to_string())?;
+            if runtime_snapshot.is_partitioned {
+                session
+                    .transition_state(SessionState::Lost, now)
+                    .map_err(|err| err.to_string())?;
+            } else if runtime_snapshot.is_open {
+                session
+                    .transition_state(SessionState::Open, now)
+                    .map_err(|err| err.to_string())?;
+                if !runtime_snapshot.is_attached {
+                    session
+                        .transition_state(SessionState::Backgrounded, now)
+                        .map_err(|err| err.to_string())?;
+                }
+            } else {
+                session
+                    .transition_state(SessionState::Closed, now)
+                    .map_err(|err| err.to_string())?;
+            }
+
+            let mut session_snapshot = CampaignSessionSnapshot::new(session)
+                .with_metadata(
+                    "module_name",
+                    MetadataValue::Text(runtime_snapshot.module_name.clone()),
+                )
+                .with_metadata(
+                    "pending_bytes",
+                    MetadataValue::Integer(runtime_snapshot.pending_bytes as i64),
+                )
+                .with_metadata(
+                    "idle_secs",
+                    MetadataValue::Integer(runtime_snapshot.idle_secs as i64),
+                )
+                .with_metadata(
+                    "consecutive_errors",
+                    MetadataValue::Integer(runtime_snapshot.consecutive_errors as i64),
+                );
+            if let Some(partition_age_secs) = runtime_snapshot.partition_age_secs {
+                session_snapshot = session_snapshot.with_metadata(
+                    "partition_age_secs",
+                    MetadataValue::Integer(partition_age_secs as i64),
+                );
+            }
+            if let Some(privilege) = infer_runtime_session_privilege(&runtime_snapshot) {
+                session_snapshot = session_snapshot.with_privilege(privilege);
+            }
+            predicate_snapshot = predicate_snapshot.with_session(session_snapshot);
+        }
+        Ok(predicate_snapshot)
+    }
+
+    fn planner_step_execution_status(&self, module_reference: Option<&str>) -> &'static str {
+        let Some(module_reference) = module_reference else {
+            return "pending";
+        };
+        let token = normalize_evidence_token(module_reference);
+        if !token.is_empty() && self.successful_run_modules.contains(&token) {
+            "done"
+        } else {
+            "pending"
+        }
+    }
+
+    fn load_persisted_repl_evidence(&mut self) {
+        let Ok(contents) = fs::read_to_string(&self.evidence_state_path) else {
+            return;
+        };
+        for line in contents.lines() {
+            if line == "v1" || line.trim().is_empty() {
+                continue;
+            }
+            let Some((kind, raw_value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = normalize_evidence_token(raw_value);
+            if value.is_empty() {
+                continue;
+            }
+            match kind {
+                "run" => {
+                    self.successful_run_modules.insert(value);
+                }
+                "artifact" => {
+                    self.observed_artifact_signals.insert(value);
+                }
+                "finding" => {
+                    self.observed_finding_types.insert(value);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn persist_repl_evidence(&self) -> Result<(), String> {
+        if let Some(parent) = self.evidence_state_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        let mut lines = vec!["v1".to_string()];
+        lines.extend(
+            self.successful_run_modules
+                .iter()
+                .map(|module| format!("run:{module}")),
+        );
+        lines.extend(
+            self.observed_artifact_signals
+                .iter()
+                .map(|artifact| format!("artifact:{artifact}")),
+        );
+        lines.extend(
+            self.observed_finding_types
+                .iter()
+                .map(|finding| format!("finding:{finding}")),
+        );
+        let payload = lines.join("\n");
+        let tmp_path = self.evidence_state_path.with_extension("tmp");
+        fs::write(&tmp_path, &payload).map_err(|err| err.to_string())?;
+        fs::rename(&tmp_path, &self.evidence_state_path).map_err(|err| err.to_string())?;
+        Ok(())
     }
 
     fn validate_campaign_objective_graph(
@@ -4864,6 +5068,37 @@ fn objective_display_status(status: ObjectiveStatus) -> &'static str {
     }
 }
 
+fn default_repl_evidence_path() -> PathBuf {
+    match std::env::current_dir() {
+        Ok(dir) => dir.join(".moonlight").join("repl_evidence.state"),
+        Err(_) => PathBuf::from(".moonlight/repl_evidence.state"),
+    }
+}
+
+fn normalize_evidence_token(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+fn infer_runtime_session_privilege(
+    snapshot: &crate::sessions::SessionSnapshot,
+) -> Option<SessionPrivilegeLevel> {
+    let joined = format!(
+        "{} {} {}",
+        snapshot.kind, snapshot.module_name, snapshot.target
+    )
+    .to_ascii_lowercase();
+    if joined.contains("root") {
+        return Some(SessionPrivilegeLevel::Root);
+    }
+    if joined.contains("elevated") || joined.contains("admin") {
+        return Some(SessionPrivilegeLevel::Elevated);
+    }
+    if joined.contains("user") {
+        return Some(SessionPrivilegeLevel::User);
+    }
+    None
+}
+
 fn normalize_reason_token(raw: &str) -> String {
     let mut out = String::new();
     let mut previous_sep = false;
@@ -5175,9 +5410,18 @@ mod tests {
             .build()
             .expect("empty registry");
         let mut repl = Repl::new("moonlight".to_string(), registry, None);
-        repl.record_successful_module_run("auxiliary/crypto/hash_sha2_256");
-        repl.record_successful_module_run("auxiliary/crypto/hash_sha2_256");
-        repl.record_successful_module_run("auxiliary/crypto/hash_sha3_256");
+        repl.record_successful_module_run(
+            "auxiliary/crypto/hash_sha2_256",
+            &BTreeSet::from(["sha2-256".to_string(), "hash".to_string()]),
+        );
+        repl.record_successful_module_run(
+            "auxiliary/crypto/hash_sha2_256",
+            &BTreeSet::from(["sha2-256".to_string(), "hash".to_string()]),
+        );
+        repl.record_successful_module_run(
+            "auxiliary/crypto/hash_sha3_256",
+            &BTreeSet::from(["sha3-256".to_string(), "hash".to_string()]),
+        );
 
         let snapshot = repl
             .build_objective_evaluation_snapshot()
@@ -5195,5 +5439,65 @@ mod tests {
             .runs
             .iter()
             .all(|run| run.run.state == corelib::domain::RunState::Succeeded));
+        assert!(!snapshot.artifacts.is_empty());
+        assert!(!snapshot.findings.is_empty());
+    }
+
+    #[test]
+    fn planner_step_status_reflects_successful_run_history() {
+        let registry = modules::ModuleRegistryBuilder::new()
+            .build()
+            .expect("empty registry");
+        let mut repl = Repl::new("moonlight".to_string(), registry, None);
+        repl.successful_run_modules.clear();
+        repl.successful_run_modules
+            .insert("auxiliary/crypto/hash_sha2_256".to_string());
+
+        assert_eq!(
+            repl.planner_step_execution_status(Some("auxiliary/crypto/hash_sha2_256")),
+            "done"
+        );
+        assert_eq!(
+            repl.planner_step_execution_status(Some("auxiliary/crypto/hash_sha3_256")),
+            "pending"
+        );
+        assert_eq!(repl.planner_step_execution_status(None), "pending");
+    }
+
+    #[test]
+    fn repl_evidence_persistence_round_trip_restores_runtime_signals() {
+        let registry = modules::ModuleRegistryBuilder::new()
+            .build()
+            .expect("empty registry");
+        let temp_path =
+            std::env::temp_dir().join(format!("moonlight-repl-evidence-{}.state", Id::next().0));
+
+        let mut writer = Repl::new("moonlight".to_string(), registry, None);
+        writer.evidence_state_path = temp_path.clone();
+        writer.successful_run_modules.clear();
+        writer.observed_artifact_signals.clear();
+        writer.observed_finding_types.clear();
+        writer.record_successful_module_run(
+            "auxiliary/crypto/hash_sha2_256",
+            &BTreeSet::from(["sha2-256".to_string(), "hash".to_string()]),
+        );
+
+        let registry = modules::ModuleRegistryBuilder::new()
+            .build()
+            .expect("empty registry");
+        let mut reader = Repl::new("moonlight".to_string(), registry, None);
+        reader.evidence_state_path = temp_path.clone();
+        reader.successful_run_modules.clear();
+        reader.observed_artifact_signals.clear();
+        reader.observed_finding_types.clear();
+        reader.load_persisted_repl_evidence();
+
+        assert!(reader
+            .successful_run_modules
+            .contains("auxiliary/crypto/hash_sha2_256"));
+        assert!(reader.observed_artifact_signals.contains("sha2-256"));
+        assert!(reader.observed_finding_types.contains("hash"));
+
+        let _ = fs::remove_file(temp_path);
     }
 }

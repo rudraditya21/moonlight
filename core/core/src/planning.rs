@@ -2941,8 +2941,23 @@ fn execute_planner_pipeline_with_graph(
         context.available_capabilities.clone(),
         context.weights.clone(),
     );
-    let path =
-        astar_plan_with_forbidden_edges(&graph_output.graph, &astar_request, forbidden_edges)?;
+    let mut effective_forbidden_edges = forbidden_edges.clone();
+    if !request.include_blocked_paths {
+        effective_forbidden_edges.extend(blocked_edges_for_context(&graph_output.graph, context));
+    }
+    let mut path = astar_plan_with_forbidden_edges(
+        &graph_output.graph,
+        &astar_request,
+        &effective_forbidden_edges,
+    )?;
+    // Prefer unblocked paths when requested, but keep advisory continuity if none exist.
+    if path.is_none()
+        && !request.include_blocked_paths
+        && effective_forbidden_edges != *forbidden_edges
+    {
+        path =
+            astar_plan_with_forbidden_edges(&graph_output.graph, &astar_request, forbidden_edges)?;
+    }
     let Some(path) = path else {
         let result = PlanResult::new(
             request.objective_id.clone(),
@@ -3013,33 +3028,7 @@ fn execute_planner_pipeline_with_graph(
             .get(edge_id)
             .expect("A* path edges must exist in graph");
         let attrs = edge.attrs();
-        let blocked_capabilities = attrs
-            .required_capabilities
-            .iter()
-            .filter(|capability| !context.available_capabilities.contains(*capability))
-            .map(|capability| PlanStepBlockReason::CapabilityDisabled {
-                capability: capability.clone(),
-            })
-            .collect::<Vec<_>>();
-        let mut blocked_reasons = blocked_capabilities;
-        if let Some(module_reference) = edge.module_reference() {
-            let module_key = normalize_token(module_reference);
-            if let Some(policy_key) = context.policy_blocked_modules.get(&module_key) {
-                blocked_reasons.push(PlanStepBlockReason::PolicyDenied {
-                    policy_key: policy_key.clone(),
-                });
-            }
-            if !context.allowed_scopes.is_empty() {
-                let scope = context
-                    .module_scopes
-                    .get(&module_key)
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                if !context.allowed_scopes.contains(&scope) {
-                    blocked_reasons.push(PlanStepBlockReason::OutOfScope { scope_key: scope });
-                }
-            }
-        }
+        let blocked_reasons = edge_block_reasons(edge, context);
         total_risk_cost =
             total_risk_cost.saturating_add(context.weights.risk_weight(attrs.estimated_risk));
         steps.push(PlanStep::new(
@@ -3120,6 +3109,54 @@ fn execute_planner_pipeline_with_graph(
         simulation,
         event_payloads,
     })
+}
+
+fn edge_block_reasons(edge: &PlanEdge, context: &PlannerEngineContext) -> Vec<PlanStepBlockReason> {
+    let attrs = edge.attrs();
+    let mut blocked_reasons = attrs
+        .required_capabilities
+        .iter()
+        .filter(|capability| !context.available_capabilities.contains(*capability))
+        .map(|capability| PlanStepBlockReason::CapabilityDisabled {
+            capability: capability.clone(),
+        })
+        .collect::<Vec<_>>();
+    if let Some(module_reference) = edge.module_reference() {
+        let module_key = normalize_token(module_reference);
+        if let Some(policy_key) = context.policy_blocked_modules.get(&module_key) {
+            blocked_reasons.push(PlanStepBlockReason::PolicyDenied {
+                policy_key: policy_key.clone(),
+            });
+        }
+        if !context.allowed_scopes.is_empty() {
+            let scope = context
+                .module_scopes
+                .get(&module_key)
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            if !context.allowed_scopes.contains(&scope) {
+                blocked_reasons.push(PlanStepBlockReason::OutOfScope { scope_key: scope });
+            }
+        }
+    }
+    blocked_reasons
+}
+
+fn blocked_edges_for_context(
+    graph: &CapabilityGraph,
+    context: &PlannerEngineContext,
+) -> BTreeSet<PlanEdgeId> {
+    graph
+        .edges()
+        .iter()
+        .filter_map(|(edge_id, edge)| {
+            if edge_block_reasons(edge, context).is_empty() {
+                None
+            } else {
+                Some(edge_id.clone())
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6259,6 +6296,104 @@ mod tests {
                 if scope_key == "public"
             ) && reason.code() == "ML-PLAN-BLOCK-0003"
         }));
+    }
+
+    #[test]
+    fn planner_engine_respects_include_blocked_paths_flag_when_alternative_exists() {
+        let objective_id = parse_objective_id("24121212-3434-5656-7878-909090909090");
+        let blocked_module_ref = "auxiliary/path/blocked_fast";
+        let allowed_module_ref = "auxiliary/path/allowed_slow";
+        let snapshot = normalize_planner_input(
+            PlannerNormalizationInput::new(
+                vec![
+                    RegisteredModuleInput::new(
+                        blocked_module_ref,
+                        BTreeSet::new(),
+                        1,
+                        RiskLevel::Low,
+                        8_000,
+                        BTreeSet::from(["shell_access".to_string()]),
+                        BTreeMap::new(),
+                    )
+                    .expect("blocked module"),
+                    RegisteredModuleInput::new(
+                        allowed_module_ref,
+                        BTreeSet::new(),
+                        20,
+                        RiskLevel::Low,
+                        8_000,
+                        BTreeSet::from(["shell_access".to_string()]),
+                        BTreeMap::new(),
+                    )
+                    .expect("allowed module"),
+                ],
+                vec![ObjectiveDefinitionInput::new(
+                    objective_id.clone(),
+                    parse_campaign_id("cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd"),
+                    ObjectiveStatus::Pending,
+                    vec![],
+                    vec![
+                        Predicate::RunSucceeded {
+                            module_name: blocked_module_ref.to_string(),
+                        },
+                        Predicate::RunSucceeded {
+                            module_name: allowed_module_ref.to_string(),
+                        },
+                    ],
+                    vec![],
+                    RiskLevel::Low,
+                    None,
+                    BTreeMap::new(),
+                )
+                .expect("objective")],
+                vec![],
+                BTreeMap::new(),
+            )
+            .expect("input"),
+        )
+        .expect("snapshot");
+
+        let context = PlannerEngineContext::new(85, BTreeSet::new(), AStarCostWeights::default())
+            .with_policy_blocked_module(blocked_module_ref, "deny:policy");
+
+        let request_without_blocked = PlanRequest::new(
+            objective_id.clone(),
+            PlanRequestMode::Plan,
+            "blocked.path.disabled",
+            None,
+            false,
+        )
+        .expect("request without blocked");
+        let without_blocked =
+            execute_planner_pipeline(&snapshot, &request_without_blocked, &context).expect("plan");
+        assert_eq!(without_blocked.result.status, PlanLifecycleStatus::Proposed);
+        assert_eq!(without_blocked.result.steps.len(), 1);
+        assert_eq!(
+            without_blocked.result.steps[0].module_reference.as_deref(),
+            Some(allowed_module_ref)
+        );
+        assert!(without_blocked.result.steps[0].blocked_reasons.is_empty());
+
+        let request_with_blocked = PlanRequest::new(
+            objective_id,
+            PlanRequestMode::Plan,
+            "blocked.path.enabled",
+            None,
+            true,
+        )
+        .expect("request with blocked");
+        let with_blocked =
+            execute_planner_pipeline(&snapshot, &request_with_blocked, &context).expect("plan");
+        assert_eq!(with_blocked.result.status, PlanLifecycleStatus::Proposed);
+        assert_eq!(with_blocked.result.steps.len(), 1);
+        assert_eq!(
+            with_blocked.result.steps[0].module_reference.as_deref(),
+            Some(blocked_module_ref)
+        );
+        assert!(with_blocked.result.steps[0]
+            .blocked_reasons
+            .iter()
+            .any(|reason| matches!(reason, PlanStepBlockReason::PolicyDenied { policy_key } if policy_key == "deny:policy")));
     }
 
     #[test]
