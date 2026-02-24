@@ -52,14 +52,44 @@ moonlight(auxiliary/crypto/hash_sha2_256)> set INPUT moonlight
 moonlight(auxiliary/crypto/hash_sha2_256)> run
 ```
 
-Campaign + planner flow:
+## Advanced Campaign + Planner Flow
+
+Use this end-to-end sequence to verify plan generation, execution progress, and objective completion.
 
 ```text
-moonlight> campaign create operation-alpha --yes
+moonlight> output json
+
+# 1) Create campaign and capture campaign_id from JSON output
+moonlight> campaign create operation-alpha "Internal validation operation" --yes
+moonlight> campaign list
+
+# 2) Create chained objectives and capture objective IDs from JSON output
 moonlight> objective create <campaign-id> foothold --success run_succeeded:auxiliary/crypto/hash_sha2_256 --risk low --yes
-moonlight> plan <objective-id>
-moonlight> plan explain <objective-id>
-moonlight> plan simulate <objective-id>
+moonlight> objective create <campaign-id> post-check --success run_succeeded:auxiliary/crypto/hash_sha3_256 --risk low --yes
+moonlight> objective link-prereq <post-check-objective-id> <foothold-objective-id> --yes
+moonlight> objective list <campaign-id>
+
+# 3) Start the first objective and inspect advisory plan
+moonlight> objective status <foothold-objective-id> start --yes
+moonlight> plan <foothold-objective-id>
+moonlight> plan explain <foothold-objective-id>
+
+# 4) Execute the planned module
+moonlight> use auxiliary/crypto/hash_sha2_256
+moonlight(auxiliary/crypto/hash_sha2_256)> set INPUT moonlight
+moonlight(auxiliary/crypto/hash_sha2_256)> run --yes
+moonlight(auxiliary/crypto/hash_sha2_256)> back
+
+# 5) Evaluate objective and confirm completion display state
+moonlight> objective status <foothold-objective-id> evaluate --yes
+moonlight> objective status <foothold-objective-id>
+
+# 6) Re-run plan to confirm completed step status is shown as done
+moonlight> plan <foothold-objective-id>
+
+# 7) Continue with dependent objective
+moonlight> objective status <post-check-objective-id> start --yes
+moonlight> plan simulate <post-check-objective-id>
 ```
 
 ## Common Commands
