@@ -1981,8 +1981,9 @@ pub fn astar_plan_with_forbidden_edges(
         return Ok(None);
     }
 
+    let hop_bounds =
+        compute_goal_hop_bounds_with_forbidden_edges(graph, &objective_nodes, forbidden_edges);
     let lower_bound = minimum_edge_lower_bound(graph, &request.weights);
-    let hop_bounds = compute_goal_hop_bounds(graph, &objective_nodes);
     let adjacency = adjacency_index(graph);
 
     let mut open = BinaryHeap::<OpenEntry>::new();
@@ -1991,6 +1992,9 @@ pub fn astar_plan_with_forbidden_edges(
     let mut expansion_seq = 0_u64;
 
     for start in start_nodes {
+        if !hop_bounds.contains_key(&start) {
+            continue;
+        }
         let g = 0_u64;
         let h = heuristic_cost(&start, &hop_bounds, lower_bound);
         let f = g.saturating_add(h);
@@ -2003,6 +2007,9 @@ pub fn astar_plan_with_forbidden_edges(
             seq: expansion_seq,
         });
         expansion_seq = expansion_seq.saturating_add(1);
+    }
+    if open.is_empty() {
+        return Ok(None);
     }
 
     while let Some(entry) = open.pop() {
@@ -2034,6 +2041,9 @@ pub fn astar_plan_with_forbidden_edges(
         };
         for (edge_id, next_node) in neighbors {
             if forbidden_edges.contains(edge_id) {
+                continue;
+            }
+            if !hop_bounds.contains_key(next_node) {
                 continue;
             }
             let edge = graph
@@ -2133,12 +2143,16 @@ fn minimum_edge_lower_bound(graph: &CapabilityGraph, weights: &AStarCostWeights)
     minimum
 }
 
-fn compute_goal_hop_bounds(
+fn compute_goal_hop_bounds_with_forbidden_edges(
     graph: &CapabilityGraph,
     goals: &BTreeSet<PlanNodeId>,
+    forbidden_edges: &BTreeSet<PlanEdgeId>,
 ) -> BTreeMap<PlanNodeId, u32> {
     let mut reverse = BTreeMap::<PlanNodeId, Vec<PlanNodeId>>::new();
-    for edge in graph.edges().values() {
+    for (edge_id, edge) in graph.edges() {
+        if forbidden_edges.contains(edge_id) {
+            continue;
+        }
         reverse
             .entry(edge.to().clone())
             .or_default()
@@ -5621,7 +5635,7 @@ mod tests {
         let goals = BTreeSet::from([goal.clone()]);
         let weights = AStarCostWeights::default_contract();
         let lower = minimum_edge_lower_bound(&graph, &weights);
-        let hops = compute_goal_hop_bounds(&graph, &goals);
+        let hops = compute_goal_hop_bounds_with_forbidden_edges(&graph, &goals, &BTreeSet::new());
         let caps = BTreeSet::new();
         for edge in graph.edges().values() {
             let h_from = heuristic_cost(edge.from(), &hops, lower);
@@ -5637,6 +5651,140 @@ mod tests {
         );
         let plan = astar_plan(&graph, &request).expect("plan").expect("path");
         assert_eq!(plan.traversed_edges.len(), 2);
+    }
+
+    #[test]
+    fn goal_hop_bounds_respect_forbidden_edges() {
+        let mut graph = CapabilityGraph::new();
+        let start = parse_node_id("node/cap/start");
+        let mid = parse_node_id("node/asset/mid");
+        let goal = parse_node_id("node/objective/goal");
+        let blocked_edge_id = parse_edge_id("edge/mid-goal");
+
+        graph
+            .add_node(PlanNode::CapabilityState(
+                CapabilityStateNode::new(start.clone(), "scan", true).expect("start"),
+            ))
+            .expect("insert");
+        graph
+            .add_node(PlanNode::AssetState(
+                AssetStateNode::new(mid.clone(), "signal", "expected").expect("mid"),
+            ))
+            .expect("insert");
+        graph
+            .add_node(PlanNode::ObjectiveState(
+                ObjectiveStateNode::new(
+                    goal.clone(),
+                    parse_objective_id("dfdddddd-dddd-dddd-dddd-dddddddddddd"),
+                    ObjectiveStatus::Pending,
+                    "goal",
+                )
+                .expect("goal"),
+            ))
+            .expect("insert");
+        graph
+            .add_edge(
+                PlanEdge::module_execution(
+                    parse_edge_id("edge/start-mid"),
+                    start.clone(),
+                    mid.clone(),
+                    "module/start-mid",
+                    edge_attrs(),
+                )
+                .expect("edge"),
+            )
+            .expect("insert");
+        graph
+            .add_edge(
+                PlanEdge::module_execution(
+                    blocked_edge_id.clone(),
+                    mid.clone(),
+                    goal.clone(),
+                    "module/mid-goal",
+                    edge_attrs(),
+                )
+                .expect("edge"),
+            )
+            .expect("insert");
+
+        let goals = BTreeSet::from([goal.clone()]);
+        let all_edges_bounds =
+            compute_goal_hop_bounds_with_forbidden_edges(&graph, &goals, &BTreeSet::new());
+        assert_eq!(all_edges_bounds.get(&start), Some(&2));
+        assert_eq!(all_edges_bounds.get(&mid), Some(&1));
+        assert_eq!(all_edges_bounds.get(&goal), Some(&0));
+
+        let forbidden = BTreeSet::from([blocked_edge_id]);
+        let constrained_bounds =
+            compute_goal_hop_bounds_with_forbidden_edges(&graph, &goals, &forbidden);
+        assert_eq!(constrained_bounds.get(&goal), Some(&0));
+        assert!(!constrained_bounds.contains_key(&start));
+        assert!(!constrained_bounds.contains_key(&mid));
+    }
+
+    #[test]
+    fn astar_with_forbidden_edges_returns_none_when_goal_paths_are_blocked() {
+        let mut graph = CapabilityGraph::new();
+        let start = parse_node_id("node/cap/start");
+        let mid = parse_node_id("node/asset/mid");
+        let goal = parse_node_id("node/objective/goal");
+        let blocked_edge_id = parse_edge_id("edge/mid-goal");
+
+        graph
+            .add_node(PlanNode::CapabilityState(
+                CapabilityStateNode::new(start.clone(), "scan", true).expect("start"),
+            ))
+            .expect("insert");
+        graph
+            .add_node(PlanNode::AssetState(
+                AssetStateNode::new(mid.clone(), "signal", "expected").expect("mid"),
+            ))
+            .expect("insert");
+        graph
+            .add_node(PlanNode::ObjectiveState(
+                ObjectiveStateNode::new(
+                    goal.clone(),
+                    parse_objective_id("eddddddd-dddd-dddd-dddd-dddddddddddd"),
+                    ObjectiveStatus::Pending,
+                    "goal",
+                )
+                .expect("goal"),
+            ))
+            .expect("insert");
+        graph
+            .add_edge(
+                PlanEdge::module_execution(
+                    parse_edge_id("edge/start-mid"),
+                    start.clone(),
+                    mid.clone(),
+                    "module/start-mid",
+                    edge_attrs(),
+                )
+                .expect("edge"),
+            )
+            .expect("insert");
+        graph
+            .add_edge(
+                PlanEdge::module_execution(
+                    blocked_edge_id.clone(),
+                    mid.clone(),
+                    goal.clone(),
+                    "module/mid-goal",
+                    edge_attrs(),
+                )
+                .expect("edge"),
+            )
+            .expect("insert");
+
+        let request = AStarPlanRequest::new(
+            parse_objective_id("eddddddd-dddd-dddd-dddd-dddddddddddd"),
+            BTreeSet::new(),
+            AStarCostWeights::default_contract(),
+        );
+        let forbidden = BTreeSet::from([blocked_edge_id]);
+        let plan =
+            astar_plan_with_forbidden_edges(&graph, &request, &forbidden).expect("planner call");
+        assert!(plan.is_none());
     }
 
     #[test]

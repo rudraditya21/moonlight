@@ -5,9 +5,10 @@ use std::time::{Duration, Instant};
 
 use corelib::campaign::{
     validate_prerequisite_graph, Campaign, CampaignId, MetadataValue, Objective,
-    ObjectiveEvaluationEngine, ObjectiveId, ObjectiveReevaluationTrigger, Predicate,
-    PredicateSnapshot, RiskLevel, SessionPrivilegeLevel,
+    ObjectiveEvaluationEngine, ObjectiveId, ObjectiveReevaluationTrigger, ObjectiveStatus,
+    Predicate, PredicateSnapshot, RiskLevel, RunSnapshot, SessionPrivilegeLevel,
 };
+use corelib::domain::{ModuleVersionId, Run, RunState, WorkspaceId};
 use corelib::ids::Id;
 use corelib::planning::{
     execute_planner_pipeline, normalize_planner_input, AStarCostWeights, DiscoveredArtifactInput,
@@ -72,6 +73,7 @@ pub struct Repl {
     release_checklist: ReleaseChecklistTemplate,
     campaigns: BTreeMap<CampaignId, Campaign>,
     objectives: BTreeMap<ObjectiveId, Objective>,
+    successful_run_modules: BTreeSet<String>,
     planning_events: PlanningEventLog,
     palette: Palette,
 }
@@ -357,6 +359,7 @@ impl Repl {
             release_checklist: ReleaseChecklistTemplate::default_control_plane(),
             campaigns: BTreeMap::new(),
             objectives: BTreeMap::new(),
+            successful_run_modules: BTreeSet::new(),
             planning_events: PlanningEventLog::default(),
             palette: Palette::new(),
         }
@@ -995,6 +998,7 @@ impl Repl {
                 if let Some(session) = result.take_session() {
                     let kind = session.kind().to_string();
                     let target = session.target();
+                    self.record_successful_module_run(&module_name);
                     let id = self.sessions.register(module_name, session);
                     self.emit_response(
                         CommandResponse::ok("run", "module executed; session opened")
@@ -1005,6 +1009,7 @@ impl Repl {
                     return;
                 }
                 if result.success {
+                    self.record_successful_module_run(&module_name);
                     self.emit_response(
                         CommandResponse::ok("run", "module executed")
                             .with_field("message", result.message),
@@ -2835,6 +2840,7 @@ impl Repl {
                         .with_field("eligible", counts["eligible"])
                         .with_field("in_progress", counts["in_progress"])
                         .with_field("achieved", counts["achieved"])
+                        .with_field("done", counts["achieved"])
                         .with_field("failed", counts["failed"]),
                 );
             }
@@ -2858,7 +2864,8 @@ impl Repl {
                     CommandResponse::ok("objective", "objective status")
                         .with_field("objective_id", objective.id.as_str())
                         .with_field("campaign_id", objective.campaign_id.as_str())
-                        .with_field("status", objective.status.as_str()),
+                        .with_field("status", objective.status.as_str())
+                        .with_field("display_status", objective_display_status(objective.status)),
                 );
             }
             4 | 5 => {
@@ -2986,7 +2993,13 @@ impl Repl {
             .map(|(id, objective)| (id.clone(), objective.clone()))
             .collect::<BTreeMap<_, _>>();
         let selected = BTreeSet::from([objective_id.clone()]);
-        let snapshot = PredicateSnapshot::default();
+        let snapshot = match self.build_objective_evaluation_snapshot() {
+            Ok(value) => value,
+            Err(err) => {
+                self.emit_error("objective", CliCode::Execution, &err);
+                return;
+            }
+        };
         let mut events = Vec::new();
         let records = match ObjectiveEvaluationEngine::evaluate_selected(
             &mut scoped,
@@ -3016,6 +3029,7 @@ impl Repl {
             CommandResponse::ok("objective", "objective evaluated")
                 .with_field("objective_id", updated.id.as_str())
                 .with_field("status", updated.status.as_str())
+                .with_field("display_status", objective_display_status(updated.status))
                 .with_field("evaluations", evaluations),
         );
     }
@@ -3422,6 +3436,36 @@ impl Repl {
             println!("Simulation artifacts: {artifacts}");
             println!("Simulation detection surface: {detection}");
         }
+    }
+
+    fn record_successful_module_run(&mut self, module_name: &str) {
+        let token = module_name.trim().to_ascii_lowercase();
+        if token.is_empty() {
+            return;
+        }
+        self.successful_run_modules.insert(token);
+    }
+
+    fn build_objective_evaluation_snapshot(&self) -> Result<PredicateSnapshot, String> {
+        let now = now_secs();
+        let mut snapshot = PredicateSnapshot::new();
+        for module_name in &self.successful_run_modules {
+            let mut run = Run::new_at(
+                WorkspaceId::next(),
+                ModuleVersionId::next(),
+                None,
+                "repl",
+                now,
+            )
+            .map_err(|err| err.to_string())?;
+            run.transition_state(RunState::Running, now)
+                .map_err(|err| err.to_string())?;
+            run.transition_state(RunState::Succeeded, now)
+                .map_err(|err| err.to_string())?;
+            let run_snapshot = RunSnapshot::new(run, module_name).map_err(|err| err.to_string())?;
+            snapshot = snapshot.with_run(run_snapshot);
+        }
+        Ok(snapshot)
     }
 
     fn validate_campaign_objective_graph(
@@ -4810,6 +4854,16 @@ fn decision_kind_token(kind: DecisionKind) -> &'static str {
     }
 }
 
+fn objective_display_status(status: ObjectiveStatus) -> &'static str {
+    match status {
+        ObjectiveStatus::Achieved => "done",
+        ObjectiveStatus::Pending => "pending",
+        ObjectiveStatus::Eligible => "eligible",
+        ObjectiveStatus::InProgress => "in_progress",
+        ObjectiveStatus::Failed => "failed",
+    }
+}
+
 fn normalize_reason_token(raw: &str) -> String {
     let mut out = String::new();
     let mut previous_sep = false;
@@ -5104,5 +5158,42 @@ mod tests {
         assert!(plan_explain
             .candidates
             .contains(&objective_id.as_str().to_string()));
+    }
+
+    #[test]
+    fn objective_display_status_maps_achieved_to_done() {
+        assert_eq!(objective_display_status(ObjectiveStatus::Achieved), "done");
+        assert_eq!(
+            objective_display_status(ObjectiveStatus::InProgress),
+            "in_progress"
+        );
+    }
+
+    #[test]
+    fn objective_evaluation_snapshot_includes_successful_module_runs() {
+        let registry = modules::ModuleRegistryBuilder::new()
+            .build()
+            .expect("empty registry");
+        let mut repl = Repl::new("moonlight".to_string(), registry, None);
+        repl.record_successful_module_run("auxiliary/crypto/hash_sha2_256");
+        repl.record_successful_module_run("auxiliary/crypto/hash_sha2_256");
+        repl.record_successful_module_run("auxiliary/crypto/hash_sha3_256");
+
+        let snapshot = repl
+            .build_objective_evaluation_snapshot()
+            .expect("snapshot should build");
+        let modules = snapshot
+            .runs
+            .iter()
+            .map(|run| run.module_name.clone())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(snapshot.runs.len(), 2);
+        assert!(modules.contains("auxiliary/crypto/hash_sha2_256"));
+        assert!(modules.contains("auxiliary/crypto/hash_sha3_256"));
+        assert!(snapshot
+            .runs
+            .iter()
+            .all(|run| run.run.state == corelib::domain::RunState::Succeeded));
     }
 }
