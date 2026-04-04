@@ -793,16 +793,16 @@ pub fn proxy_forward(request: &HttpRequest, timeouts: Timeouts) -> CoreResult<Ht
     outbound.path = target.path.clone();
     set_header(&mut outbound.headers, "Host", &target.host_header);
     remove_header(&mut outbound.headers, "Proxy-Connection");
-    if target.scheme == "https" {
-        let tls = TlsClientConfig::with_webpki_roots()?;
-        let addr = NetAddr::new(&target.host, target.port);
-        let mut client = HttpClient::connect_tls(&addr, &target.host, &tls, timeouts)?;
-        client.send(&outbound)
-    } else {
-        let addr = NetAddr::new(&target.host, target.port);
-        let mut client = HttpClient::connect(&addr, timeouts)?;
-        client.send(&outbound)
-    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| CoreError::Message(err.to_string()))?;
+    runtime.block_on(send_with_hyper_http11_async(
+        &outbound,
+        &target,
+        timeouts,
+        DEFAULT_MAX_BODY,
+    ))
 }
 
 pub async fn proxy_forward_async(
