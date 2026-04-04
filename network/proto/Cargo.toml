@@ -23,6 +23,7 @@ http-body-util = "0.1"
 redis = { version = "1.1.0", features = ["tokio-comp"] }
 mysql_async = { version = "0.36.2", default-features = false, features = ["minimal-rust", "rustls-tls", "ring"] }
 rumqttc = "0.25.1"
+ldap3 = "0.12.1"
 ring = "0.17"
 aes = "0.8"
 ctr = "0.9"

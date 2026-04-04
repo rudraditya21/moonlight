@@ -147,6 +147,7 @@ pub use ldap::{
     BindResponse, Change, CompareRequest, Control, DerefAliases, ExtendedRequest, ExtendedResponse,
     Filter, InMemoryBackend, LdapClient, LdapMessage, LdapResult, LdapServer, ModifyDnRequest,
     ModifyOp, ModifyRequest, ProtocolOp, SearchRequest, SearchResultEntry, SearchScope, Substring,
+    AsyncUpstreamLdapClient, UpstreamLdapClient,
 };
 pub use mdns::{
     build_query as mdns_query, build_response as mdns_response, decode_message as mdns_decode,

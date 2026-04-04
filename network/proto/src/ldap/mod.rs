@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use corelib::error::{CoreError, CoreResult};
+use ldap3 as ldap3_crate;
 use net::NetAddr;
 
 use crate::transport::{AsyncStreamTransport, AsyncTcpTransport, StreamTransport, TcpTransport};
@@ -609,6 +610,213 @@ impl AsyncLdapClient {
         self.transport.write_all(&bytes).await?;
         Ok(())
     }
+}
+
+pub struct UpstreamLdapClient {
+    runtime: tokio::runtime::Runtime,
+    inner: AsyncUpstreamLdapClient,
+}
+
+impl UpstreamLdapClient {
+    pub fn connect(addr: &NetAddr, _timeouts: Timeouts) -> CoreResult<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| CoreError::Message(err.to_string()))?;
+        let inner = runtime.block_on(AsyncUpstreamLdapClient::connect(addr))?;
+        Ok(Self { runtime, inner })
+    }
+
+    pub fn bind_simple(&mut self, dn: &str, password: &str) -> CoreResult<LdapResult> {
+        self.runtime.block_on(self.inner.bind_simple(dn, password))
+    }
+
+    pub fn search(
+        &mut self,
+        request: SearchRequest,
+    ) -> CoreResult<(Vec<SearchResultEntry>, LdapResult)> {
+        self.runtime.block_on(self.inner.search(request))
+    }
+
+    pub fn unbind(&mut self) -> CoreResult<()> {
+        self.runtime.block_on(self.inner.unbind())
+    }
+}
+
+pub struct AsyncUpstreamLdapClient {
+    ldap: ldap3_crate::Ldap,
+}
+
+impl AsyncUpstreamLdapClient {
+    pub async fn connect(addr: &NetAddr) -> CoreResult<Self> {
+        let socket = addr
+            .resolve()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CoreError::Parse("unable to resolve".to_string()))?;
+        let url = format!("ldap://{}:{}", socket.ip(), socket.port());
+        let (conn, ldap) = ldap3_crate::LdapConnAsync::new(&url)
+            .await
+            .map_err(|err| CoreError::Message(format!("ldap connect failed: {err}")))?;
+        tokio::spawn(async move {
+            let _ = conn.drive().await;
+        });
+        Ok(Self { ldap })
+    }
+
+    pub async fn bind_simple(&mut self, dn: &str, password: &str) -> CoreResult<LdapResult> {
+        let result = self
+            .ldap
+            .simple_bind(dn, password)
+            .await
+            .map_err(|err| CoreError::Message(format!("ldap bind failed: {err}")))?
+            .success()
+            .map_err(|err| CoreError::Message(format!("ldap bind failed: {err}")))?;
+        Ok(map_ldap3_result(&result))
+    }
+
+    pub async fn search(
+        &mut self,
+        request: SearchRequest,
+    ) -> CoreResult<(Vec<SearchResultEntry>, LdapResult)> {
+        let scope = match request.scope {
+            SearchScope::Base => ldap3_crate::Scope::Base,
+            SearchScope::One => ldap3_crate::Scope::OneLevel,
+            SearchScope::Subtree => ldap3_crate::Scope::Subtree,
+        };
+        let attrs = request.attributes.clone();
+        let filter = ldap_filter_to_string(&request.filter);
+        let (entries, result) = self
+            .ldap
+            .search(&request.base_dn, scope, &filter, attrs)
+            .await
+            .map_err(|err| CoreError::Message(format!("ldap search failed: {err}")))?
+            .success()
+            .map_err(|err| CoreError::Message(format!("ldap search failed: {err}")))?;
+
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let entry = ldap3_crate::SearchEntry::construct(entry);
+            let mut attributes = Vec::new();
+            for (name, values) in entry.attrs {
+                attributes.push(Attribute {
+                    name,
+                    values: values.into_iter().map(|v| v.into_bytes()).collect(),
+                });
+            }
+            for (name, values) in entry.bin_attrs {
+                attributes.push(Attribute { name, values });
+            }
+            out.push(SearchResultEntry {
+                dn: entry.dn,
+                attributes,
+            });
+        }
+        Ok((out, map_ldap3_result(&result)))
+    }
+
+    pub async fn unbind(&mut self) -> CoreResult<()> {
+        self.ldap
+            .unbind()
+            .await
+            .map_err(|err| CoreError::Message(format!("ldap unbind failed: {err}")))
+    }
+}
+
+fn map_ldap3_result(result: &ldap3_crate::LdapResult) -> LdapResult {
+    LdapResult {
+        code: map_ldap3_code(result.rc),
+        matched_dn: result.matched.clone(),
+        message: result.text.clone(),
+        referrals: result.refs.clone(),
+    }
+}
+
+fn map_ldap3_code(rc: u32) -> ResultCode {
+    ResultCode::from_u32(rc)
+}
+
+fn ldap_filter_to_string(filter: &Filter) -> String {
+    match filter {
+        Filter::And(filters) => {
+            let mut out = String::from("(&");
+            for item in filters {
+                out.push_str(&ldap_filter_to_string(item));
+            }
+            out.push(')');
+            out
+        }
+        Filter::Or(filters) => {
+            let mut out = String::from("(|");
+            for item in filters {
+                out.push_str(&ldap_filter_to_string(item));
+            }
+            out.push(')');
+            out
+        }
+        Filter::Not(item) => format!("(!{})", ldap_filter_to_string(item)),
+        Filter::Equality(ava) => format!(
+            "({}={})",
+            ava.attribute,
+            ldap_escape_filter_value(&ava.value)
+        ),
+        Filter::Substrings {
+            attribute,
+            substrings,
+        } => {
+            let mut out = format!("({attribute}=");
+            for part in substrings {
+                match part {
+                    Substring::Initial(v) | Substring::Any(v) | Substring::Final(v) => {
+                        out.push_str(&ldap_escape_filter_str(v));
+                        out.push('*');
+                    }
+                }
+            }
+            out.push(')');
+            out
+        }
+        Filter::GreaterOrEqual(ava) => format!(
+            "({}>={})",
+            ava.attribute,
+            ldap_escape_filter_value(&ava.value)
+        ),
+        Filter::LessOrEqual(ava) => format!(
+            "({}<={})",
+            ava.attribute,
+            ldap_escape_filter_value(&ava.value)
+        ),
+        Filter::Present(attribute) => format!("({}=*)", attribute),
+        Filter::Approx(ava) => format!(
+            "({}~={})",
+            ava.attribute,
+            ldap_escape_filter_value(&ava.value)
+        ),
+        Filter::Extensible(ext) => {
+            let attr = ext.attribute.clone().unwrap_or_default();
+            let rule = ext.matching_rule.clone().unwrap_or_default();
+            let dn_flag = if ext.dn_attributes { ":dn" } else { "" };
+            format!(
+                "({attr}:{dn_flag}:{rule}:={})",
+                ldap_escape_filter_value(&ext.value)
+            )
+        }
+    }
+}
+
+fn ldap_escape_filter_str(value: &str) -> String {
+    ldap_escape_filter_value(value.as_bytes())
+}
+
+fn ldap_escape_filter_value(value: &[u8]) -> String {
+    let mut out = String::new();
+    for &b in value {
+        match b {
+            b'(' | b')' | b'*' | b'\\' | 0x00 => out.push_str(&format!("\\{:02x}", b)),
+            _ => out.push(b as char),
+        }
+    }
+    out
 }
 
 pub trait LdapBackend: Send + Sync {
