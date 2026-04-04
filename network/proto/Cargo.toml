@@ -7,17 +7,23 @@ edition = "2021"
 corelib = { path = "../../core/core" }
 net = { path = "../net" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros"] }
-rustls = "0.22"
-tokio-rustls = "0.25"
-webpki-roots = "0.26"
+rustls = "0.23"
+tokio-rustls = "0.26"
+webpki-roots = "1"
 rustls-pemfile = "2"
 h2 = "0.4.13"
 http = "1"
+httparse = "1"
+hickory-proto = "0.25.2"
 bytes = "1"
-quiche = "0.24.8"
+quiche = "0.28.0"
+hyper = { version = "1.9.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "http1", "tokio"] }
+http-body-util = "0.1"
 ring = "0.17"
 aes = "0.8"
 ctr = "0.9"
+x509-parser = "0.16"
 sha1 = { path = "../../crypt/sha1" }
 sha256 = { path = "../../crypt/sha2_256" }
 sha384 = { path = "../../crypt/sha2_384" }
