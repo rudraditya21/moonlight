@@ -5,13 +5,16 @@ use std::thread;
 use std::time::Duration;
 
 use corelib::error::{CoreError, CoreResult};
+use http_body_util::{BodyExt, Full};
+use hickory_proto::op::Message as HickoryMessage;
+use hyper::client::conn::http1;
+use hyper::Request;
+use hyper_util::rt::TokioIo;
 use net::NetAddr;
 use tokio::net::UdpSocket as TokioUdpSocket;
 
 use crate::framing::{Framer, LengthPrefixedFramer};
-use crate::http::{
-    AsyncHttpClient, HttpClient, HttpMethod, HttpRequest, HttpResponse, HttpVersion,
-};
+use crate::http::{HttpMethod, HttpRequest, HttpResponse};
 use crate::http2::{Http2Request, Http2Response, Http2Server, Http2TlsServer};
 use crate::http3::{Http3Request, Http3Response, Http3Server};
 use crate::transport::{
@@ -1900,6 +1903,85 @@ impl DohUrl {
     }
 }
 
+async fn doh_send_http11_request<S>(
+    io: S,
+    url: &DohUrl,
+    payload: Vec<u8>,
+    timeouts: Timeouts,
+    max_packet: usize,
+) -> CoreResult<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut sender, connection) = http1::handshake(TokioIo::new(io))
+        .await
+        .map_err(|err| CoreError::Message(err.to_string()))?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(url.path.as_str())
+        .header("host", &url.host_header)
+        .header("content-type", "application/dns-message")
+        .header("accept", "application/dns-message")
+        .body(Full::new(bytes::Bytes::from(payload)))
+        .map_err(|_| CoreError::Parse("invalid doh request".to_string()))?;
+
+    let response = tokio::time::timeout(timeouts.read, sender.send_request(request))
+        .await
+        .map_err(|_| CoreError::Parse("doh request timeout".to_string()))?
+        .map_err(|err| CoreError::Message(err.to_string()))?;
+
+    if response.status().as_u16() != 200 {
+        return Err(CoreError::Parse("doh non-200 response".to_string()));
+    }
+
+    let body = tokio::time::timeout(timeouts.read, response.into_body().collect())
+        .await
+        .map_err(|_| CoreError::Parse("doh response timeout".to_string()))?
+        .map_err(|err| CoreError::Message(err.to_string()))?
+        .to_bytes();
+    if body.len() > max_packet {
+        return Err(CoreError::Parse("doh response too large".to_string()));
+    }
+    Ok(body.to_vec())
+}
+
+async fn doh_query_http11_async(
+    url: &DohUrl,
+    payload: Vec<u8>,
+    timeouts: Timeouts,
+    max_packet: usize,
+) -> CoreResult<Vec<u8>> {
+    let target = NetAddr::new(&url.host, url.port)
+        .resolve()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CoreError::Parse("unable to resolve".to_string()))?;
+    let tcp = tokio::time::timeout(timeouts.connect, tokio::net::TcpStream::connect(target))
+        .await
+        .map_err(|_| CoreError::Parse("connect timeout".to_string()))?
+        .map_err(CoreError::Io)?;
+    tcp.set_nodelay(true).map_err(CoreError::Io)?;
+
+    if url.scheme == "https" {
+        let tls = TlsClientConfig::with_webpki_roots()?.with_alpn(&[b"http/1.1"]);
+        let server_name = rustls::pki_types::ServerName::try_from(url.host.as_str())
+            .map_err(|_| CoreError::Parse("invalid server name".to_string()))?
+            .to_owned();
+        let connector = tokio_rustls::TlsConnector::from(tls.inner());
+        let stream = tokio::time::timeout(timeouts.connect, connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| CoreError::Parse("tls handshake timeout".to_string()))?
+            .map_err(|err| CoreError::Message(err.to_string()))?;
+        return doh_send_http11_request(stream, url, payload, timeouts, max_packet).await;
+    }
+
+    doh_send_http11_request(tcp, url, payload, timeouts, max_packet).await
+}
+
 impl DohClient {
     pub fn new(url: &str, timeouts: Timeouts) -> CoreResult<Self> {
         Ok(Self {
@@ -1915,28 +1997,18 @@ impl DohClient {
     }
 
     pub fn query(&self, message: &DnsMessage) -> CoreResult<DnsMessage> {
-        let mut req = HttpRequest::new(HttpMethod::Post, self.url.path.clone());
-        req.version = HttpVersion::Http11;
-        req.set_header("Host", &self.url.host_header);
-        req.set_header("Content-Type", "application/dns-message");
-        req.set_header("Accept", "application/dns-message");
-        req.body = message.encode()?;
-        let addr = NetAddr::new(&self.url.host, self.url.port);
-        let response = if self.url.scheme == "https" {
-            let tls = TlsClientConfig::with_webpki_roots()?;
-            let mut client = HttpClient::connect_tls(&addr, &self.url.host, &tls, self.timeouts)?;
-            client.send(&req)?
-        } else {
-            let mut client = HttpClient::connect(&addr, self.timeouts)?;
-            client.send(&req)?
-        };
-        if response.status_code != 200 {
-            return Err(CoreError::Parse("doh non-200 response".to_string()));
-        }
-        if response.body.len() > self.max_packet {
-            return Err(CoreError::Parse("doh response too large".to_string()));
-        }
-        DnsMessage::decode(&response.body)
+        let payload = message.encode()?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| CoreError::Message(err.to_string()))?;
+        let bytes = runtime.block_on(doh_query_http11_async(
+            &self.url,
+            payload,
+            self.timeouts,
+            self.max_packet,
+        ))?;
+        DnsMessage::decode(&bytes)
     }
 }
 
@@ -1955,29 +2027,10 @@ impl AsyncDohClient {
     }
 
     pub async fn query(&self, message: &DnsMessage) -> CoreResult<DnsMessage> {
-        let mut req = HttpRequest::new(HttpMethod::Post, self.url.path.clone());
-        req.version = HttpVersion::Http11;
-        req.set_header("Host", &self.url.host_header);
-        req.set_header("Content-Type", "application/dns-message");
-        req.set_header("Accept", "application/dns-message");
-        req.body = message.encode()?;
-        let addr = NetAddr::new(&self.url.host, self.url.port);
-        let response = if self.url.scheme == "https" {
-            let tls = TlsClientConfig::with_webpki_roots()?;
-            let mut client =
-                AsyncHttpClient::connect_tls(&addr, &self.url.host, &tls, self.timeouts).await?;
-            client.send(&req).await?
-        } else {
-            let mut client = AsyncHttpClient::connect(&addr, self.timeouts).await?;
-            client.send(&req).await?
-        };
-        if response.status_code != 200 {
-            return Err(CoreError::Parse("doh non-200 response".to_string()));
-        }
-        if response.body.len() > self.max_packet {
-            return Err(CoreError::Parse("doh response too large".to_string()));
-        }
-        DnsMessage::decode(&response.body)
+        let payload = message.encode()?;
+        let bytes =
+            doh_query_http11_async(&self.url, payload, self.timeouts, self.max_packet).await?;
+        DnsMessage::decode(&bytes)
     }
 }
 
