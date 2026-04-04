@@ -10,6 +10,7 @@ This module provides a full LDAP protocol implementation intended for use by Moo
 ### Structs
 - `AddRequest`
 - `AsyncLdapClient`
+- `AsyncUpstreamLdapClient`
 - `AsyncLdapServer`
 - `Attribute`
 - `AttributeValueAssertion`
@@ -26,6 +27,7 @@ This module provides a full LDAP protocol implementation intended for use by Moo
 - `LdapMessage`
 - `LdapResult`
 - `LdapServer`
+- `UpstreamLdapClient`
 - `ModifyDnRequest`
 - `ModifyRequest`
 - `SearchRequest`
@@ -47,7 +49,9 @@ This module provides a full LDAP protocol implementation intended for use by Moo
 ## Key Entry Points
 ### Clients
 - `AsyncLdapClient`
+- `AsyncUpstreamLdapClient`
 - `LdapClient`
+- `UpstreamLdapClient`
 
 ### Servers
 - `AsyncLdapServer`
@@ -75,6 +79,11 @@ This module provides a full LDAP protocol implementation intended for use by Moo
   - `pub async fn search( &mut self, request: SearchRequest, ) -> CoreResult<(Vec<SearchResultEntry>, LdapResult)>`
 - `AsyncLdapServer`
   - `pub async fn bind( addr: SocketAddr, timeouts: Timeouts, backend: Arc<dyn LdapBackend>, ) -> CoreResult<Self>`
+- `AsyncUpstreamLdapClient`
+  - `pub async fn connect(addr: &NetAddr) -> CoreResult<Self>`
+  - `pub async fn bind_simple(&mut self, dn: &str, password: &str) -> CoreResult<LdapResult>`
+  - `pub async fn search( &mut self, request: SearchRequest, ) -> CoreResult<(Vec<SearchResultEntry>, LdapResult)>`
+  - `pub async fn unbind(&mut self) -> CoreResult<()>`
 - `InMemoryBackend`
   - `pub fn new() -> Self`
   - `pub fn with_entry(self, entry: SearchResultEntry) -> Self`
@@ -90,6 +99,11 @@ This module provides a full LDAP protocol implementation intended for use by Moo
   - `pub fn decode(data: &[u8]) -> CoreResult<Self>`
 - `LdapServer`
   - `pub fn bind( addr: SocketAddr, timeouts: Timeouts, backend: Arc<dyn LdapBackend>, ) -> CoreResult<Self>`
+- `UpstreamLdapClient`
+  - `pub fn connect(addr: &NetAddr, _timeouts: Timeouts) -> CoreResult<Self>`
+  - `pub fn bind_simple(&mut self, dn: &str, password: &str) -> CoreResult<LdapResult>`
+  - `pub fn search( &mut self, request: SearchRequest, ) -> CoreResult<(Vec<SearchResultEntry>, LdapResult)>`
+  - `pub fn unbind(&mut self) -> CoreResult<()>`
 
 ## Usage Notes
 - Start with the client or server structs listed above, then follow their constructors and connect/bind/listen methods if present.
@@ -99,4 +113,3 @@ This module provides a full LDAP protocol implementation intended for use by Moo
 ## Tests and Examples
 - Unit tests live alongside the implementation in `network/proto/src/ldap/`.
 - Protocol‑level fuzz/negative tests are located in `network/proto/tests/negative_fuzz.rs` where applicable.
-

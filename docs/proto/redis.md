@@ -11,6 +11,7 @@ This module provides a full REDIS protocol implementation intended for use by Mo
 - `AsyncRedisClient`
 - `AsyncRedisConnection`
 - `AsyncRedisServer`
+- `AsyncUpstreamRedisClient`
 - `DefaultRedisHandler`
 - `RedisClient`
 - `RedisCommand`
@@ -19,6 +20,7 @@ This module provides a full REDIS protocol implementation intended for use by Mo
 - `RedisServer`
 - `RedisServerConfig`
 - `RedisStore`
+- `UpstreamRedisClient`
 
 ### Enums
 - `RespFrame`
@@ -30,7 +32,9 @@ This module provides a full REDIS protocol implementation intended for use by Mo
 ## Key Entry Points
 ### Clients
 - `AsyncRedisClient`
+- `AsyncUpstreamRedisClient`
 - `RedisClient`
+- `UpstreamRedisClient`
 
 ### Servers
 - `AsyncRedisServer`
@@ -56,6 +60,11 @@ This module provides a full REDIS protocol implementation intended for use by Mo
   - `pub fn into_inner(self) -> T`
 - `AsyncRedisServer`
   - `pub async fn bind( addr: SocketAddr, config: RedisServerConfig, handler: Arc<dyn RedisHandler>, ) -> CoreResult<Self>`
+- `AsyncUpstreamRedisClient`
+  - `pub async fn connect(addr: &NetAddr, _timeouts: Timeouts) -> CoreResult<Self>`
+  - `pub async fn call(&mut self, cmd: RedisCommand) -> CoreResult<RespFrame>`
+  - `pub async fn auth(&mut self, password: &str) -> CoreResult<RespFrame>`
+  - `pub async fn hello(&mut self, version: RespVersion) -> CoreResult<RespFrame>`
 - `RedisClient`
   - `pub fn connect(addr: &NetAddr, timeouts: Timeouts) -> CoreResult<Self>`
   - `pub fn call(&mut self, cmd: RedisCommand) -> CoreResult<RespFrame>`
@@ -74,6 +83,11 @@ This module provides a full REDIS protocol implementation intended for use by Mo
   - `pub fn bind( addr: SocketAddr, config: RedisServerConfig, handler: Arc<dyn RedisHandler>, ) -> CoreResult<Self>`
 - `RedisStore`
   - `pub fn new(databases: usize) -> Self`
+- `UpstreamRedisClient`
+  - `pub fn connect(addr: &NetAddr, _timeouts: Timeouts) -> CoreResult<Self>`
+  - `pub fn call(&mut self, cmd: RedisCommand) -> CoreResult<RespFrame>`
+  - `pub fn auth(&mut self, password: &str) -> CoreResult<RespFrame>`
+  - `pub fn hello(&mut self, version: RespVersion) -> CoreResult<RespFrame>`
 - `RespFrame`
   - `pub fn encode(&self, version: RespVersion) -> Vec<u8>`
 
@@ -85,4 +99,3 @@ This module provides a full REDIS protocol implementation intended for use by Mo
 ## Tests and Examples
 - Unit tests live alongside the implementation in `network/proto/src/redis/`.
 - Protocol‑level fuzz/negative tests are located in `network/proto/tests/negative_fuzz.rs` where applicable.
-

@@ -10,10 +10,12 @@ This module provides a full MQTT protocol implementation intended for use by Moo
 ### Structs
 - `AsyncMqttClient`
 - `AsyncMqttServer`
+- `AsyncUpstreamMqttClient`
 - `MqttClient`
 - `MqttClientConfig`
 - `MqttServer`
 - `MqttServerConfig`
+- `UpstreamMqttClient`
 
 ### Enums
 - `MqttPacket`
@@ -22,8 +24,10 @@ This module provides a full MQTT protocol implementation intended for use by Moo
 ## Key Entry Points
 ### Clients
 - `AsyncMqttClient`
+- `AsyncUpstreamMqttClient`
 - `MqttClient`
 - `MqttClientConfig`
+- `UpstreamMqttClient`
 
 ### Servers
 - `AsyncMqttServer`
@@ -40,6 +44,11 @@ This module provides a full MQTT protocol implementation intended for use by Moo
   - `pub async fn bind(addr: SocketAddr, config: MqttServerConfig) -> CoreResult<Self>`
   - `pub fn local_addr(&self) -> CoreResult<SocketAddr>`
   - `pub async fn serve(&self) -> CoreResult<()>`
+- `AsyncUpstreamMqttClient`
+  - `pub async fn connect(addr: &NetAddr, config: MqttClientConfig) -> CoreResult<Self>`
+  - `pub async fn publish(&mut self, topic: &str, payload: Vec<u8>, qos: u8) -> CoreResult<()>`
+  - `pub async fn subscribe(&mut self, topics: Vec<(String, u8)>) -> CoreResult<()>`
+  - `pub async fn recv(&mut self) -> CoreResult<MqttPacket>`
 - `MqttClient`
   - `pub fn connect(addr: &NetAddr, config: MqttClientConfig) -> CoreResult<Self>`
   - `pub fn publish(&mut self, topic: &str, payload: Vec<u8>, qos: u8) -> CoreResult<()>`
@@ -53,6 +62,11 @@ This module provides a full MQTT protocol implementation intended for use by Moo
   - `pub fn bind(addr: SocketAddr, config: MqttServerConfig) -> CoreResult<Self>`
   - `pub fn local_addr(&self) -> CoreResult<SocketAddr>`
   - `pub fn serve(&self) -> CoreResult<()>`
+- `UpstreamMqttClient`
+  - `pub fn connect(addr: &NetAddr, config: MqttClientConfig) -> CoreResult<Self>`
+  - `pub fn publish(&mut self, topic: &str, payload: Vec<u8>, qos: u8) -> CoreResult<()>`
+  - `pub fn subscribe(&mut self, topics: Vec<(String, u8)>) -> CoreResult<()>`
+  - `pub fn recv(&mut self) -> CoreResult<MqttPacket>`
 
 ## Usage Notes
 - Start with the client or server structs listed above, then follow their constructors and connect/bind/listen methods if present.
@@ -62,4 +76,3 @@ This module provides a full MQTT protocol implementation intended for use by Moo
 ## Tests and Examples
 - Unit tests live alongside the implementation in `network/proto/src/mqtt/`.
 - Protocol‑level fuzz/negative tests are located in `network/proto/tests/negative_fuzz.rs` where applicable.
-

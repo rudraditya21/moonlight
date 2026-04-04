@@ -10,17 +10,21 @@ This module provides a full MYSQL protocol implementation intended for use by Mo
 ### Structs
 - `AsyncMysqlClient`
 - `AsyncMysqlServer`
+- `AsyncUpstreamMysqlClient`
 - `MysqlClient`
 - `MysqlClientConfig`
 - `MysqlQueryResult`
 - `MysqlServer`
 - `MysqlServerConfig`
+- `UpstreamMysqlClient`
 
 ## Key Entry Points
 ### Clients
 - `AsyncMysqlClient`
+- `AsyncUpstreamMysqlClient`
 - `MysqlClient`
 - `MysqlClientConfig`
+- `UpstreamMysqlClient`
 
 ### Servers
 - `AsyncMysqlServer`
@@ -39,6 +43,10 @@ This module provides a full MYSQL protocol implementation intended for use by Mo
 - `AsyncMysqlServer`
   - `pub async fn bind(addr: SocketAddr, config: MysqlServerConfig) -> CoreResult<Self>`
   - `pub async fn serve(&self) -> CoreResult<()>`
+- `AsyncUpstreamMysqlClient`
+  - `pub async fn connect(addr: &net::NetAddr, config: MysqlClientConfig) -> CoreResult<Self>`
+  - `pub async fn query(&mut self, sql: &str) -> CoreResult<MysqlQueryResult>`
+  - `pub async fn ping(&mut self) -> CoreResult<()>`
 - `MysqlClient`
   - `pub fn connect(addr: &net::NetAddr, config: MysqlClientConfig) -> CoreResult<Self>`
   - `pub fn server_version(&self) -> &str`
@@ -51,6 +59,10 @@ This module provides a full MYSQL protocol implementation intended for use by Mo
   - `pub fn bind(addr: SocketAddr, config: MysqlServerConfig) -> CoreResult<Self>`
   - `pub fn local_addr(&self) -> CoreResult<SocketAddr>`
   - `pub fn serve(&self) -> CoreResult<()>`
+- `UpstreamMysqlClient`
+  - `pub fn connect(addr: &net::NetAddr, config: MysqlClientConfig) -> CoreResult<Self>`
+  - `pub fn query(&mut self, sql: &str) -> CoreResult<MysqlQueryResult>`
+  - `pub fn ping(&mut self) -> CoreResult<()>`
 
 ## Usage Notes
 - Start with the client or server structs listed above, then follow their constructors and connect/bind/listen methods if present.
@@ -60,4 +72,3 @@ This module provides a full MYSQL protocol implementation intended for use by Mo
 ## Tests and Examples
 - Unit tests live alongside the implementation in `network/proto/src/mysql/`.
 - Protocol‑level fuzz/negative tests are located in `network/proto/tests/negative_fuzz.rs` where applicable.
-
