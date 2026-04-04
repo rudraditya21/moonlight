@@ -225,7 +225,7 @@ pub use quake::{
 pub use redis::{
     AsyncRedisClient, AsyncRedisConnection, AsyncRedisServer, DefaultRedisHandler, RedisClient,
     RedisCommand, RedisConnection, RedisContext, RedisHandler, RedisServer, RedisServerConfig,
-    RedisStore, RespFrame, RespVersion,
+    RedisStore, RespFrame, RespVersion, AsyncUpstreamRedisClient, UpstreamRedisClient,
 };
 pub use rfb::{
     AsyncRfbClient, AsyncRfbServer, RfbClient, RfbClientConfig, RfbClientMessage, RfbPixelFormat,

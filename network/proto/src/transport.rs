@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Once;
 use std::time::Duration;
 
 use corelib::error::{CoreError, CoreResult};
@@ -16,6 +17,13 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::util::Timeouts;
+
+fn ensure_rustls_provider() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 pub trait StreamTransport {
     fn read(&mut self, buf: &mut [u8]) -> CoreResult<usize>;
@@ -153,6 +161,7 @@ pub struct TlsClientConfig {
 
 impl TlsClientConfig {
     pub fn with_webpki_roots() -> CoreResult<Self> {
+        ensure_rustls_provider();
         let mut root_store = RootCertStore::empty();
         root_store
             .roots
@@ -166,6 +175,7 @@ impl TlsClientConfig {
     }
 
     pub fn with_root_certificates(certs: Vec<CertificateDer<'static>>) -> CoreResult<Self> {
+        ensure_rustls_provider();
         let mut root_store = RootCertStore::empty();
         root_store.add_parsable_certificates(certs.into_iter());
         let config = ClientConfig::builder()
@@ -199,6 +209,7 @@ impl TlsServerConfig {
         certs: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> CoreResult<Self> {
+        ensure_rustls_provider();
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)

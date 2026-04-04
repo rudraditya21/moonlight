@@ -7,6 +7,7 @@ use std::thread;
 
 use corelib::error::{CoreError, CoreResult};
 use net::NetAddr;
+use redis as redis_crate;
 
 use crate::transport::{AsyncStreamTransport, AsyncTcpTransport, StreamTransport, TcpTransport};
 use crate::util::Timeouts;
@@ -557,6 +558,166 @@ impl AsyncRedisClient {
         self.version = version;
         Ok(resp)
     }
+}
+
+pub struct UpstreamRedisClient {
+    conn: redis_crate::Connection,
+}
+
+impl UpstreamRedisClient {
+    pub fn connect(addr: &NetAddr, _timeouts: Timeouts) -> CoreResult<Self> {
+        let socket = addr
+            .resolve()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CoreError::Parse("unable to resolve".to_string()))?;
+        let url = format!("redis://{}:{}/", socket.ip(), socket.port());
+        let client = redis_crate::Client::open(url)
+            .map_err(|err| CoreError::Message(format!("redis client open failed: {err}")))?;
+        let conn = client
+            .get_connection()
+            .map_err(|err| CoreError::Message(format!("redis connection failed: {err}")))?;
+        Ok(Self { conn })
+    }
+
+    pub fn call(&mut self, cmd: RedisCommand) -> CoreResult<RespFrame> {
+        let mut upstream = redis_crate::cmd(&cmd.name);
+        for arg in cmd.args {
+            upstream.arg(arg);
+        }
+        let value: redis_crate::Value = upstream
+            .query(&mut self.conn)
+            .map_err(|err| CoreError::Message(format!("redis query failed: {err}")))?;
+        redis_value_to_resp(value)
+    }
+
+    pub fn auth(&mut self, password: &str) -> CoreResult<RespFrame> {
+        self.call(RedisCommand::new(
+            "AUTH",
+            vec![password.as_bytes().to_vec()],
+        ))
+    }
+
+    pub fn hello(&mut self, version: RespVersion) -> CoreResult<RespFrame> {
+        let proto = match version {
+            RespVersion::Resp2 => b"2".to_vec(),
+            RespVersion::Resp3 => b"3".to_vec(),
+        };
+        self.call(RedisCommand::new("HELLO", vec![proto]))
+    }
+}
+
+pub struct AsyncUpstreamRedisClient {
+    conn: redis_crate::aio::MultiplexedConnection,
+}
+
+impl AsyncUpstreamRedisClient {
+    pub async fn connect(addr: &NetAddr, _timeouts: Timeouts) -> CoreResult<Self> {
+        let socket = addr
+            .resolve()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CoreError::Parse("unable to resolve".to_string()))?;
+        let url = format!("redis://{}:{}/", socket.ip(), socket.port());
+        let client = redis_crate::Client::open(url)
+            .map_err(|err| CoreError::Message(format!("redis client open failed: {err}")))?;
+        let conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|err| CoreError::Message(format!("redis connection failed: {err}")))?;
+        Ok(Self { conn })
+    }
+
+    pub async fn call(&mut self, cmd: RedisCommand) -> CoreResult<RespFrame> {
+        let mut upstream = redis_crate::cmd(&cmd.name);
+        for arg in cmd.args {
+            upstream.arg(arg);
+        }
+        let value: redis_crate::Value = upstream
+            .query_async(&mut self.conn)
+            .await
+            .map_err(|err| CoreError::Message(format!("redis query failed: {err}")))?;
+        redis_value_to_resp(value)
+    }
+
+    pub async fn auth(&mut self, password: &str) -> CoreResult<RespFrame> {
+        self.call(RedisCommand::new(
+            "AUTH",
+            vec![password.as_bytes().to_vec()],
+        ))
+        .await
+    }
+
+    pub async fn hello(&mut self, version: RespVersion) -> CoreResult<RespFrame> {
+        let proto = match version {
+            RespVersion::Resp2 => b"2".to_vec(),
+            RespVersion::Resp3 => b"3".to_vec(),
+        };
+        self.call(RedisCommand::new("HELLO", vec![proto])).await
+    }
+}
+
+fn redis_value_to_resp(value: redis_crate::Value) -> CoreResult<RespFrame> {
+    Ok(match value {
+        redis_crate::Value::Nil => RespFrame::Null,
+        redis_crate::Value::Int(v) => RespFrame::Integer(v),
+        redis_crate::Value::BulkString(v) => RespFrame::BulkString(Some(v)),
+        redis_crate::Value::SimpleString(v) => RespFrame::SimpleString(v),
+        redis_crate::Value::Okay => RespFrame::SimpleString("OK".to_string()),
+        redis_crate::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(redis_value_to_resp(item)?);
+            }
+            RespFrame::Array(Some(out))
+        }
+        redis_crate::Value::Map(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (k, v) in items {
+                out.push((redis_value_to_resp(k)?, redis_value_to_resp(v)?));
+            }
+            RespFrame::Map(out)
+        }
+        redis_crate::Value::Attribute { data, attributes } => {
+            let mut out = Vec::with_capacity(attributes.len() + 1);
+            out.push((
+                RespFrame::SimpleString("data".to_string()),
+                redis_value_to_resp(*data)?,
+            ));
+            for (k, v) in attributes {
+                out.push((redis_value_to_resp(k)?, redis_value_to_resp(v)?));
+            }
+            RespFrame::Map(out)
+        }
+        redis_crate::Value::Set(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(redis_value_to_resp(item)?);
+            }
+            RespFrame::Set(out)
+        }
+        redis_crate::Value::Double(v) => RespFrame::Double(v),
+        redis_crate::Value::Boolean(v) => RespFrame::Boolean(v),
+        redis_crate::Value::BigNumber(v) => RespFrame::BigNumber(v.to_string()),
+        redis_crate::Value::VerbatimString { format, text } => {
+            let mut fmt = [b't', b'x', b't'];
+            let raw = format.to_string();
+            let bytes = raw.as_bytes();
+            if bytes.len() == 3 {
+                fmt.copy_from_slice(bytes);
+            }
+            RespFrame::Verbatim(fmt, text.into_bytes())
+        }
+        redis_crate::Value::Push { data, .. } => {
+            let mut out = Vec::with_capacity(data.len());
+            for item in data {
+                out.push(redis_value_to_resp(item)?);
+            }
+            RespFrame::Push(out)
+        }
+        redis_crate::Value::ServerError(err) => RespFrame::Error(err.to_string()),
+        other => RespFrame::Error(format!("unsupported redis value: {:?}", other)),
+    })
 }
 
 pub struct RedisConnection<T: StreamTransport> {
