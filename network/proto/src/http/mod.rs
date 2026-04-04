@@ -5,7 +5,14 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
+use bytes::Bytes;
 use corelib::error::{CoreError, CoreResult};
+use http_body_util::{BodyExt, Full};
+use hyper::client::conn::http1;
+use hyper::{Request as HyperRequest, Response as HyperResponse};
+use hyper_util::rt::TokioIo;
+use http::{HeaderName, HeaderValue, Method, StatusCode, Version};
+use httparse::{Header as HttpHeader, Request as HttpParseRequest, Response as HttpParseResponse};
 use net::NetAddr;
 
 use crate::transport::{
@@ -783,7 +790,7 @@ impl ProxyServer {
 pub fn proxy_forward(request: &HttpRequest, timeouts: Timeouts) -> CoreResult<HttpResponse> {
     let target = resolve_forward_target(request)?;
     let mut outbound = request.clone();
-    outbound.path = target.path;
+    outbound.path = target.path.clone();
     set_header(&mut outbound.headers, "Host", &target.host_header);
     remove_header(&mut outbound.headers, "Proxy-Connection");
     if target.scheme == "https" {
@@ -804,19 +811,10 @@ pub async fn proxy_forward_async(
 ) -> CoreResult<HttpResponse> {
     let target = resolve_forward_target(request)?;
     let mut outbound = request.clone();
-    outbound.path = target.path;
+    outbound.path = target.path.clone();
     set_header(&mut outbound.headers, "Host", &target.host_header);
     remove_header(&mut outbound.headers, "Proxy-Connection");
-    if target.scheme == "https" {
-        let tls = TlsClientConfig::with_webpki_roots()?;
-        let addr = NetAddr::new(&target.host, target.port);
-        let mut client = AsyncHttpClient::connect_tls(&addr, &target.host, &tls, timeouts).await?;
-        client.send(&outbound).await
-    } else {
-        let addr = NetAddr::new(&target.host, target.port);
-        let mut client = AsyncHttpClient::connect(&addr, timeouts).await?;
-        client.send(&outbound).await
-    }
+    send_with_hyper_http11_async(&outbound, &target, timeouts, DEFAULT_MAX_BODY).await
 }
 
 struct ForwardTarget {
@@ -825,6 +823,115 @@ struct ForwardTarget {
     host_header: String,
     port: u16,
     path: String,
+}
+
+fn http_request_to_hyper(request: &HttpRequest) -> CoreResult<HyperRequest<Full<Bytes>>> {
+    let method = Method::from_bytes(request.method.as_str().as_bytes())
+        .map_err(|_| CoreError::Parse("invalid method".to_string()))?;
+    let uri: http::Uri = request
+        .path
+        .parse()
+        .map_err(|_| CoreError::Parse("invalid uri".to_string()))?;
+    let mut builder = HyperRequest::builder().method(method).uri(uri);
+    for (name, value) in &request.headers {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| CoreError::Parse("invalid header name".to_string()))?;
+        let value = HeaderValue::from_bytes(value.as_bytes())
+            .map_err(|_| CoreError::Parse("invalid header value".to_string()))?;
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Full::new(Bytes::from(request.body.clone())))
+        .map_err(|_| CoreError::Parse("invalid request".to_string()))
+}
+
+fn hyper_response_to_http(mut response: HyperResponse<Bytes>) -> CoreResult<HttpResponse> {
+    let version = match response.version() {
+        Version::HTTP_10 => HttpVersion::Http10,
+        Version::HTTP_11 => HttpVersion::Http11,
+        _ => HttpVersion::Http11,
+    };
+    let status = response.status().as_u16();
+    let mut headers = Vec::with_capacity(response.headers().len());
+    for (name, value) in response.headers() {
+        let value = value
+            .to_str()
+            .map_err(|_| CoreError::Parse("invalid header value".to_string()))?;
+        headers.push((name.as_str().to_string(), value.to_string()));
+    }
+    Ok(HttpResponse {
+        version,
+        status_code: status,
+        reason: default_reason(status).to_string(),
+        headers,
+        body: response.body_mut().split_off(0).to_vec(),
+    })
+}
+
+async fn hyper_send_over_io<S>(
+    io: S,
+    request: &HttpRequest,
+    timeouts: Timeouts,
+    max_body: usize,
+) -> CoreResult<HttpResponse>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut sender, connection) = http1::handshake(TokioIo::new(io))
+        .await
+        .map_err(|err| CoreError::Message(err.to_string()))?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let request = http_request_to_hyper(request)?;
+    let response = tokio::time::timeout(timeouts.read, sender.send_request(request))
+        .await
+        .map_err(|_| CoreError::Parse("http request timeout".to_string()))?
+        .map_err(|err| CoreError::Message(err.to_string()))?;
+    let (parts, body) = response.into_parts();
+    let body = tokio::time::timeout(timeouts.read, body.collect())
+        .await
+        .map_err(|_| CoreError::Parse("http response timeout".to_string()))?
+        .map_err(|err| CoreError::Message(err.to_string()))?
+        .to_bytes();
+    if body.len() > max_body {
+        return Err(CoreError::Parse("body exceeds maximum size".to_string()));
+    }
+    hyper_response_to_http(HyperResponse::from_parts(parts, body))
+}
+
+async fn send_with_hyper_http11_async(
+    request: &HttpRequest,
+    target: &ForwardTarget,
+    timeouts: Timeouts,
+    max_body: usize,
+) -> CoreResult<HttpResponse> {
+    let socket = NetAddr::new(&target.host, target.port)
+        .resolve()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CoreError::Parse("unable to resolve".to_string()))?;
+    let tcp = tokio::time::timeout(timeouts.connect, tokio::net::TcpStream::connect(socket))
+        .await
+        .map_err(|_| CoreError::Parse("connect timeout".to_string()))?
+        .map_err(CoreError::Io)?;
+    tcp.set_nodelay(true).map_err(CoreError::Io)?;
+
+    if target.scheme == "https" {
+        let tls = TlsClientConfig::with_webpki_roots()?.with_alpn(&[b"http/1.1"]);
+        let server_name = rustls::pki_types::ServerName::try_from(target.host.as_str())
+            .map_err(|_| CoreError::Parse("invalid server name".to_string()))?
+            .to_owned();
+        let connector = tokio_rustls::TlsConnector::from(tls.inner());
+        let stream = tokio::time::timeout(timeouts.connect, connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| CoreError::Parse("tls handshake timeout".to_string()))?
+            .map_err(|err| CoreError::Message(err.to_string()))?;
+        return hyper_send_over_io(stream, request, timeouts, max_body).await;
+    }
+
+    hyper_send_over_io(tcp, request, timeouts, max_body).await
 }
 
 fn resolve_forward_target(request: &HttpRequest) -> CoreResult<ForwardTarget> {
