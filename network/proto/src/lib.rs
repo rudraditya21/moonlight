@@ -158,8 +158,8 @@ pub use mms::{
     MmsDescription, MmsFrame, MmsHandler, MmsServer, MmsServerConfig,
 };
 pub use mqtt::{
-    AsyncMqttClient, AsyncMqttServer, MqttClient, MqttClientConfig, MqttPacket, MqttPacketType,
-    MqttServer, MqttServerConfig,
+    AsyncMqttClient, AsyncMqttServer, AsyncUpstreamMqttClient, MqttClient, MqttClientConfig,
+    MqttPacket, MqttPacketType, MqttServer, MqttServerConfig, UpstreamMqttClient,
 };
 pub use ms_adts::{KeyCredentialEntry, KeyCredentialStruct};
 pub use ms_crtd::{

@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use corelib::error::{CoreError, CoreResult};
 use net::NetAddr;
+use rumqttc as rumqttc_crate;
 
 use crate::transport::{AsyncStreamTransport, AsyncTcpTransport, StreamTransport, TcpTransport};
 use crate::util::Timeouts;
@@ -555,6 +556,149 @@ impl AsyncMqttClient {
 
     pub async fn recv(&mut self) -> CoreResult<MqttPacket> {
         read_packet_async(&mut self.transport).await
+    }
+}
+
+pub struct UpstreamMqttClient {
+    client: rumqttc_crate::Client,
+    connection: rumqttc_crate::Connection,
+}
+
+impl UpstreamMqttClient {
+    pub fn connect(addr: &NetAddr, config: MqttClientConfig) -> CoreResult<Self> {
+        let socket = addr
+            .resolve()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CoreError::Parse("unable to resolve".to_string()))?;
+        let mut options = rumqttc_crate::MqttOptions::new(
+            config.client_id,
+            socket.ip().to_string(),
+            socket.port(),
+        );
+        options.set_keep_alive(Duration::from_secs(config.keep_alive.max(1) as u64));
+        if let (Some(username), Some(password)) = (config.username, config.password) {
+            options.set_credentials(username, password);
+        }
+        let (client, connection) = rumqttc_crate::Client::new(options, 64);
+        Ok(Self { client, connection })
+    }
+
+    pub fn publish(&mut self, topic: &str, payload: Vec<u8>, qos: u8) -> CoreResult<()> {
+        self.client
+            .publish(topic, qos_from_u8(qos)?, false, payload)
+            .map_err(|err| CoreError::Message(format!("mqtt publish failed: {err}")))
+    }
+
+    pub fn subscribe(&mut self, topics: Vec<(String, u8)>) -> CoreResult<()> {
+        for (topic, qos) in topics {
+            self.client
+                .subscribe(topic, qos_from_u8(qos)?)
+                .map_err(|err| CoreError::Message(format!("mqtt subscribe failed: {err}")))?;
+        }
+        Ok(())
+    }
+
+    pub fn recv(&mut self) -> CoreResult<MqttPacket> {
+        for event in self.connection.iter() {
+            let event =
+                event.map_err(|err| CoreError::Message(format!("mqtt event failed: {err}")))?;
+            if let rumqttc_crate::Event::Incoming(rumqttc_crate::Packet::Publish(msg)) = event {
+                return Ok(MqttPacket::Publish {
+                    topic: msg.topic,
+                    payload: msg.payload.to_vec(),
+                    qos: qos_to_u8(msg.qos),
+                    retain: msg.retain,
+                    packet_id: Some(msg.pkid),
+                });
+            }
+            if let rumqttc_crate::Event::Incoming(rumqttc_crate::Packet::PingResp) = event {
+                return Ok(MqttPacket::PingResp);
+            }
+        }
+        Err(CoreError::Parse("mqtt connection closed".to_string()))
+    }
+}
+
+pub struct AsyncUpstreamMqttClient {
+    client: rumqttc_crate::AsyncClient,
+    eventloop: rumqttc_crate::EventLoop,
+}
+
+impl AsyncUpstreamMqttClient {
+    pub async fn connect(addr: &NetAddr, config: MqttClientConfig) -> CoreResult<Self> {
+        let socket = addr
+            .resolve()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CoreError::Parse("unable to resolve".to_string()))?;
+        let mut options = rumqttc_crate::MqttOptions::new(
+            config.client_id,
+            socket.ip().to_string(),
+            socket.port(),
+        );
+        options.set_keep_alive(Duration::from_secs(config.keep_alive.max(1) as u64));
+        if let (Some(username), Some(password)) = (config.username, config.password) {
+            options.set_credentials(username, password);
+        }
+        let (client, eventloop) = rumqttc_crate::AsyncClient::new(options, 64);
+        Ok(Self { client, eventloop })
+    }
+
+    pub async fn publish(&mut self, topic: &str, payload: Vec<u8>, qos: u8) -> CoreResult<()> {
+        self.client
+            .publish(topic, qos_from_u8(qos)?, false, payload)
+            .await
+            .map_err(|err| CoreError::Message(format!("mqtt publish failed: {err}")))
+    }
+
+    pub async fn subscribe(&mut self, topics: Vec<(String, u8)>) -> CoreResult<()> {
+        for (topic, qos) in topics {
+            self.client
+                .subscribe(topic, qos_from_u8(qos)?)
+                .await
+                .map_err(|err| CoreError::Message(format!("mqtt subscribe failed: {err}")))?;
+        }
+        Ok(())
+    }
+
+    pub async fn recv(&mut self) -> CoreResult<MqttPacket> {
+        loop {
+            let event = self
+                .eventloop
+                .poll()
+                .await
+                .map_err(|err| CoreError::Message(format!("mqtt event failed: {err}")))?;
+            if let rumqttc_crate::Event::Incoming(rumqttc_crate::Packet::Publish(msg)) = event {
+                return Ok(MqttPacket::Publish {
+                    topic: msg.topic,
+                    payload: msg.payload.to_vec(),
+                    qos: qos_to_u8(msg.qos),
+                    retain: msg.retain,
+                    packet_id: Some(msg.pkid),
+                });
+            }
+            if let rumqttc_crate::Event::Incoming(rumqttc_crate::Packet::PingResp) = event {
+                return Ok(MqttPacket::PingResp);
+            }
+        }
+    }
+}
+
+fn qos_from_u8(qos: u8) -> CoreResult<rumqttc_crate::QoS> {
+    match qos {
+        0 => Ok(rumqttc_crate::QoS::AtMostOnce),
+        1 => Ok(rumqttc_crate::QoS::AtLeastOnce),
+        2 => Ok(rumqttc_crate::QoS::ExactlyOnce),
+        _ => Err(CoreError::Parse("invalid qos".to_string())),
+    }
+}
+
+fn qos_to_u8(qos: rumqttc_crate::QoS) -> u8 {
+    match qos {
+        rumqttc_crate::QoS::AtMostOnce => 0,
+        rumqttc_crate::QoS::AtLeastOnce => 1,
+        rumqttc_crate::QoS::ExactlyOnce => 2,
     }
 }
 
