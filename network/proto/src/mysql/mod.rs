@@ -5,6 +5,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use corelib::error::{CoreError, CoreResult};
+use mysql_async as mysql_async_crate;
+use mysql_async_crate::prelude::Queryable;
 
 use crate::transport::{AsyncStreamTransport, AsyncTcpTransport, StreamTransport, TcpTransport};
 use crate::util::Timeouts;
@@ -376,6 +378,110 @@ pub struct AsyncMysqlClient {
     status_flags: u16,
     server_version: String,
     connection_id: u32,
+}
+
+pub struct UpstreamMysqlClient {
+    runtime: tokio::runtime::Runtime,
+    inner: AsyncUpstreamMysqlClient,
+}
+
+impl UpstreamMysqlClient {
+    pub fn connect(addr: &net::NetAddr, config: MysqlClientConfig) -> CoreResult<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| CoreError::Message(err.to_string()))?;
+        let inner = runtime.block_on(AsyncUpstreamMysqlClient::connect(addr, config))?;
+        Ok(Self { runtime, inner })
+    }
+
+    pub fn query(&mut self, sql: &str) -> CoreResult<MysqlQueryResult> {
+        self.runtime.block_on(self.inner.query(sql))
+    }
+
+    pub fn ping(&mut self) -> CoreResult<()> {
+        self.runtime.block_on(self.inner.ping())
+    }
+}
+
+pub struct AsyncUpstreamMysqlClient {
+    conn: mysql_async_crate::Conn,
+}
+
+impl AsyncUpstreamMysqlClient {
+    pub async fn connect(addr: &net::NetAddr, config: MysqlClientConfig) -> CoreResult<Self> {
+        let socket = addr
+            .resolve()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CoreError::Parse("unable to resolve".to_string()))?;
+        let mut builder = mysql_async_crate::OptsBuilder::default()
+            .ip_or_hostname(socket.ip().to_string())
+            .tcp_port(socket.port())
+            .user(Some(config.username))
+            .pass(Some(config.password));
+        if let Some(database) = config.database {
+            builder = builder.db_name(Some(database));
+        }
+        let opts = mysql_async_crate::Opts::from(builder);
+        let conn = mysql_async_crate::Conn::new(opts)
+            .await
+            .map_err(|err| CoreError::Message(format!("mysql connect failed: {err}")))?;
+        Ok(Self { conn })
+    }
+
+    pub async fn query(&mut self, sql: &str) -> CoreResult<MysqlQueryResult> {
+        let rows: Vec<mysql_async_crate::Row> = self
+            .conn
+            .query(sql)
+            .await
+            .map_err(|err| CoreError::Message(format!("mysql query failed: {err}")))?;
+        let mut result = MysqlQueryResult::default();
+        if let Some(first) = rows.first() {
+            result.columns = first
+                .columns_ref()
+                .iter()
+                .map(|column| column.name_str().to_string())
+                .collect();
+        }
+        for row in rows {
+            result.rows.push(
+                row.unwrap()
+                    .into_iter()
+                    .map(mysql_value_to_opt_bytes)
+                    .collect(),
+            );
+        }
+        Ok(result)
+    }
+
+    pub async fn ping(&mut self) -> CoreResult<()> {
+        self.conn
+            .ping()
+            .await
+            .map_err(|err| CoreError::Message(format!("mysql ping failed: {err}")))
+    }
+}
+
+fn mysql_value_to_opt_bytes(value: mysql_async_crate::Value) -> Option<Vec<u8>> {
+    match value {
+        mysql_async_crate::Value::NULL => None,
+        mysql_async_crate::Value::Bytes(v) => Some(v),
+        mysql_async_crate::Value::Int(v) => Some(v.to_string().into_bytes()),
+        mysql_async_crate::Value::UInt(v) => Some(v.to_string().into_bytes()),
+        mysql_async_crate::Value::Float(v) => Some(v.to_string().into_bytes()),
+        mysql_async_crate::Value::Double(v) => Some(v.to_string().into_bytes()),
+        mysql_async_crate::Value::Date(year, mon, day, hour, min, sec, micro) => Some(
+            format!("{year:04}-{mon:02}-{day:02} {hour:02}:{min:02}:{sec:02}.{micro:06}")
+                .into_bytes(),
+        ),
+        mysql_async_crate::Value::Time(neg, days, hours, mins, secs, micro) => {
+            let sign = if neg { "-" } else { "" };
+            Some(
+                format!("{sign}{days} {hours:02}:{mins:02}:{secs:02}.{micro:06}").into_bytes(),
+            )
+        }
+    }
 }
 
 impl AsyncMysqlClient {

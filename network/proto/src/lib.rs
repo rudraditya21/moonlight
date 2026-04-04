@@ -189,8 +189,8 @@ pub use mssql::{
     MssqlServer, MssqlServerConfig, MSSQL_DEFAULT_PORT,
 };
 pub use mysql::{
-    AsyncMysqlClient, AsyncMysqlServer, MysqlClient, MysqlClientConfig, MysqlQueryResult,
-    MysqlServer, MysqlServerConfig,
+    AsyncMysqlClient, AsyncMysqlServer, AsyncUpstreamMysqlClient, MysqlClient, MysqlClientConfig,
+    MysqlQueryResult, MysqlServer, MysqlServerConfig, UpstreamMysqlClient,
 };
 pub use natpmp::{
     AsyncNatPmpServer, NatPmpClient, NatPmpClientConfig, NatPmpOpcode, NatPmpRequest,
