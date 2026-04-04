@@ -37,14 +37,6 @@ impl HttpVersion {
             Self::Http11 => "HTTP/1.1",
         }
     }
-
-    fn parse(value: &str) -> CoreResult<Self> {
-        match value {
-            "HTTP/1.0" => Ok(Self::Http10),
-            "HTTP/1.1" => Ok(Self::Http11),
-            _ => Err(CoreError::Parse("unsupported http version".to_string())),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,21 +66,6 @@ impl HttpMethod {
             Self::Trace => "TRACE",
             Self::Connect => "CONNECT",
             Self::Other(value) => value.as_str(),
-        }
-    }
-
-    fn parse(value: &str) -> Self {
-        match value {
-            "GET" => Self::Get,
-            "POST" => Self::Post,
-            "PUT" => Self::Put,
-            "DELETE" => Self::Delete,
-            "HEAD" => Self::Head,
-            "OPTIONS" => Self::Options,
-            "PATCH" => Self::Patch,
-            "TRACE" => Self::Trace,
-            "CONNECT" => Self::Connect,
-            other => Self::Other(other.to_string()),
         }
     }
 }
@@ -283,24 +260,52 @@ fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
     }
 }
 
-fn parse_headers(lines: &[&str]) -> CoreResult<Vec<(String, String)>> {
-    let mut headers = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.splitn(2, ':');
-        let name = parts
-            .next()
-            .ok_or_else(|| CoreError::Parse("invalid header".to_string()))?
-            .trim();
-        let value = parts
-            .next()
-            .ok_or_else(|| CoreError::Parse("invalid header".to_string()))?
-            .trim();
-        headers.push((name.to_string(), value.to_string()));
+fn parse_headers(headers: &[HttpHeader<'_>]) -> CoreResult<Vec<(String, String)>> {
+    let mut parsed_headers = Vec::with_capacity(headers.len());
+    for header in headers {
+        let parsed_name = HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|_| CoreError::Parse("invalid header name".to_string()))?;
+        let parsed_value = HeaderValue::from_bytes(header.value)
+            .map_err(|_| CoreError::Parse("invalid header value".to_string()))?;
+        let normalized_value = parsed_value
+            .to_str()
+            .map_err(|_| CoreError::Parse("invalid header value".to_string()))?;
+        parsed_headers.push((
+            parsed_name.as_str().to_string(),
+            normalized_value.to_string(),
+        ));
     }
-    Ok(headers)
+    Ok(parsed_headers)
+}
+
+fn parse_method(method: &str) -> CoreResult<HttpMethod> {
+    let parsed = Method::from_bytes(method.as_bytes())
+        .map_err(|_| CoreError::Parse("invalid method".to_string()))?;
+    Ok(match parsed {
+        Method::GET => HttpMethod::Get,
+        Method::POST => HttpMethod::Post,
+        Method::PUT => HttpMethod::Put,
+        Method::DELETE => HttpMethod::Delete,
+        Method::HEAD => HttpMethod::Head,
+        Method::OPTIONS => HttpMethod::Options,
+        Method::PATCH => HttpMethod::Patch,
+        Method::TRACE => HttpMethod::Trace,
+        Method::CONNECT => HttpMethod::Connect,
+        _ => HttpMethod::Other(parsed.as_str().to_string()),
+    })
+}
+
+fn parse_version(version: u8) -> CoreResult<HttpVersion> {
+    let parsed = match version {
+        0 => Version::HTTP_10,
+        1 => Version::HTTP_11,
+        _ => return Err(CoreError::Parse("unsupported http version".to_string())),
+    };
+    Ok(match parsed {
+        Version::HTTP_10 => HttpVersion::Http10,
+        Version::HTTP_11 => HttpVersion::Http11,
+        _ => return Err(CoreError::Parse("unsupported http version".to_string())),
+    })
 }
 
 fn parse_authority(value: &str) -> CoreResult<(String, u16)> {
@@ -479,32 +484,39 @@ fn read_chunked_body<T: StreamTransport>(
 }
 
 fn parse_request(header_bytes: &[u8]) -> CoreResult<(HttpRequest, HashMap<String, String>)> {
-    let text = String::from_utf8(header_bytes.to_vec())
-        .map_err(|_| CoreError::Parse("invalid utf-8".to_string()))?;
-    let mut lines = text.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or_else(|| CoreError::Parse("missing request line".to_string()))?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts
-        .next()
+    let mut raw = header_bytes.to_vec();
+    if !raw.ends_with(b"\r\n\r\n") {
+        raw.extend_from_slice(b"\r\n\r\n");
+    }
+
+    let mut header_slots = [httparse::EMPTY_HEADER; 128];
+    let mut req = HttpParseRequest::new(&mut header_slots);
+    match req
+        .parse(&raw)
+        .map_err(|_| CoreError::Parse("invalid request".to_string()))?
+    {
+        httparse::Status::Complete(_) => {}
+        httparse::Status::Partial => return Err(CoreError::Parse("partial request".to_string())),
+    }
+    let method = req
+        .method
         .ok_or_else(|| CoreError::Parse("missing method".to_string()))?;
-    let path = parts
-        .next()
+    let path = req
+        .path
         .ok_or_else(|| CoreError::Parse("missing path".to_string()))?;
-    let version = parts
-        .next()
+    let version = req
+        .version
         .ok_or_else(|| CoreError::Parse("missing version".to_string()))?;
-    let headers = parse_headers(&lines.collect::<Vec<_>>())?;
+    let headers = parse_headers(req.headers)?;
     let mut map = HashMap::new();
     for (name, value) in &headers {
         map.insert(name.to_ascii_lowercase(), value.clone());
     }
     Ok((
         HttpRequest {
-            method: HttpMethod::parse(method),
+            method: parse_method(method)?,
             path: path.to_string(),
-            version: HttpVersion::parse(version)?,
+            version: parse_version(version)?,
             headers,
             body: Vec::new(),
         },
@@ -513,31 +525,38 @@ fn parse_request(header_bytes: &[u8]) -> CoreResult<(HttpRequest, HashMap<String
 }
 
 fn parse_response(header_bytes: &[u8]) -> CoreResult<(HttpResponse, HashMap<String, String>)> {
-    let text = String::from_utf8(header_bytes.to_vec())
-        .map_err(|_| CoreError::Parse("invalid utf-8".to_string()))?;
-    let mut lines = text.split("\r\n");
-    let status_line = lines
-        .next()
-        .ok_or_else(|| CoreError::Parse("missing status line".to_string()))?;
-    let mut parts = status_line.split_whitespace();
-    let version = parts
-        .next()
+    let mut raw = header_bytes.to_vec();
+    if !raw.ends_with(b"\r\n\r\n") {
+        raw.extend_from_slice(b"\r\n\r\n");
+    }
+
+    let mut header_slots = [httparse::EMPTY_HEADER; 128];
+    let mut response = HttpParseResponse::new(&mut header_slots);
+    match response
+        .parse(&raw)
+        .map_err(|_| CoreError::Parse("invalid response".to_string()))?
+    {
+        httparse::Status::Complete(_) => {}
+        httparse::Status::Partial => return Err(CoreError::Parse("partial response".to_string())),
+    }
+    let version = response
+        .version
         .ok_or_else(|| CoreError::Parse("missing version".to_string()))?;
-    let code = parts
-        .next()
+    let status_code = response
+        .code
         .ok_or_else(|| CoreError::Parse("missing status".to_string()))?;
-    let reason = parts.collect::<Vec<_>>().join(" ");
-    let headers = parse_headers(&lines.collect::<Vec<_>>())?;
+    let reason = response.reason.unwrap_or("").to_string();
+    let headers = parse_headers(response.headers)?;
     let mut map = HashMap::new();
     for (name, value) in &headers {
         map.insert(name.to_ascii_lowercase(), value.clone());
     }
+    StatusCode::from_u16(status_code)
+        .map_err(|_| CoreError::Parse("invalid status".to_string()))?;
     Ok((
         HttpResponse {
-            version: HttpVersion::parse(version)?,
-            status_code: code
-                .parse()
-                .map_err(|_| CoreError::Parse("invalid status".to_string()))?,
+            version: parse_version(version)?,
+            status_code,
             reason,
             headers,
             body: Vec::new(),
@@ -1626,6 +1645,9 @@ mod tests {
     fn http_parse_negative() {
         assert!(parse_request(&[]).is_err());
         assert!(parse_response(&[]).is_err());
+        assert!(parse_request(b"GE T / HTTP/1.1\r\nHost: example.com\r\n\r\n").is_err());
+        assert!(parse_request(b"GET / HTTP/1.1\r\nBad Header\r\n\r\n").is_err());
+        assert!(parse_response(b"HTTP/1.1 9999 Weird\r\n\r\n").is_err());
     }
 
     #[test]

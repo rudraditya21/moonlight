@@ -52,6 +52,7 @@ const TAG_FILTER_LE: u8 = 0xa6;
 const TAG_FILTER_PRESENT: u8 = 0x87;
 const TAG_FILTER_APPROX: u8 = 0xa8;
 const TAG_FILTER_EXTENSIBLE: u8 = 0xa9;
+const MAX_BER_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LdapMessage {
@@ -1299,7 +1300,10 @@ impl LdapMessage {
             return Err(CoreError::Parse("invalid ldap message".to_string()));
         }
         let mut reader = BerReader::new(&element.content);
-        let msg_id = reader.read_integer()? as i32;
+        let msg_id = reader.read_integer()?;
+        if !(0..=i32::MAX as i64).contains(&msg_id) {
+            return Err(CoreError::Parse("ldap message id out of range".to_string()));
+        }
         let op_element = reader.read_element()?;
         let op = decode_protocol_op(op_element)?;
         let controls = if reader.remaining() > 0 {
@@ -1309,7 +1313,7 @@ impl LdapMessage {
             Vec::new()
         };
         Ok(Self {
-            message_id: msg_id,
+            message_id: msg_id as i32,
             op,
             controls,
         })
@@ -2086,16 +2090,29 @@ fn read_ber_message<T: StreamTransport>(transport: &mut T) -> CoreResult<Vec<u8>
                 "indefinite length not supported".to_string(),
             ));
         }
+        if count > std::mem::size_of::<usize>() {
+            return Err(CoreError::Parse("invalid ldap length".to_string()));
+        }
         len_bytes.resize(count, 0);
         transport.read_exact(&mut len_bytes)?;
         len = 0;
         for b in &len_bytes {
-            len = (len << 8) | (*b as usize);
+            len = len
+                .checked_mul(256)
+                .and_then(|value| value.checked_add(*b as usize))
+                .ok_or_else(|| CoreError::Parse("invalid ldap length".to_string()))?;
         }
+    }
+    if len > MAX_BER_MESSAGE_SIZE {
+        return Err(CoreError::Parse("ldap message too large".to_string()));
     }
     let mut content = vec![0u8; len];
     transport.read_exact(&mut content)?;
-    let mut out = Vec::with_capacity(2 + len_bytes.len() + len);
+    let capacity = 2usize
+        .checked_add(len_bytes.len())
+        .and_then(|value| value.checked_add(len))
+        .ok_or_else(|| CoreError::Parse("invalid ldap length".to_string()))?;
+    let mut out = Vec::with_capacity(capacity);
     out.push(tag[0]);
     out.push(len_byte[0]);
     out.extend_from_slice(&len_bytes);
@@ -2117,16 +2134,29 @@ async fn read_ber_message_async<T: AsyncStreamTransport>(transport: &mut T) -> C
                 "indefinite length not supported".to_string(),
             ));
         }
+        if count > std::mem::size_of::<usize>() {
+            return Err(CoreError::Parse("invalid ldap length".to_string()));
+        }
         len_bytes.resize(count, 0);
         transport.read_exact(&mut len_bytes).await?;
         len = 0;
         for b in &len_bytes {
-            len = (len << 8) | (*b as usize);
+            len = len
+                .checked_mul(256)
+                .and_then(|value| value.checked_add(*b as usize))
+                .ok_or_else(|| CoreError::Parse("invalid ldap length".to_string()))?;
         }
+    }
+    if len > MAX_BER_MESSAGE_SIZE {
+        return Err(CoreError::Parse("ldap message too large".to_string()));
     }
     let mut content = vec![0u8; len];
     transport.read_exact(&mut content).await?;
-    let mut out = Vec::with_capacity(2 + len_bytes.len() + len);
+    let capacity = 2usize
+        .checked_add(len_bytes.len())
+        .and_then(|value| value.checked_add(len))
+        .ok_or_else(|| CoreError::Parse("invalid ldap length".to_string()))?;
+    let mut out = Vec::with_capacity(capacity);
     out.push(tag[0]);
     out.push(len_byte[0]);
     out.extend_from_slice(&len_bytes);
@@ -2142,7 +2172,11 @@ struct BerElement {
 impl BerElement {
     fn decode(data: &[u8]) -> CoreResult<Self> {
         let mut reader = BerReader::new(data);
-        reader.read_element()
+        let element = reader.read_element()?;
+        if reader.remaining() != 0 {
+            return Err(CoreError::Parse("unexpected trailing data".to_string()));
+        }
+        Ok(element)
     }
 }
 
@@ -2175,15 +2209,24 @@ impl<'a> BerReader<'a> {
                     "indefinite length not supported".to_string(),
                 ));
             }
+            if len > std::mem::size_of::<usize>() {
+                return Err(CoreError::Parse("invalid length".to_string()));
+            }
             if self.remaining() < len {
                 return Err(CoreError::Parse("invalid length".to_string()));
             }
             let mut value = 0usize;
             for _ in 0..len {
-                value = (value << 8) | (self.data[self.pos] as usize);
+                value = value
+                    .checked_mul(256)
+                    .and_then(|current| current.checked_add(self.data[self.pos] as usize))
+                    .ok_or_else(|| CoreError::Parse("invalid length".to_string()))?;
                 self.pos += 1;
             }
             len = value;
+        }
+        if len > MAX_BER_MESSAGE_SIZE {
+            return Err(CoreError::Parse("invalid length".to_string()));
         }
         if self.remaining() < len {
             return Err(CoreError::Parse("invalid length".to_string()));
@@ -2222,7 +2265,9 @@ impl<'a> BerReader<'a> {
         if elem.tag != TAG_OCTET_STRING {
             return Err(CoreError::Parse("expected octet string".to_string()));
         }
-        Ok(String::from_utf8_lossy(&elem.content).to_string())
+        let value = std::str::from_utf8(&elem.content)
+            .map_err(|_| CoreError::Parse("invalid utf-8 string".to_string()))?;
+        Ok(value.to_string())
     }
 
     fn read_octet_string_bytes(&mut self) -> CoreResult<Vec<u8>> {
@@ -2675,6 +2720,27 @@ mod tests {
         let encoded = msg.encode().unwrap();
         let decoded = LdapMessage::decode(&encoded).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn decode_rejects_out_of_range_message_id() {
+        let encoded = encode_sequence(&[
+            encode_integer(i32::MAX as i64 + 1),
+            encode_tagged(TAG_UNBIND_REQUEST, Vec::new()),
+        ]);
+        assert!(LdapMessage::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        let msg = LdapMessage {
+            message_id: 1,
+            op: ProtocolOp::UnbindRequest,
+            controls: Vec::new(),
+        };
+        let mut encoded = msg.encode().unwrap();
+        encoded.extend_from_slice(&[0x00, 0x00]);
+        assert!(LdapMessage::decode(&encoded).is_err());
     }
 
     #[test]

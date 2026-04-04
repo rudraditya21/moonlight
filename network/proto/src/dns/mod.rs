@@ -492,6 +492,7 @@ impl DnsMessage {
             let _ = _rdata_len;
         }
 
+        validate_dns_wire_message(&buf)?;
         Ok(buf)
     }
 
@@ -499,6 +500,7 @@ impl DnsMessage {
         if bytes.len() < 12 {
             return Err(CoreError::Parse("dns message too short".to_string()));
         }
+        validate_dns_wire_message(bytes)?;
         let id = u16::from_be_bytes([bytes[0], bytes[1]]);
         let flags = DnsFlags::from_bits(u16::from_be_bytes([bytes[2], bytes[3]]));
         let qdcount = u16::from_be_bytes([bytes[4], bytes[5]]);
@@ -552,16 +554,18 @@ fn encode_name(
     buf: &mut Vec<u8>,
     compression: &mut HashMap<String, u16>,
 ) -> CoreResult<()> {
-    if name.is_empty() {
+    let normalized = name.trim_end_matches('.');
+    if normalized.is_empty() {
         buf.push(0);
         return Ok(());
     }
-    if let Some(offset) = compression.get(name) {
+    validate_dns_name(normalized)?;
+    if let Some(offset) = compression.get(normalized) {
         let pointer = 0xC000u16 | offset;
         buf.extend_from_slice(&pointer.to_be_bytes());
         return Ok(());
     }
-    let labels: Vec<&str> = name.split('.').collect();
+    let labels: Vec<&str> = normalized.split('.').collect();
     for i in 0..labels.len() {
         let suffix = labels[i..].join(".");
         if let Some(offset) = compression.get(&suffix) {
@@ -1174,11 +1178,13 @@ fn encode_rdata_canonical(data: &DnsRecordData, buf: &mut Vec<u8>) -> CoreResult
 }
 
 fn encode_name_canonical(name: &str, buf: &mut Vec<u8>) -> CoreResult<()> {
-    if name.is_empty() {
+    let normalized = name.trim_end_matches('.');
+    if normalized.is_empty() {
         buf.push(0);
         return Ok(());
     }
-    for label in name.split('.') {
+    validate_dns_name(normalized)?;
+    for label in normalized.split('.') {
         let label = label.to_ascii_lowercase();
         if label.len() > 63 {
             return Err(CoreError::Parse("label too long".to_string()));
@@ -1187,6 +1193,21 @@ fn encode_name_canonical(name: &str, buf: &mut Vec<u8>) -> CoreResult<()> {
         buf.extend_from_slice(label.as_bytes());
     }
     buf.push(0);
+    Ok(())
+}
+
+fn validate_dns_name(name: &str) -> CoreResult<()> {
+    // Hickory applies RFC-compliant hostname and label validation.
+    let fqdn = format!("{name}.");
+    hickory_proto::rr::Name::from_ascii(&fqdn)
+        .map_err(|_| CoreError::Parse("invalid dns name".to_string()))?;
+    Ok(())
+}
+
+fn validate_dns_wire_message(bytes: &[u8]) -> CoreResult<()> {
+    // Validate DNS wire format via a standards-based parser before use.
+    HickoryMessage::from_vec(bytes)
+        .map_err(|_| CoreError::Parse("invalid dns message".to_string()))?;
     Ok(())
 }
 
